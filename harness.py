@@ -205,7 +205,7 @@ def _compact_messages(messages: list, role: str) -> list:
 
 # ─── UTILIDADES ─────────────────────────────────────────────────────────────
 
-def _safe_parse_args(raw: str, tool_name: str) -> tuple[dict | None, str]:
+def _safe_parse_args(raw: str, tool_name: str):
     """Parsea argumentos JSON de una tool call. Retorna (args, error_msg)."""
     try:
         return json.loads(raw), ""
