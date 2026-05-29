@@ -1,0 +1,26 @@
+[
+  {
+    "id": 1,
+    "title": "Módulo de almacenamiento de notas en JSON",
+    "description": "Crear src/storage.py con funciones load() y save() que lean y escriban notas en data/notes.json de forma atómica.",
+    "status": "done",
+    "created_at": "2026-05-21T00:00:00",
+    "updated_at": "2026-05-22T08:48:50.178343"
+  },
+  {
+    "id": 2,
+    "title": "Modelo de dominio Note",
+    "description": "Crear src/notes.py con la clase Note (id, title, body, created_at). Incluir método to_dict() y from_dict().",
+    "status": "done",
+    "created_at": "2026-05-21T00:00:00",
+    "updated_at": "2026-05-25T10:00:18.536436"
+  },
+  {
+    "id": 3,
+    "title": "CLI básico con comandos add y list",
+    "description": "Crear src/cli.py con argparse. Comandos: 'add <title> [--body TEXT]' y 'list'. Usar storage.py y notes.py.",
+    "status": "done",
+    "created_at": "2026-05-21T00:00:00",
+    "updated_at": "2026-05-25T10:06:12.070147"
+  }
+]
