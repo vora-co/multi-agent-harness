@@ -9,6 +9,7 @@ from rich import print as rprint
 import agents.leader as leader_cfg
 import agents.implementer as impl_cfg
 import agents.reviewer as reviewer_cfg
+import agents.e2e_tester as e2e_cfg
 from tools import execute_tool
 
 load_dotenv()
@@ -21,8 +22,18 @@ MAX_RETRIES_API    = 3   # Reintentos ante errores transitorios de la API (rate 
 MAX_RETRIES_IMPL   = 3   # Cuántas veces el implementer puede reintentar una feature
 MAX_RETRIES_REVIEW = 2   # Cuántas veces el ciclo impl→review puede repetirse antes de marcar "failed"
 MAX_ITER_LEADER    = 20  # Iteraciones máximas del loop del leader
-MAX_ITER_AGENT     = 15  # Iteraciones máximas de run_agent (implementer/reviewer)
+MAX_ITER_AGENT     = 15  # Iteraciones máximas de run_agent (implementer/reviewer/e2e)
 RETRY_BACKOFF      = [2, 4, 8]  # segundos entre retries de API
+
+# Compactación de contexto — mejores prácticas 2025:
+# Modelos de 64K tokens: compactar cuando el historial supera ~30% del contexto.
+# Conservador: disparar a los 24 mensajes (~12 intercambios), mantener los últimos 8.
+COMPACT_THRESHOLD  = 24  # mensajes acumulados antes de compactar
+COMPACT_KEEP_TAIL  = 8   # mensajes recientes a preservar intactos tras compactar
+
+# Precios DeepSeek v3 (USD por millón de tokens, cache miss):
+_PRICE_INPUT  = 0.27 / 1_000_000
+_PRICE_OUTPUT = 1.10 / 1_000_000
 
 # ─── LOGGING ESTRUCTURADO ───────────────────────────────────────────────────
 logging.basicConfig(
@@ -44,6 +55,153 @@ client = OpenAI(
     api_key=os.getenv("DEEPSEEK_API_KEY"),
     base_url="https://api.deepseek.com"
 )
+
+# ─── OBSERVABILIDAD DE COSTOS ────────────────────────────────────────────────
+_SESSION_COSTS: dict = {
+    "leader":       {"prompt_tokens": 0, "completion_tokens": 0, "calls": 0},
+    "implementer":  {"prompt_tokens": 0, "completion_tokens": 0, "calls": 0},
+    "reviewer":     {"prompt_tokens": 0, "completion_tokens": 0, "calls": 0},
+    "e2e_tester":   {"prompt_tokens": 0, "completion_tokens": 0, "calls": 0},
+    "compaction":   {"prompt_tokens": 0, "completion_tokens": 0, "calls": 0},
+}
+_SESSION_START = datetime.datetime.now()
+
+def _track_usage(role: str, usage) -> None:
+    """Acumula tokens de cada llamada a la API por rol."""
+    if usage is None:
+        return
+    bucket = _SESSION_COSTS.get(role, _SESSION_COSTS["leader"])
+    bucket["prompt_tokens"]     += getattr(usage, "prompt_tokens", 0)
+    bucket["completion_tokens"] += getattr(usage, "completion_tokens", 0)
+    bucket["calls"]             += 1
+
+def _write_session_costs() -> None:
+    """Escribe el resumen de costos de la sesión en progress/session_costs.json."""
+    total_prompt     = sum(v["prompt_tokens"]     for v in _SESSION_COSTS.values())
+    total_completion = sum(v["completion_tokens"] for v in _SESSION_COSTS.values())
+    total_cost_usd   = total_prompt * _PRICE_INPUT + total_completion * _PRICE_OUTPUT
+
+    summary = {
+        "session_start":      _SESSION_START.isoformat(),
+        "session_end":        datetime.datetime.now().isoformat(),
+        "model":              MODEL,
+        "by_role":            _SESSION_COSTS,
+        "totals": {
+            "prompt_tokens":     total_prompt,
+            "completion_tokens": total_completion,
+            "total_tokens":      total_prompt + total_completion,
+            "estimated_usd":     round(total_cost_usd, 6),
+        }
+    }
+    os.makedirs("progress", exist_ok=True)
+    path = "progress/session_costs.json"
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(summary, f, indent=2, ensure_ascii=False)
+
+    console.print(Panel(
+        f"Total tokens: [cyan]{total_prompt + total_completion:,}[/]  |  "
+        f"Costo estimado: [yellow]USD {total_cost_usd:.4f}[/]",
+        title="[dim]Costos de sesión → progress/session_costs.json[/]",
+        border_style="dim",
+        padding=(0, 1)
+    ))
+
+# ─── CHECKPOINTING ──────────────────────────────────────────────────────────
+
+def recover_stale_features() -> list[int]:
+    """
+    Al arrancar, detecta features atascadas en 'in_progress' por un crash anterior
+    y las resetea a 'pending'. Retorna lista de IDs recuperados.
+    """
+    try:
+        with open("feature_list.json", "r") as f:
+            features = json.load(f)
+    except FileNotFoundError:
+        return []
+
+    recovered = []
+    for feat in features:
+        if feat.get("status") == "in_progress":
+            feat["status"] = "pending"
+            feat["updated_at"] = datetime.datetime.now().isoformat()
+            feat["recovery_note"] = "Reseteada a pending por harness tras arranque (posible crash previo)"
+            recovered.append(feat["id"])
+
+    if recovered:
+        with open("feature_list.json", "w") as f:
+            json.dump(features, f, indent=2, ensure_ascii=False)
+        _log("harness", "CHECKPOINT_RECOVERY",
+             f"Features reseteadas a pending: {recovered}", level="warning")
+        console.print(Panel(
+            f"[yellow]Features {recovered} estaban en 'in_progress' — reseteadas a 'pending'[/]\n"
+            "[dim]Posible crash en sesión anterior. El leader las retomará.[/]",
+            title="[yellow]⚠ Checkpoint Recovery[/]",
+            border_style="yellow",
+            padding=(0, 1)
+        ))
+    return recovered
+
+# ─── COMPACTACIÓN DE CONTEXTO ────────────────────────────────────────────────
+
+def _compact_messages(messages: list, role: str) -> list:
+    """
+    Cuando el historial supera COMPACT_THRESHOLD mensajes, resume el bloque
+    intermedio en una sola entrada para evitar exceder el context window.
+    Siempre conserva: system (0), tarea inicial (1), y los últimos COMPACT_KEEP_TAIL.
+    """
+    if len(messages) <= COMPACT_THRESHOLD:
+        return messages
+
+    system_msg   = messages[0]
+    initial_task = messages[1]
+    tail         = messages[-COMPACT_KEEP_TAIL:]
+    middle       = messages[2:-COMPACT_KEEP_TAIL]
+
+    if not middle:
+        return messages
+
+    # Construir texto del bloque medio para resumir
+    middle_text = ""
+    for m in middle:
+        role_label = m.get("role", "?").upper()
+        content = m.get("content") or ""
+        if isinstance(content, list):
+            content = json.dumps(content, ensure_ascii=False)
+        middle_text += f"[{role_label}]: {str(content)[:300]}\n"
+
+    _log(role, "COMPACTING",
+         f"Compactando {len(middle)} mensajes intermedios (total={len(messages)})")
+
+    try:
+        summary_response = client.chat.completions.create(
+            model=MODEL,
+            messages=[
+                {"role": "system",
+                 "content": "Eres un asistente técnico. Resume de forma concisa el historial de trabajo de un agente de software."},
+                {"role": "user",
+                 "content": (
+                     "Resume este historial en máximo 400 palabras. Preserva: "
+                     "decisiones de diseño tomadas, herramientas ejecutadas y sus resultados clave, "
+                     "errores encontrados y cómo se resolvieron, estado actual del trabajo.\n\n"
+                     f"{middle_text}"
+                 )}
+            ],
+            max_tokens=500,
+        )
+        _track_usage("compaction", summary_response.usage)
+        summary_text = summary_response.choices[0].message.content or "(sin resumen)"
+    except Exception as e:
+        summary_text = f"(resumen no disponible: {e})"
+
+    compact_msg = {
+        "role": "system",
+        "content": f"## Resumen de contexto anterior\n{summary_text}"
+    }
+
+    compacted = [system_msg, initial_task, compact_msg] + list(tail)
+    _log(role, "COMPACTED",
+         f"Reducido de {len(messages)} a {len(compacted)} mensajes")
+    return compacted
 
 # ─── UTILIDADES ─────────────────────────────────────────────────────────────
 
@@ -106,6 +264,7 @@ def run_agent(system_prompt: str, tools: list, task: str,
         if api_response is None:
             return "[ERROR: no se obtuvo respuesta de la API]"
 
+        _track_usage(role, api_response.usage)
         msg = api_response.choices[0].message
 
         if not msg.tool_calls:
@@ -113,6 +272,7 @@ def run_agent(system_prompt: str, tools: list, task: str,
             return msg.content or ""
 
         messages.append(msg)
+        messages = _compact_messages(messages, role)
 
         for tc in msg.tool_calls:
             fn_name = tc.function.name
@@ -231,51 +391,103 @@ def spawn_reviewer(feature_id: int) -> str:
     return result
 
 
+def spawn_e2e_tester(feature_id: int) -> str:
+    console.print(Panel(
+        f"Tests E2E para feature [bold]#{feature_id}[/]",
+        title="[yellow]>> E2E_TESTER activo[/]",
+        border_style="yellow",
+        padding=(0, 1)
+    ))
+    _log("e2e_tester", "SPAWN", f"feature={feature_id}")
+
+    task = (
+        f"Ejecuta los tests E2E para la feature #{feature_id}.\n"
+        f"El reporte del implementer está en progress/impl_{feature_id}.md\n"
+        f"Escribe tu reporte en progress/e2e_{feature_id}.md\n"
+        f"Devuelve SOLO: 'E2E_PASSED' o 'E2E_FAILED: <razón>'"
+    )
+    result = run_agent(e2e_cfg.SYSTEM_PROMPT, e2e_cfg.TOOLS, task,
+                       role="e2e_tester", color="yellow")
+
+    passed = result.strip().startswith("E2E_PASSED")
+    color  = "green" if passed else "red"
+    _log("e2e_tester", "VERDICT", result[:200], level="info" if passed else "warning")
+    console.print(Panel(
+        f"[bold]{result[:200]}[/]",
+        title=f"[{color}]<< E2E_TESTER veredicto[/]",
+        border_style=color,
+        padding=(0, 1)
+    ))
+    return result
+
+
 def run_feature_cycle(feature_id: int, description: str) -> dict:
     """
-    Ciclo completo impl → review con reintentos.
+    Ciclo completo: impl → e2e → review con reintentos.
+    Flujo:
+      1. Implementer escribe código + tests unitarios.
+      2. E2E Tester valida con Playwright (flujos de usuario reales).
+      3. Reviewer verifica todo: unit tests, mutation score, e2e y checkpoints.
+    Si el reviewer rechaza, reintenta desde el paso 1 con el motivo inyectado.
     Retorna dict con: approved (bool), attempts (int), final_verdict (str).
     """
     rejection_reason = ""
     for attempt in range(1, MAX_RETRIES_REVIEW + 1):
-        # Implementar
+
+        # ── Paso 1: Implementar ──────────────────────────────────────────────
         impl_result = spawn_implementer(
             feature_id, description,
             attempt=attempt,
             rejection_reason=rejection_reason
         )
-
-        # Si el implementer mismo reportó bloqueo
         if "[ERROR" in impl_result.upper():
             err_type = _classify_error(impl_result)
-            _log("harness", "IMPL_ERROR", f"feature={feature_id} type={err_type} detail={impl_result[:200]}", level="error")
+            _log("harness", "IMPL_ERROR",
+                 f"feature={feature_id} type={err_type} detail={impl_result[:200]}", level="error")
             if err_type == "FATAL":
                 return {"approved": False, "attempts": attempt, "final_verdict": impl_result}
-            # LOGICAL/TRANSIENT → reintentar con contexto
             rejection_reason = impl_result
             continue
 
-        # Revisar
-        review_result = spawn_reviewer(feature_id)
+        # ── Paso 2: E2E Testing ──────────────────────────────────────────────
+        e2e_result = spawn_e2e_tester(feature_id)
+        if e2e_result.strip().startswith("E2E_FAILED"):
+            e2e_reason = e2e_result.replace("E2E_FAILED:", "").strip()
+            _log("harness", "E2E_FAILED",
+                 f"feature={feature_id} attempt={attempt} reason={e2e_reason[:100]}", level="warning")
+            # E2E failure cuenta como rejection — el implementer corrige
+            rejection_reason = f"E2E falló: {e2e_reason}"
+            if attempt < MAX_RETRIES_REVIEW:
+                console.print(Panel(
+                    f"[red]E2E falló — reintentando impl (intento {attempt+1}/{MAX_RETRIES_REVIEW})[/]\n"
+                    f"[dim]{e2e_reason[:200]}[/]",
+                    title=f"[red]↻ E2E → impl — feature #{feature_id}[/]",
+                    border_style="red", padding=(0, 1)
+                ))
+            continue
 
+        # ── Paso 3: Revisar ──────────────────────────────────────────────────
+        review_result = spawn_reviewer(feature_id)
         if review_result.strip().startswith("APPROVED"):
             return {"approved": True, "attempts": attempt, "final_verdict": review_result}
 
-        # REJECTED — extraer razón y reintentar si quedan intentos
         rejection_reason = review_result.replace("REJECTED:", "").strip()
         _log("harness", "CYCLE_RETRY",
              f"feature={feature_id} attempt={attempt}/{MAX_RETRIES_REVIEW} reason={rejection_reason[:100]}",
              level="warning")
-
         if attempt < MAX_RETRIES_REVIEW:
             console.print(Panel(
-                f"[yellow]Reintento {attempt+1}/{MAX_RETRIES_REVIEW}[/]\n[dim]{rejection_reason[:200]}[/]",
-                title=f"[yellow]↻ Ciclo impl→review — feature #{feature_id}[/]",
-                border_style="yellow",
-                padding=(0, 1)
+                f"[yellow]Reviewer rechazó — reintento {attempt+1}/{MAX_RETRIES_REVIEW}[/]\n"
+                f"[dim]{rejection_reason[:200]}[/]",
+                title=f"[yellow]↻ Ciclo impl→e2e→review — feature #{feature_id}[/]",
+                border_style="yellow", padding=(0, 1)
             ))
 
-    return {"approved": False, "attempts": MAX_RETRIES_REVIEW, "final_verdict": f"REJECTED tras {MAX_RETRIES_REVIEW} intentos: {rejection_reason}"}
+    return {
+        "approved": False,
+        "attempts": MAX_RETRIES_REVIEW,
+        "final_verdict": f"REJECTED tras {MAX_RETRIES_REVIEW} intentos: {rejection_reason}"
+    }
 
 
 # ─── LOOP DEL LEADER ─────────────────────────────────────────────────────────
@@ -343,6 +555,7 @@ def run_leader(user_task: str) -> str:
         if api_response is None:
             return "[ERROR: leader no obtuvo respuesta de la API]"
 
+        _track_usage("leader", api_response.usage)
         msg = api_response.choices[0].message
 
         if not msg.tool_calls:
@@ -350,6 +563,7 @@ def run_leader(user_task: str) -> str:
             return msg.content or ""
 
         messages.append(msg)
+        messages = _compact_messages(messages, "leader")
 
         for tc in msg.tool_calls:
             fn_name = tc.function.name
@@ -423,39 +637,49 @@ def main():
     console.print(Panel(
         f"[bold white]DeepSeek Multi-Agent Harness[/]\n"
         f"Modelo: [cyan]{MODEL}[/]\n"
-        f"Roles:  [green]Leader[/] → [blue]Implementer[/] → [magenta]Reviewer[/]\n"
-        f"[dim]Comandos: /salir | /estado | /features[/]",
+        f"Roles:  [green]Leader[/] → [blue]Implementer[/] → [yellow]E2E Tester[/] → [magenta]Reviewer[/]\n"
+        f"[dim]Comandos: /salir | /estado | /features | /costos[/]",
         border_style="white",
         padding=(1, 2)
     ))
 
-    while True:
-        try:
-            user_input = console.input("[bold white]Tú →[/] ").strip()
-        except (KeyboardInterrupt, EOFError):
-            console.print("\n[dim]Saliendo...[/]")
-            break
+    # Checkpointing: recuperar features atascadas de sesiones anteriores
+    recover_stale_features()
 
-        if not user_input:
-            continue
+    try:
+        while True:
+            try:
+                user_input = console.input("[bold white]Tú →[/] ").strip()
+            except (KeyboardInterrupt, EOFError):
+                console.print("\n[dim]Saliendo...[/]")
+                break
 
-        if user_input == "/salir":
-            break
-        elif user_input == "/estado":
-            with open("progress/current.md", "r") as f:
-                console.print(Markdown(f.read()))
-            continue
-        elif user_input == "/features":
-            print_features()
-            continue
+            if not user_input:
+                continue
 
-        result = run_leader(user_input)
-        console.print(Panel(
-            f"{result}",
-            title="[green]Leader — resultado final[/]",
-            border_style="green",
-            padding=(0, 1)
-        ))
+            if user_input == "/salir":
+                break
+            elif user_input == "/estado":
+                with open("progress/current.md", "r") as f:
+                    console.print(Markdown(f.read()))
+                continue
+            elif user_input == "/features":
+                print_features()
+                continue
+            elif user_input == "/costos":
+                _write_session_costs()
+                continue
+
+            result = run_leader(user_input)
+            console.print(Panel(
+                f"{result}",
+                title="[green]Leader — resultado final[/]",
+                border_style="green",
+                padding=(0, 1)
+            ))
+    finally:
+        # Siempre escribir costos al salir, incluso si hay crash
+        _write_session_costs()
 
 
 if __name__ == "__main__":

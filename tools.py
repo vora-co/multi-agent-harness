@@ -3,7 +3,7 @@ import os, json, subprocess, datetime, re
 # ─── SEGURIDAD ───────────────────────────────────────────────────────────────
 
 # Directorios donde los agentes pueden escribir (relativo al CWD del proyecto)
-SAFE_WRITE_DIRS = ("src/", "tests/", "progress/", "docs/")
+SAFE_WRITE_DIRS = ("src/", "tests/", "progress/", "docs/", "tests/e2e/", "tests/screenshots/")
 
 # Patrones de comandos bash bloqueados — evita destrucción accidental
 BLOCKED_BASH_PATTERNS = [
@@ -129,6 +129,86 @@ def read_feature_list() -> str:
     except Exception as e:
         return json.dumps({"error": str(e)})
 
+def run_playwright_tests(test_path: str = "tests/e2e/", base_url: str = "http://localhost:8000",
+                         headed: bool = False, timeout_ms: int = 30000) -> str:
+    """
+    Corre tests E2E con Playwright/pytest-playwright.
+    Instala dependencias si no están disponibles.
+    Captura screenshots en failures automáticamente.
+    """
+    # Verificar/instalar pytest-playwright
+    check = subprocess.run("python -m pytest --co -q tests/e2e/ 2>&1 | head -5",
+                           shell=True, capture_output=True, text=True)
+    if "No module named" in check.stdout or "playwright" not in check.stdout.lower():
+        install = subprocess.run(
+            "pip install pytest-playwright playwright --quiet --break-system-packages && "
+            "playwright install chromium --with-deps",
+            shell=True, capture_output=True, text=True, timeout=120
+        )
+        if install.returncode != 0:
+            return json.dumps({"error": "No se pudo instalar playwright", "stderr": install.stderr[:500]})
+
+    os.makedirs("tests/screenshots", exist_ok=True)
+
+    headed_flag = "--headed" if headed else ""
+    cmd = (
+        f"python -m pytest {test_path} -v --tb=short "
+        f"--base-url={base_url} "
+        f"--screenshot=only-on-failure "
+        f"--output=tests/screenshots "
+        f"--timeout={timeout_ms // 1000} "
+        f"{headed_flag} 2>&1"
+    )
+    try:
+        result = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=300)
+        output = result.stdout + result.stderr
+
+        # Listar screenshots generados si hubo fallos
+        screenshots = []
+        if os.path.exists("tests/screenshots"):
+            screenshots = [f for f in os.listdir("tests/screenshots") if f.endswith(".png")]
+
+        return json.dumps({
+            "output": output[-3000:],
+            "returncode": result.returncode,
+            "success": result.returncode == 0,
+            "screenshots": screenshots,
+            "tip": "Si hay screenshots, léelos con read_file para ver el estado de la UI en el fallo."
+        })
+    except subprocess.TimeoutExpired:
+        return json.dumps({"error": "Timeout: los tests E2E tardaron más de 5 minutos."})
+    except Exception as e:
+        return json.dumps({"error": str(e)})
+
+
+def take_screenshot(url: str, output_path: str = "tests/screenshots/manual.png") -> str:
+    """
+    Toma un screenshot de una URL usando Playwright (headless).
+    Útil para verificar el estado visual de la app en un punto específico.
+    """
+    if not _is_safe_path(output_path):
+        return json.dumps({"error": f"Path '{output_path}' fuera de los directorios permitidos."})
+    script = (
+        f"from playwright.sync_api import sync_playwright; "
+        f"p = sync_playwright().start(); "
+        f"b = p.chromium.launch(); "
+        f"page = b.new_page(); "
+        f"page.goto('{url}'); "
+        f"page.screenshot(path='{output_path}', full_page=True); "
+        f"b.close(); p.stop(); "
+        f"print('screenshot guardado en {output_path}')"
+    )
+    try:
+        result = subprocess.run(
+            f'python -c "{script}"', shell=True, capture_output=True, text=True, timeout=30
+        )
+        if result.returncode == 0:
+            return json.dumps({"status": "ok", "path": output_path})
+        return json.dumps({"error": result.stderr[:300]})
+    except Exception as e:
+        return json.dumps({"error": str(e)})
+
+
 def run_mutation_tests(paths_to_mutate: str = "src/", tests_dir: str = "tests/") -> str:
     """
     Corre mutation testing con mutmut sobre el path indicado.
@@ -188,6 +268,8 @@ TOOLS_FN = {
     "update_feature_status": update_feature_status,
     "read_feature_list": read_feature_list,
     "run_mutation_tests": run_mutation_tests,
+    "run_playwright_tests": run_playwright_tests,
+    "take_screenshot": take_screenshot,
 }
 
 TOOLS_SCHEMA = {
@@ -216,6 +298,25 @@ TOOLS_SCHEMA = {
         {"feature_id": {"type": "integer"}, "status": {"type": "string"}}, ["feature_id", "status"]),
 
     "read_feature_list": _schema("read_feature_list", "Lee feature_list.json completo.", {}, []),
+
+    "run_playwright_tests": _schema(
+        "run_playwright_tests",
+        "Corre tests E2E con Playwright. Ejecutar DESPUÉS de que los tests unitarios pasen. "
+        "Captura screenshots automáticamente en fallos. Retorna output, success y lista de screenshots.",
+        {
+            "test_path":   {"type": "string", "description": "Carpeta o archivo de tests E2E. Default: 'tests/e2e/'"},
+            "base_url":    {"type": "string", "description": "URL base de la app. Default: 'http://localhost:8000'"},
+            "headed":      {"type": "boolean","description": "Mostrar navegador. Default: false (headless)"},
+            "timeout_ms":  {"type": "integer","description": "Timeout por test en ms. Default: 30000"}
+        }, []),
+
+    "take_screenshot": _schema(
+        "take_screenshot",
+        "Toma un screenshot de una URL con Playwright (headless). Útil para verificar estado visual.",
+        {
+            "url":         {"type": "string", "description": "URL a capturar"},
+            "output_path": {"type": "string", "description": "Ruta de salida .png. Default: 'tests/screenshots/manual.png'"}
+        }, ["url"]),
 
     "run_mutation_tests": _schema(
         "run_mutation_tests",
