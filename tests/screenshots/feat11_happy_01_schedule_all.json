@@ -1,0 +1,35 @@
+{
+  "status": 200,
+  "body": [
+    {
+      "id": 1,
+      "title": "Yoga Flow",
+      "instructor": "Alice",
+      "style": "Vinyasa",
+      "starts_at": "2025-07-01T08:00:00",
+      "duration_minutes": 60,
+      "capacity": 20,
+      "enrolled": 0
+    },
+    {
+      "id": 2,
+      "title": "Power Pilates",
+      "instructor": "Alice",
+      "style": "Pilates",
+      "starts_at": "2025-07-02T10:00:00",
+      "duration_minutes": 60,
+      "capacity": 20,
+      "enrolled": 0
+    },
+    {
+      "id": 3,
+      "title": "Zen Meditation",
+      "instructor": "Alice",
+      "style": "Meditation",
+      "starts_at": "2025-07-03T12:00:00",
+      "duration_minutes": 60,
+      "capacity": 20,
+      "enrolled": 0
+    }
+  ]
+}

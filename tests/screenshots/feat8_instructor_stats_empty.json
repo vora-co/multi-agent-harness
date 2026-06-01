@@ -1,0 +1,23 @@
+{
+  "status": 200,
+  "body": [
+    {
+      "id": 1,
+      "name": "Alice",
+      "sessions_count": 13,
+      "total_enrolled": 0
+    },
+    {
+      "id": 2,
+      "name": "Bob",
+      "sessions_count": 4,
+      "total_enrolled": 0
+    },
+    {
+      "id": 3,
+      "name": "Charlie",
+      "sessions_count": 1,
+      "total_enrolled": 0
+    }
+  ]
+}

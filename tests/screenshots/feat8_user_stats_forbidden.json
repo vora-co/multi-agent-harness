@@ -1,0 +1,6 @@
+{
+  "status": 403,
+  "body": {
+    "detail": "Admin privileges required"
+  }
+}

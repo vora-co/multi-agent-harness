@@ -1,0 +1,6 @@
+{
+  "status": 409,
+  "body": {
+    "detail": "Cannot delete session with enrolled participants"
+  }
+}

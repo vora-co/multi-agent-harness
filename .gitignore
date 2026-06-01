@@ -5,3 +5,8 @@ __pycache__/
 *.pyo
 .vscode/
 .pytest_cache/
+mutants/
+.mutmut-cache
+data/
+node_modules/
+frontend/dist/

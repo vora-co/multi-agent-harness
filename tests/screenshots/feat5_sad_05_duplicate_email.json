@@ -1,0 +1,6 @@
+{
+  "status": 400,
+  "body": {
+    "detail": "Email already registered"
+  }
+}

@@ -1,0 +1,22 @@
+{
+  "status": 200,
+  "body": [
+    {
+      "id": 28,
+      "user_id": 88,
+      "session_id": 1,
+      "status": "confirmed",
+      "created_at": "2026-05-29T23:13:19.119914",
+      "session": {
+        "id": 1,
+        "title": "Table Test Session",
+        "instructor": "Master Yoda",
+        "style": "Jedi",
+        "starts_at": "2025-10-01T14:00:00",
+        "duration_minutes": 60,
+        "capacity": 20,
+        "enrolled": 1
+      }
+    }
+  ]
+}

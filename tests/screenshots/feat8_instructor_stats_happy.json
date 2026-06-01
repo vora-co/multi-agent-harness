@@ -1,0 +1,17 @@
+{
+  "status": 200,
+  "body": [
+    {
+      "id": 1,
+      "name": "Alice",
+      "sessions_count": 7,
+      "total_enrolled": 0
+    },
+    {
+      "id": 2,
+      "name": "Bob",
+      "sessions_count": 2,
+      "total_enrolled": 0
+    }
+  ]
+}

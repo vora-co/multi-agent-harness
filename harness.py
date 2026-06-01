@@ -1,4 +1,47 @@
-import os, json, time, logging, datetime
+import os, json, time, logging, datetime, subprocess, sys
+
+# ─── AUTO-INSTALACIÓN DE DEPENDENCIAS ────────────────────────────────────────
+def _ensure_deps():
+    """
+    Verifica e instala todo lo necesario antes de arrancar.
+    Solo corre cuando algo falta — en sesiones normales es instantáneo.
+    """
+    missing = []
+    checks = {
+        "fastapi":    "fastapi",
+        "uvicorn":    "uvicorn",
+        "jose":       "python-jose[cryptography]",
+        "passlib":    "passlib[bcrypt]",
+        "playwright": "playwright",
+        "pytest":     "pytest",
+        "httpx":      "httpx",
+    }
+    for module, package in checks.items():
+        try:
+            __import__(module)
+        except ImportError:
+            missing.append(package)
+
+    if missing:
+        print(f"📦 Instalando dependencias faltantes: {', '.join(missing)}")
+        subprocess.check_call(
+            [sys.executable, "-m", "pip", "install", "-r", "requirements.txt", "-q"]
+        )
+        print("✓ Dependencias instaladas.\n")
+
+    # Instalar browsers de Playwright si no están disponibles
+    try:
+        from playwright.sync_api import sync_playwright
+        with sync_playwright() as p:
+            p.chromium.launch().close()
+    except Exception:
+        print("📦 Instalando Playwright chromium...")
+        subprocess.run(
+            [sys.executable, "-m", "playwright", "install", "chromium"],
+            capture_output=True
+        )
+        print("✓ Playwright listo.\n")
+
 from openai import OpenAI
 from dotenv import load_dotenv
 from rich.console import Console
@@ -10,6 +53,7 @@ import agents.leader as leader_cfg
 import agents.implementer as impl_cfg
 import agents.reviewer as reviewer_cfg
 import agents.e2e_tester as e2e_cfg
+import agents.spec_writer as spec_cfg
 from tools import execute_tool
 
 load_dotenv()
@@ -21,8 +65,10 @@ VERBOSE = True
 MAX_RETRIES_API    = 3   # Reintentos ante errores transitorios de la API (rate limit, timeout)
 MAX_RETRIES_IMPL   = 3   # Cuántas veces el implementer puede reintentar una feature
 MAX_RETRIES_REVIEW = 2   # Cuántas veces el ciclo impl→review puede repetirse antes de marcar "failed"
-MAX_ITER_LEADER    = 20  # Iteraciones máximas del loop del leader
-MAX_ITER_AGENT     = 15  # Iteraciones máximas de run_agent (implementer/reviewer/e2e)
+MAX_ITER_LEADER    = 30  # Iteraciones máximas del loop del leader
+MAX_ITER_AGENT     = 30  # Default — e2e_tester
+MAX_ITER_IMPL      = 50  # Implementer: leer contexto + escribir código + tests
+MAX_ITER_REVIEWER  = 40  # Reviewer: leer reportes + correr tests + mutation testing
 RETRY_BACKOFF      = [2, 4, 8]  # segundos entre retries de API
 
 # Compactación de contexto — mejores prácticas 2025:
@@ -59,11 +105,51 @@ client = OpenAI(
 # ─── OBSERVABILIDAD DE COSTOS ────────────────────────────────────────────────
 _SESSION_COSTS: dict = {
     "leader":       {"prompt_tokens": 0, "completion_tokens": 0, "calls": 0},
+    "spec_writer":  {"prompt_tokens": 0, "completion_tokens": 0, "calls": 0},
     "implementer":  {"prompt_tokens": 0, "completion_tokens": 0, "calls": 0},
     "reviewer":     {"prompt_tokens": 0, "completion_tokens": 0, "calls": 0},
     "e2e_tester":   {"prompt_tokens": 0, "completion_tokens": 0, "calls": 0},
     "compaction":   {"prompt_tokens": 0, "completion_tokens": 0, "calls": 0},
 }
+
+# ─── UTILIDADES DE CONSOLA ───────────────────────────────────────────────────
+
+_AGENT_STYLES = {
+    "leader":      ("green",   "👑"),
+    "spec_writer": ("cyan",    "📋"),
+    "implementer": ("blue",    "🔨"),
+    "e2e_tester":  ("yellow",  "🧪"),
+    "reviewer":    ("magenta", "🔍"),
+}
+
+def _phase_header(agent: str, action: str, feature_id: int = None,
+                  attempt: int = None, total_features: int = None, current_feature: int = None):
+    """Imprime un header claro de fase con agente, acción y contexto."""
+    color, icon = _AGENT_STYLES.get(agent, ("white", "•"))
+    progress = ""
+    if total_features and current_feature:
+        progress = f" [dim]({current_feature}/{total_features})[/]"
+    feat_info = f" → Feature #{feature_id}" if feature_id else ""
+    attempt_info = f" [dim](intento {attempt})[/]" if attempt and attempt > 1 else ""
+
+    console.rule(
+        f"[{color}]{icon} {agent.upper()} — {action}{feat_info}[/]{attempt_info}{progress}",
+        style=color
+    )
+
+def _agent_action(agent: str, tool: str, args_preview: str, step: int):
+    """Línea compacta mostrando qué herramienta está usando el agente."""
+    color, icon = _AGENT_STYLES.get(agent, ("white", "•"))
+    console.print(
+        f"  [{color}]{icon}[/] [dim]paso {step:02d}[/] "
+        f"[bold]{tool}[/] [dim]{args_preview[:80]}[/]"
+    )
+
+def _agent_result(result_preview: str, success: bool = True):
+    """Resultado compacto de una herramienta."""
+    icon = "✓" if success else "✗"
+    color = "green" if success else "red"
+    console.print(f"         [{color}]{icon}[/] [dim]{result_preview[:120]}[/]")
 _SESSION_START = datetime.datetime.now()
 
 def _track_usage(role: str, usage) -> None:
@@ -143,6 +229,12 @@ def recover_stale_features() -> list[int]:
 
 # ─── COMPACTACIÓN DE CONTEXTO ────────────────────────────────────────────────
 
+def _msg_field(m, field, default=""):
+    """Accede a un campo de un mensaje que puede ser dict o ChatCompletionMessage (Pydantic)."""
+    if isinstance(m, dict):
+        return m.get(field, default)
+    return getattr(m, field, default)
+
 def _compact_messages(messages: list, role: str) -> list:
     """
     Cuando el historial supera COMPACT_THRESHOLD mensajes, resume el bloque
@@ -154,17 +246,27 @@ def _compact_messages(messages: list, role: str) -> list:
 
     system_msg   = messages[0]
     initial_task = messages[1]
-    tail         = messages[-COMPACT_KEEP_TAIL:]
-    middle       = messages[2:-COMPACT_KEEP_TAIL]
+    raw_tail     = messages[-COMPACT_KEEP_TAIL:]
+
+    # Garantizar que el tail empiece en un límite seguro: el primer mensaje
+    # 'assistant' o 'user'. Un tail que empieza con 'tool' causaría error 400
+    # porque la API exige que 'tool' siempre siga a un 'assistant' con tool_calls.
+    safe_start = 0
+    for i, m in enumerate(raw_tail):
+        if _msg_field(m, "role", "") in ("assistant", "user"):
+            safe_start = i
+            break
+    tail   = raw_tail[safe_start:]
+    middle = messages[2: len(messages) - COMPACT_KEEP_TAIL + safe_start]
 
     if not middle:
         return messages
 
-    # Construir texto del bloque medio para resumir
+    # Construir texto del bloque medio para resumir.
     middle_text = ""
     for m in middle:
-        role_label = m.get("role", "?").upper()
-        content = m.get("content") or ""
+        role_label = (_msg_field(m, "role", "?") or "?").upper()
+        content    = _msg_field(m, "content") or ""
         if isinstance(content, list):
             content = json.dumps(content, ensure_ascii=False)
         middle_text += f"[{role_label}]: {str(content)[:300]}\n"
@@ -287,28 +389,25 @@ def run_agent(system_prompt: str, tools: list, task: str,
                 })
                 continue
 
+            args_preview = json.dumps(fn_args, ensure_ascii=False)[:80]
             if VERBOSE:
-                if msg.content:
-                    console.print(f"  [italic dim]{msg.content[:120]}[/]")
-                args_preview = json.dumps(fn_args, ensure_ascii=False)[:200]
-                console.print(Panel(
-                    f"[bold]Action:[/]  [cyan]{fn_name}[/]\n[dim]{args_preview}[/]",
-                    title=f"[{color}]Paso {i+1} — {fn_name}[/]",
-                    border_style=color,
-                    padding=(0, 1)
-                ))
+                _agent_action(role, fn_name, args_preview, i + 1)
 
             _log(role, "TOOL_CALL", f"{fn_name}({json.dumps(fn_args, ensure_ascii=False)[:100]})")
             result = execute_tool(fn_name, fn_args)
             _log(role, "TOOL_RESULT", result[:200])
 
             if VERBOSE:
-                console.print(Panel(
-                    f"[dim]{result[:400]}[/]",
-                    title=f"[yellow]Observation — Paso {i+1}[/]",
-                    border_style="yellow",
-                    padding=(0, 1)
-                ))
+                try:
+                    parsed = json.loads(result)
+                    success = not ("error" in parsed) and parsed.get("success", True) is not False
+                    preview = parsed.get("stdout") or parsed.get("content") or parsed.get("status") or result
+                    if isinstance(preview, str):
+                        preview = preview.strip()[:120]
+                except Exception:
+                    success = True
+                    preview = result[:120]
+                _agent_result(str(preview), success)
 
             messages.append({
                 "role": "tool",
@@ -322,12 +421,42 @@ def run_agent(system_prompt: str, tools: list, task: str,
 
 # ─── SPAWNERS ────────────────────────────────────────────────────────────────
 
+def _file_tree(path: str, max_files: int = 60) -> str:
+    """Snapshot compacto del árbol de archivos relevantes (sin node_modules)."""
+    try:
+        result = subprocess.run(
+            ["find", path, "-type", "f",
+             "-not", "-path", "*/node_modules/*",
+             "-not", "-path", "*/__pycache__/*",
+             "-not", "-path", "*/.git/*"],
+            capture_output=True, text=True, timeout=5
+        )
+        lines = sorted(result.stdout.strip().splitlines())[:max_files]
+        return "\n".join(lines) or "(vacío)"
+    except Exception:
+        return "(no disponible)"
+
+
 def spawn_implementer(feature_id: int, description: str, attempt: int = 1,
-                      rejection_reason: str = "") -> str:
+                      rejection_reason: str = "", spec_path: str = None) -> str:
     """
-    Lanza el implementer. Si es un reintento, inyecta el motivo de rechazo
-    para que el agente no cometa el mismo error.
+    Lanza el implementer. Si es un primer intento y el impl anterior pasó tests,
+    lo reutiliza. Si es reintento, inyecta el motivo de rechazo.
     """
+    impl_path = f"progress/impl_{feature_id}.md"
+
+    # Fix 2: Reutilizar impl si ya existe y muestra tests pasando
+    if attempt == 1 and os.path.exists(impl_path):
+        try:
+            with open(impl_path, "r", encoding="utf-8") as f:
+                content = f.read()
+            if "passed" in content and "[ERROR" not in content:
+                _log("implementer", "SKIP", f"Impl existente con tests OK: {impl_path}")
+                console.print(f"  [blue]🔨 IMPLEMENTER[/] [dim]↩ reutilizando impl existente →[/] {impl_path}")
+                return impl_path
+        except Exception:
+            pass
+
     context = ""
     if attempt > 1 and rejection_reason:
         context = (
@@ -336,71 +465,129 @@ def spawn_implementer(feature_id: int, description: str, attempt: int = 1,
             f"Debes corregir exactamente esos puntos antes de volver a reportar."
         )
 
-    console.print(Panel(
-        f"[bold]Feature #{feature_id}[/] [dim](intento {attempt}/{MAX_RETRIES_IMPL})[/]\n"
-        f"[dim]{description[:200]}[/]",
-        title="[blue]>> IMPLEMENTER activo[/]",
-        border_style="blue",
-        padding=(0, 1)
-    ))
+    _phase_header("implementer", "Implementando", feature_id, attempt)
     _log("implementer", "SPAWN", f"feature={feature_id} attempt={attempt}")
 
+    cwd = os.getcwd()
+
+    # Fix 1: Pre-inyectar árbol de archivos para evitar reads exploratorios
+    tree_src     = _file_tree("src")
+    tree_frontend = _file_tree("frontend/src") if os.path.exists("frontend/src") else "(no existe aún)"
+    tree_tests   = _file_tree("tests")
+
+    spec_content = ""
+    if spec_path and os.path.exists(spec_path):
+        try:
+            with open(spec_path, "r", encoding="utf-8") as f:
+                spec_content = f"\n## Especificación técnica ({spec_path}):\n{f.read()}\n"
+        except Exception:
+            spec_content = f"\nLee la especificación técnica en {spec_path} ANTES de escribir código.\n"
+
     task = (
+        f"DIRECTORIO DE TRABAJO: {cwd}\n"
+        f"Todos los comandos bash deben ejecutarse desde este directorio.\n\n"
+        f"## Árbol de archivos actual (src/):\n{tree_src}\n\n"
+        f"## Árbol de archivos actual (frontend/src/):\n{tree_frontend}\n\n"
+        f"## Árbol de archivos actual (tests/):\n{tree_tests}\n"
+        f"{spec_content}\n"
         f"Implementa la feature #{feature_id}: {description}{context}\n"
-        f"Escribe tu reporte en progress/impl_{feature_id}.md\n"
+        f"Escribe tu reporte en {impl_path}\n"
         f"Devuelve solo la ruta del archivo cuando termines."
     )
     result = run_agent(impl_cfg.SYSTEM_PROMPT, impl_cfg.TOOLS, task,
-                       role="implementer", color="blue")
-    console.print(Panel(
-        f"[dim]{result[:200]}[/]",
-        title="[blue]<< IMPLEMENTER terminó[/]",
-        border_style="blue",
-        padding=(0, 1)
-    ))
+                       role="implementer", color="blue", max_iter=MAX_ITER_IMPL)
+    done = not result.startswith("[ERROR")
+    console.print(f"  [blue]🔨 IMPLEMENTER[/] {'[green]✓ terminó[/]' if done else '[red]✗ error[/]'} → {result[:80]}")
     return result
 
 
-def spawn_reviewer(feature_id: int) -> str:
-    console.print(Panel(
-        f"Revisando feature [bold]#{feature_id}[/]",
-        title="[magenta]>> REVIEWER activo[/]",
-        border_style="magenta",
-        padding=(0, 1)
-    ))
-    _log("reviewer", "SPAWN", f"feature={feature_id}")
+def spawn_spec_writer(feature_id: int, description: str) -> str:
+    """Genera la spec técnica detallada antes de implementar.
+    Si la spec ya existe en disco, la reutiliza sin llamar al agente.
+    """
+    spec_path = f"progress/spec_{feature_id}.md"
+
+    # Reutilizar spec existente — evita gastar iteraciones regenerando
+    if os.path.exists(spec_path):
+        _log("spec_writer", "SKIP", f"Spec ya existe: {spec_path}")
+        console.print(f"  [cyan]📋 SPEC_WRITER[/] [dim]↩ reutilizando spec existente →[/] {spec_path}")
+        return spec_path
+
+    _phase_header("spec_writer", "Escribiendo spec", feature_id)
+    cwd = os.getcwd()
+    task = (
+        f"DIRECTORIO DE TRABAJO: {cwd}\n\n"
+        f"Escribe la especificación técnica para la feature #{feature_id}: {description}\n"
+        f"Guarda la spec en {spec_path}\n"
+        f"Devuelve SOLO la ruta: {spec_path}"
+    )
+    result = run_agent(spec_cfg.SYSTEM_PROMPT, spec_cfg.TOOLS, task,
+                       role="spec_writer", color="cyan", max_iter=35)
+    done = not result.startswith("[ERROR")
+    console.print(f"  [cyan]📋 SPEC_WRITER[/] {'[green]✓ spec lista[/]' if done else '[red]✗ error[/]'} → {result[:80]}")
+    return result
+
+
+def spawn_reviewer(feature_id: int, e2e: bool = True) -> str:
+    _phase_header("reviewer", "Revisando", feature_id)
+    _log("reviewer", "SPAWN", f"feature={feature_id} e2e={e2e}")
+
+    cwd = os.getcwd()
+
+    # Fix 1: Pre-inyectar árbol de archivos relevante
+    tree_src      = _file_tree("src")
+    tree_frontend = _file_tree("frontend/src") if os.path.exists("frontend/src") else "(no existe)"
+    tree_tests    = _file_tree("tests")
+
+    # Fix 3: Instrucción de validación según tipo de feature
+    if not e2e:
+        validation_mode = (
+            "MODO REVISIÓN FRONTEND (e2e=false):\n"
+            "- Lee el reporte del implementer en progress/impl_{fid}.md\n"
+            "- Verifica que los archivos listados en el reporte existan en disco (usa run_bash con 'ls')\n"
+            "- Verifica que el código JSX/JS no tenga errores de sintaxis obvios (usa run_bash con 'node --check' si aplica)\n"
+            "- NO intentes levantar el servidor de desarrollo\n"
+            "- NO intentes correr Playwright ni tests E2E\n"
+            "- NO corras 'npm run dev' ni 'npm run build'\n"
+            "- Si los archivos existen y el reporte indica éxito, aprueba.\n"
+        ).format(fid=feature_id)
+        max_iter = 15  # revisión liviana — no necesita más
+    else:
+        validation_mode = (
+            "Revisa el trabajo del implementer para la feature #{fid}.\n"
+            "Corre los tests con pytest y valida que pasen.\n"
+        ).format(fid=feature_id)
+        max_iter = MAX_ITER_REVIEWER
 
     task = (
-        f"Revisa el trabajo del implementer para la feature #{feature_id}.\n"
+        f"DIRECTORIO DE TRABAJO: {cwd}\n\n"
+        f"## Árbol de archivos actual (src/):\n{tree_src}\n\n"
+        f"## Árbol de archivos actual (frontend/src/):\n{tree_frontend}\n\n"
+        f"## Árbol de archivos actual (tests/):\n{tree_tests}\n\n"
+        f"{validation_mode}\n"
         f"El reporte del implementer está en progress/impl_{feature_id}.md\n"
         f"Escribe tu veredicto en progress/review_{feature_id}.md\n"
         f"Devuelve SOLO: 'APPROVED' o 'REJECTED: <razón>'"
     )
     result = run_agent(reviewer_cfg.SYSTEM_PROMPT, reviewer_cfg.TOOLS, task,
-                       role="reviewer", color="magenta")
+                       role="reviewer", color="magenta", max_iter=max_iter)
 
     approved = result.strip().startswith("APPROVED")
-    color = "green" if approved else "red"
+    verdict_color = "green" if approved else "red"
+    verdict_icon  = "✅" if approved else "❌"
     _log("reviewer", "VERDICT", result[:200], level="info" if approved else "warning")
-    console.print(Panel(
-        f"[bold]{result[:200]}[/]",
-        title=f"[{color}]<< REVIEWER veredicto[/]",
-        border_style=color,
-        padding=(0, 1)
-    ))
+    console.print(f"  [magenta]🔍 REVIEWER[/] [{verdict_color}]{verdict_icon} {result[:100]}[/]")
     return result
 
 
 def spawn_e2e_tester(feature_id: int) -> str:
-    console.print(Panel(
-        f"Tests E2E para feature [bold]#{feature_id}[/]",
-        title="[yellow]>> E2E_TESTER activo[/]",
-        border_style="yellow",
-        padding=(0, 1)
-    ))
+    _phase_header("e2e_tester", "Tests E2E", feature_id)
     _log("e2e_tester", "SPAWN", f"feature={feature_id}")
 
+    cwd = os.getcwd()
     task = (
+        f"DIRECTORIO DE TRABAJO: {cwd}\n"
+        f"Todos los comandos bash deben ejecutarse desde este directorio.\n\n"
         f"Ejecuta los tests E2E para la feature #{feature_id}.\n"
         f"El reporte del implementer está en progress/impl_{feature_id}.md\n"
         f"Escribe tu reporte en progress/e2e_{feature_id}.md\n"
@@ -421,24 +608,30 @@ def spawn_e2e_tester(feature_id: int) -> str:
     return result
 
 
-def run_feature_cycle(feature_id: int, description: str) -> dict:
+def run_feature_cycle(feature_id: int, description: str, e2e: bool = True) -> dict:
     """
-    Ciclo completo: impl → e2e → review con reintentos.
+    Ciclo completo: spec → impl → (e2e) → review con reintentos.
     Flujo:
-      1. Implementer escribe código + tests unitarios.
-      2. E2E Tester valida con Playwright (flujos de usuario reales).
-      3. Reviewer verifica todo: unit tests, mutation score, e2e y checkpoints.
-    Si el reviewer rechaza, reintenta desde el paso 1 con el motivo inyectado.
+      1. Spec Writer produce la especificación técnica detallada.
+      2. Implementer escribe código + tests siguiendo la spec.
+      3. E2E Tester (solo si e2e=True) valida con Playwright.
+      4. Reviewer verifica tests + checkpoints.
+    Si el reviewer rechaza, reintenta impl→e2e→review con el motivo inyectado.
     Retorna dict con: approved (bool), attempts (int), final_verdict (str).
     """
+    # ── Paso 1: Spec (solo en el primer intento) ─────────────────────────────
+    spec_result = spawn_spec_writer(feature_id, description)
+    spec_path = spec_result.strip() if not spec_result.startswith("[ERROR") else None
+
     rejection_reason = ""
     for attempt in range(1, MAX_RETRIES_REVIEW + 1):
 
-        # ── Paso 1: Implementar ──────────────────────────────────────────────
+        # ── Paso 2: Implementar ──────────────────────────────────────────────
         impl_result = spawn_implementer(
             feature_id, description,
             attempt=attempt,
-            rejection_reason=rejection_reason
+            rejection_reason=rejection_reason,
+            spec_path=spec_path
         )
         if "[ERROR" in impl_result.upper():
             err_type = _classify_error(impl_result)
@@ -449,8 +642,11 @@ def run_feature_cycle(feature_id: int, description: str) -> dict:
             rejection_reason = impl_result
             continue
 
-        # ── Paso 2: E2E Testing ──────────────────────────────────────────────
-        e2e_result = spawn_e2e_tester(feature_id)
+        # ── Paso 2: E2E Testing (solo si la feature lo requiere) ────────────
+        if not e2e:
+            e2e_result = "E2E_PASSED"  # no aplica — saltear silenciosamente
+        else:
+            e2e_result = spawn_e2e_tester(feature_id)
         if e2e_result.strip().startswith("E2E_FAILED"):
             e2e_reason = e2e_result.replace("E2E_FAILED:", "").strip()
             _log("harness", "E2E_FAILED",
@@ -467,7 +663,7 @@ def run_feature_cycle(feature_id: int, description: str) -> dict:
             continue
 
         # ── Paso 3: Revisar ──────────────────────────────────────────────────
-        review_result = spawn_reviewer(feature_id)
+        review_result = spawn_reviewer(feature_id, e2e=e2e)
         if review_result.strip().startswith("APPROVED"):
             return {"approved": True, "attempts": attempt, "final_verdict": review_result}
 
@@ -492,7 +688,33 @@ def run_feature_cycle(feature_id: int, description: str) -> dict:
 
 # ─── LOOP DEL LEADER ─────────────────────────────────────────────────────────
 
+def _build_leader_task(user_task: str) -> str:
+    """
+    Pre-inyecta feature_list.json y progress/current.md en el mensaje del leader
+    para eliminar 2-3 tool calls de overhead por sesión.
+    """
+    try:
+        with open("feature_list.json", "r", encoding="utf-8") as f:
+            features = json.load(f)
+        features_json = json.dumps(features, indent=2, ensure_ascii=False)
+    except Exception as e:
+        features_json = f"(no disponible: {e})"
+
+    try:
+        with open("progress/current.md", "r", encoding="utf-8") as f:
+            current_md = f.read().strip()
+    except Exception:
+        current_md = "(sin estado previo)"
+
+    return (
+        f"## feature_list.json (estado actual)\n```json\n{features_json}\n```\n\n"
+        f"## progress/current.md\n{current_md}\n\n"
+        f"## Instrucción del usuario\n{user_task}"
+    )
+
+
 def run_leader(user_task: str) -> str:
+    enriched_task = _build_leader_task(user_task)
     console.print(Panel(
         f"[dim]{user_task}[/]",
         title="[green]>> LEADER activo[/]",
@@ -509,13 +731,14 @@ def run_leader(user_task: str) -> str:
                     "Ejecuta el ciclo completo implementar → revisar para una feature. "
                     f"Reintenta automáticamente hasta {MAX_RETRIES_REVIEW} veces si el reviewer rechaza. "
                     "Devuelve JSON con: approved (bool), attempts (int), final_verdict (str). "
-                    "Úsalo en lugar de llamar spawn_implementer y spawn_reviewer por separado."
+                    "Pasa e2e=false para features sin interfaz web (modelos, storage, API pura)."
                 ),
                 "parameters": {
                     "type": "object",
                     "properties": {
                         "feature_id":  {"type": "integer", "description": "ID de la feature"},
-                        "description": {"type": "string",  "description": "Descripción completa de la tarea"}
+                        "description": {"type": "string",  "description": "Descripción completa de la tarea"},
+                        "e2e":         {"type": "boolean", "description": "true si la feature tiene UI web que probar con Playwright. false para backend/dominio puro. Leer el campo 'e2e' de feature_list.json."}
                     },
                     "required": ["feature_id", "description"]
                 }
@@ -525,7 +748,7 @@ def run_leader(user_task: str) -> str:
 
     messages = [
         {"role": "system", "content": leader_cfg.SYSTEM_PROMPT},
-        {"role": "user",   "content": user_task}
+        {"role": "user",   "content": enriched_task}
     ]
 
     _log("leader", "START", user_task[:120])
@@ -634,14 +857,16 @@ def print_features():
 
 
 def main():
-    console.print(Panel(
-        f"[bold white]DeepSeek Multi-Agent Harness[/]\n"
-        f"Modelo: [cyan]{MODEL}[/]\n"
-        f"Roles:  [green]Leader[/] → [blue]Implementer[/] → [yellow]E2E Tester[/] → [magenta]Reviewer[/]\n"
-        f"[dim]Comandos: /salir | /estado | /features | /costos[/]",
-        border_style="white",
-        padding=(1, 2)
-    ))
+    # Verificar e instalar dependencias antes de mostrar cualquier UI
+    _ensure_deps()
+
+    console.rule("DeepSeek Multi-Agent Harness", style="white")
+    console.print(
+        f"  Modelo: [cyan]{MODEL}[/]  |  "
+        f"Flujo: [green]👑 Leader[/] → [cyan]📋 Spec[/] → [blue]🔨 Impl[/] → [yellow]🧪 E2E[/] → [magenta]🔍 Reviewer[/]\n"
+        f"  [dim]Comandos: /salir | /estado | /features | /costos[/]"
+    )
+    console.rule(style="dim")
 
     # Checkpointing: recuperar features atascadas de sesiones anteriores
     recover_stale_features()
@@ -671,12 +896,8 @@ def main():
                 continue
 
             result = run_leader(user_input)
-            console.print(Panel(
-                f"{result}",
-                title="[green]Leader — resultado final[/]",
-                border_style="green",
-                padding=(0, 1)
-            ))
+            console.rule("[green]✅ Sesión completada[/]", style="green")
+            console.print(f"  [green]👑 LEADER[/] {result}")
     finally:
         # Siempre escribir costos al salir, incluso si hay crash
         _write_session_costs()

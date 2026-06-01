@@ -1,0 +1,11 @@
+{
+  "status": 200,
+  "body": {
+    "id": 4,
+    "name": "E2E Tester",
+    "email": "e2e_1780094265@example.com",
+    "credits": 0,
+    "role": "client",
+    "created_at": "2026-05-29T22:37:46.444522+00:00"
+  }
+}

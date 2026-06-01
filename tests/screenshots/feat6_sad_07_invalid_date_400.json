@@ -1,0 +1,6 @@
+{
+  "status": 400,
+  "body": {
+    "detail": "Invalid date format. Use YYYY-MM-DD."
+  }
+}

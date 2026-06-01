@@ -1,0 +1,8 @@
+{
+  "status": 200,
+  "body": {
+    "message": "User promoted from waitlist successfully",
+    "booking_id": 23,
+    "user_id": 47
+  }
+}

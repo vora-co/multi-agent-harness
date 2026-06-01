@@ -36,6 +36,9 @@ PRINCIPIOS DE TESTING E2E:
 - Un test E2E que pasa por azar es peor que uno que falla consistentemente.
 
 REGLAS DURAS:
+- El DIRECTORIO DE TRABAJO viene especificado al inicio de tu tarea. Úsalo siempre en tus comandos bash. NUNCA inventes rutas de directorios.
+- Usa SIEMPRE python3, nunca python.
+- No leas nada dentro de mutants/ — son archivos temporales de mutmut.
 - No edites código en src/. Si encuentras un bug, repórtalo con evidencia (screenshot).
 - No modifiques tests unitarios existentes.
 - No marques E2E_PASSED si algún escenario falla, aunque sea "poco importante".

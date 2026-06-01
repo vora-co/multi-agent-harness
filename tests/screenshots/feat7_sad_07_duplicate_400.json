@@ -1,0 +1,6 @@
+{
+  "status": 400,
+  "body": {
+    "detail": "User already has an active booking for this session"
+  }
+}

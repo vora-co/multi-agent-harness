@@ -1,0 +1,22 @@
+{
+  "status": 200,
+  "body": [
+    {
+      "id": 1,
+      "user_id": 47,
+      "session_id": 6,
+      "status": "confirmed",
+      "created_at": "2026-05-29T18:22:34.133965",
+      "session": {
+        "id": 6,
+        "title": "Morning Yoga",
+        "instructor": "Alice",
+        "style": "Vinyasa",
+        "starts_at": "2025-06-15T09:00:00",
+        "duration_minutes": 60,
+        "capacity": 20,
+        "enrolled": 1
+      }
+    }
+  ]
+}

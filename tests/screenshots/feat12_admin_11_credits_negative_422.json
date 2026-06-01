@@ -1,0 +1,19 @@
+{
+  "status": 422,
+  "body": {
+    "detail": [
+      {
+        "type": "value_error",
+        "loc": [
+          "body",
+          "credits"
+        ],
+        "msg": "Value error, credits must be positive",
+        "input": -3,
+        "ctx": {
+          "error": {}
+        }
+      }
+    ]
+  }
+}

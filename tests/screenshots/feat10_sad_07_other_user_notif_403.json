@@ -1,0 +1,6 @@
+{
+  "status": 403,
+  "body": {
+    "detail": "Cannot mark another user's notification as read"
+  }
+}

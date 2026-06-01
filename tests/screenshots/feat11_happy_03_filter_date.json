@@ -1,0 +1,15 @@
+{
+  "status": 200,
+  "body": [
+    {
+      "id": 1,
+      "title": "Morning Hatha",
+      "instructor": "Alice",
+      "style": "Hatha",
+      "starts_at": "2025-09-10T07:00:00",
+      "duration_minutes": 60,
+      "capacity": 20,
+      "enrolled": 0
+    }
+  ]
+}

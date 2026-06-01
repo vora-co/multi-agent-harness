@@ -1,26 +1,110 @@
 [
   {
     "id": 1,
-    "title": "Módulo de almacenamiento de notas en JSON",
-    "description": "Crear src/storage.py con funciones load() y save() que lean y escriban notas en data/notes.json de forma atómica.",
+    "title": "Modelo de dominio: User",
+    "description": "Crear src/models/user.py con la clase User (id: int, name: str, email: str, credits: int = 0, role: str — valores válidos: 'client' | 'admin', created_at: datetime). Métodos: to_dict(), from_dict(). Validar email con regex básico (debe contener @ y dominio), lanzar ValueError si inválido. Lanzar ValueError si role no es 'client' ni 'admin'. Tests en tests/test_user.py: crear usuario válido con cada rol, email inválido lanza ValueError, rol inválido lanza ValueError, to_dict/from_dict round-trip, default de credits es 0.",
     "status": "done",
-    "created_at": "2026-05-21T00:00:00",
-    "updated_at": "2026-05-22T08:48:50.178343"
+    "e2e": false,
+    "created_at": "2026-05-29T00:00:00"
   },
   {
     "id": 2,
-    "title": "Modelo de dominio Note",
-    "description": "Crear src/notes.py con la clase Note (id, title, body, created_at). Incluir método to_dict() y from_dict().",
+    "title": "Modelo de dominio: Session",
+    "description": "Crear src/models/session.py con la clase Session (id: int, title: str, instructor: str, style: str, starts_at: datetime, duration_minutes: int, capacity: int, enrolled: int = 0). Métodos: to_dict(), from_dict(), is_full() -> bool, spots_available() -> int. El capacity debe ser >= 1 y duration_minutes >= 15, de lo contrario ValueError. Tests: crear sesión válida, is_full cuando enrolled==capacity, spots_available, valores inválidos lanzan error.",
     "status": "done",
-    "created_at": "2026-05-21T00:00:00",
-    "updated_at": "2026-05-25T10:00:18.536436"
+    "e2e": false,
+    "created_at": "2026-05-29T00:00:00"
   },
   {
     "id": 3,
-    "title": "CLI básico con comandos add y list",
-    "description": "Crear src/cli.py con argparse. Comandos: 'add <title> [--body TEXT]' y 'list'. Usar storage.py y notes.py.",
+    "title": "Modelo de dominio: Booking y Waitlist",
+    "description": "Crear src/models/booking.py con clase Booking (id: int, user_id: int, session_id: int, status: str — valores válidos: 'confirmed' | 'cancelled' | 'waitlist', created_at: datetime). Métodos: to_dict(), from_dict(). Lanza ValueError si status no es uno de los tres valores válidos. Tests: crear booking con cada status, status inválido lanza error, round-trip to_dict/from_dict.",
     "status": "done",
-    "created_at": "2026-05-21T00:00:00",
-    "updated_at": "2026-05-25T10:06:12.070147"
+    "e2e": false,
+    "created_at": "2026-05-29T00:00:00"
+  },
+  {
+    "id": 4,
+    "title": "Capa de almacenamiento JSON",
+    "description": "Crear src/storage.py con funciones genéricas: load(entity: str) -> list (lee data/{entity}.json), save(entity: str, records: list) (escribe atómicamente con tempfile). Crear src/repositories/users.py, sessions.py y bookings.py, cada uno con: find_all(), find_by_id(id), save_one(obj), delete(id). Tests: guardar y leer un registro, delete elimina solo el correcto, find_by_id retorna None si no existe.",
+    "status": "done",
+    "e2e": false,
+    "created_at": "2026-05-29T00:00:00",
+    "updated_at": "2026-05-29T20:36:54.058469"
+  },
+  {
+    "id": 5,
+    "title": "API REST: autenticación simple con JWT",
+    "description": "Crear src/auth.py con autenticación stateless usando JWT (librería: python-jose). Endpoints en src/api.py: POST /api/v1/auth/register (body: {name, email, password, role: 'client'|'admin'}, guarda password como hash bcrypt, retorna token JWT), POST /api/v1/auth/login (body: {email, password}, retorna token JWT con payload {user_id, role, exp: 24h}). Crear dependencia FastAPI get_current_user(token) que valide el JWT y retorne el usuario. Crear dependencia require_admin(user) que retorne 403 si role != 'admin'. Tests con TestClient en tests/test_auth.py: register exitoso, login exitoso, login con password incorrecto retorna 401, token inválido retorna 401.",
+    "status": "done",
+    "e2e": false,
+    "created_at": "2026-05-29T00:00:00",
+    "updated_at": "2026-05-29T20:45:20.065581"
+  },
+  {
+    "id": 6,
+    "title": "API REST: gestión de sesiones (admin)",
+    "description": "Agregar endpoints a src/api.py: GET /api/v1/sessions (público — lista todas, acepta ?style= y ?date=YYYY-MM-DD), GET /api/v1/sessions/{id} (público), POST /api/v1/sessions (requiere admin), PUT /api/v1/sessions/{id} (requiere admin), DELETE /api/v1/sessions/{id} (requiere admin, solo si enrolled == 0, retorna 409 si enrolled > 0). Tests con TestClient en tests/test_sessions_api.py: CRUD admin exitoso, cliente intentando crear sesión recibe 403, filtros por style y date, DELETE con enrolled > 0 retorna 409.",
+    "status": "done",
+    "e2e": false,
+    "created_at": "2026-05-29T00:00:00",
+    "updated_at": "2026-05-29T21:25:15.115924",
+    "recovery_note": "Reseteada a pending por harness tras arranque (posible crash previo)"
+  },
+  {
+    "id": 7,
+    "title": "API REST: reservas de sesiones (cliente)",
+    "description": "Agregar endpoints: POST /api/v1/bookings (requiere auth — crea reserva 'confirmed' si hay cupo y user tiene créditos, 'waitlist' si sesión llena; descuenta 1 crédito si confirmed; retorna 404 si session no existe, 400 si ya tiene reserva activa, 402 si no tiene créditos), GET /api/v1/bookings/me (requiere auth), DELETE /api/v1/bookings/{id} (requiere auth, 403 si intenta cancelar booking ajeno, devuelve crédito si era confirmed). Tests en tests/test_bookings.py.",
+    "status": "done",
+    "e2e": false,
+    "created_at": "2026-05-29T00:00:00",
+    "updated_at": "2026-05-29T21:33:35.473047"
+  },
+  {
+    "id": 8,
+    "title": "Promoción automática desde lista de espera",
+    "description": "Al cancelar una reserva 'confirmed', buscar el primer booking en 'waitlist' para esa session_id (orden ASC por created_at). Si existe y el usuario tiene créditos: promover a 'confirmed', descontar 1 crédito, actualizar session.enrolled. Si no tiene créditos, saltar al siguiente. Todo ocurre dentro del DELETE /api/v1/bookings/{id} existente. Tests: cancelar confirmed promueve al primero con créditos, si el primero no tiene créditos se promueve al siguiente, cancelar waitlist no dispara promoción.",
+    "status": "done",
+    "e2e": false,
+    "created_at": "2026-05-29T00:00:00",
+    "updated_at": "2026-05-29T21:47:54.363708"
+  },
+  {
+    "id": 9,
+    "title": "API REST: créditos y panel de admin",
+    "description": "Endpoints: POST /api/v1/users/{id}/credits (requiere admin — body: {amount: int, reason: str}, amount entre 1 y 100), GET /api/v1/users/{id}/credits/history (requiere admin o ser el propio usuario), GET /api/v1/admin/users (requiere admin), GET /api/v1/admin/sessions/{id}/attendees (requiere admin). Crear src/models/credit_transaction.py. Tests en tests/test_credits.py.",
+    "status": "done",
+    "e2e": false,
+    "created_at": "2026-05-29T00:00:00",
+    "updated_at": "2026-05-31T17:00:32.920294"
+  },
+  {
+    "id": 10,
+    "title": "Frontend React: configuración base y autenticación",
+    "description": "Crear frontend/ con Vite + React + Tailwind CSS. Estructura: frontend/src/components/, pages/, hooks/, api/. Proxy en vite.config.js → http://localhost:8000. Implementar: página Login, página Register, hook useAuth(), PrivateRoute, NavBar responsive. Tests E2E Playwright: login exitoso y redirect, login fallido muestra error, logout.",
+    "status": "done",
+    "e2e": false,
+    "created_at": "2026-05-29T00:00:00",
+    "updated_at": "2026-05-31T23:52:37.346798",
+    "recovery_note": "Reseteada a pending por harness tras arranque (posible crash previo)"
+  },
+  {
+    "id": 11,
+    "title": "Frontend React: agenda pública y reservas (cliente)",
+    "description": "Páginas del cliente: /schedule con grilla responsive de sesiones (badge 'Lista de espera' si llena, botón Reservar, filtros por estilo y fecha), /my-bookings con tabla de reservas y botón Cancelar con modal de confirmación. Tests E2E: ver agenda, reservar con cupo, reservar sesión llena, cancelar reserva.",
+    "status": "done",
+    "e2e": false,
+    "created_at": "2026-05-29T00:00:00",
+    "updated_at": "2026-05-31T19:04:26.209293"
+  },
+  {
+    "id": 12,
+    "title": "Frontend React: panel de administración",
+    "description": "Páginas admin: /admin/sessions con tabla CRUD de sesiones (modal para crear/editar), /admin/users con tabla de usuarios y modal para agregar créditos, /admin/sessions/{id}/attendees. NavBar muestra enlace Admin solo si role='admin'. Tests E2E: crear sesión como admin, acceso /admin como cliente redirige, agregar créditos.",
+    "status": "done",
+    "e2e": false,
+    "created_at": "2026-05-29T00:00:00",
+    "updated_at": "2026-05-31T19:15:44.052286",
+    "recovery_note": "Reseteada a pending por harness tras arranque (posible crash previo)"
   }
 ]

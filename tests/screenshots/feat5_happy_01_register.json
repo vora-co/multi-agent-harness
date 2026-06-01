@@ -1,0 +1,7 @@
+{
+  "status": 200,
+  "body": {
+    "access_token": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ1c2VyX2lkIjo0LCJyb2xlIjoiY2xpZW50IiwiZXhwIjoxNzgwMTgwNjY2fQ.PLrEvN4RaHcG-lA_SmV4cknE4X_VBQoMoLy5MKdOaCE",
+    "token_type": "bearer"
+  }
+}

@@ -3,7 +3,7 @@ import os, json, subprocess, datetime, re
 # ─── SEGURIDAD ───────────────────────────────────────────────────────────────
 
 # Directorios donde los agentes pueden escribir (relativo al CWD del proyecto)
-SAFE_WRITE_DIRS = ("src/", "tests/", "progress/", "docs/", "tests/e2e/", "tests/screenshots/")
+SAFE_WRITE_DIRS = ("src/", "tests/", "progress/", "docs/", "tests/e2e/", "tests/screenshots/", "frontend/")
 
 # Patrones de comandos bash bloqueados — evita destrucción accidental
 BLOCKED_BASH_PATTERNS = [
@@ -20,8 +20,14 @@ BLOCKED_BASH_PATTERNS = [
 VALID_FEATURE_STATUSES = {"pending", "in_progress", "done", "failed"}
 
 def _is_safe_path(path: str) -> bool:
-    """Verifica que el path esté dentro de los directorios permitidos."""
+    """Verifica que el path esté dentro de los directorios permitidos.
+    Acepta rutas absolutas convirtiéndolas a relativas respecto al cwd.
+    """
     normalized = os.path.normpath(path).replace("\\", "/")
+    # Convertir ruta absoluta a relativa si apunta al cwd
+    cwd = os.getcwd().replace("\\", "/")
+    if normalized.startswith(cwd + "/"):
+        normalized = normalized[len(cwd) + 1:]
     # Bloquea traversal
     if ".." in normalized:
         return False
@@ -36,14 +42,25 @@ def _is_safe_command(command: str) -> tuple[bool, str]:
 
 # ─── IMPLEMENTACIONES ───────────────────────────────────────────────────────
 
-def read_file(path: str) -> str:
+def read_file(path: str = None, limit: int = None, offset: int = 0,
+              file_path: str = None, file: str = None, filename: str = None) -> str:
+    path = path or file_path or file or filename
     try:
         with open(path, "r", encoding="utf-8") as f:
-            return json.dumps({"content": f.read(), "path": path})
+            lines = f.readlines()
+        if offset:
+            lines = lines[offset:]
+        if limit:
+            lines = lines[:limit]
+        return json.dumps({"content": "".join(lines), "path": path})
     except Exception as e:
         return json.dumps({"error": str(e)})
 
-def write_file(path: str, content: str) -> str:
+def write_file(path: str = None, content: str = "", file_path: str = None,
+               file: str = None, filename: str = None) -> str:
+    path = path or file_path or file or filename
+    if not path:
+        return json.dumps({"error": "Se requiere el argumento 'path' o 'file_path'"})
     if not _is_safe_path(path):
         return json.dumps({
             "error": f"Path '{path}' fuera de los directorios permitidos: {SAFE_WRITE_DIRS}. "
@@ -57,7 +74,11 @@ def write_file(path: str, content: str) -> str:
     except Exception as e:
         return json.dumps({"error": str(e)})
 
-def append_file(path: str, content: str) -> str:
+def append_file(path: str = None, content: str = "", file_path: str = None,
+                file: str = None, filename: str = None) -> str:
+    path = path or file_path or file or filename
+    if not path:
+        return json.dumps({"error": "Se requiere el argumento 'path' o 'file_path'"})
     if not _is_safe_path(path):
         return json.dumps({
             "error": f"Path '{path}' fuera de los directorios permitidos: {SAFE_WRITE_DIRS}."
@@ -73,7 +94,7 @@ def list_files(directory: str = ".") -> str:
     try:
         result = []
         for root, dirs, files in os.walk(directory):
-            dirs[:] = [d for d in dirs if not d.startswith(".") and d != "__pycache__"]
+            dirs[:] = [d for d in dirs if not d.startswith(".") and d not in ("__pycache__", "mutants", "node_modules", ".venv", "venv")]
             for file in files:
                 result.append(os.path.join(root, file))
         return json.dumps({"files": result})
@@ -84,6 +105,10 @@ def run_bash(command: str, timeout: int = 60) -> str:
     safe, reason = _is_safe_command(command)
     if not safe:
         return json.dumps({"error": reason, "blocked": True})
+    # En macOS 'python' no existe por defecto — normalizar a python3
+    command = command.replace("python -m", "python3 -m").replace("python3 -m mutmut", "python3 -m mutmut")
+    if command.strip().startswith("python ") and not command.strip().startswith("python3"):
+        command = "python3" + command[len("python"):]
     try:
         result = subprocess.run(
             command, shell=True, capture_output=True, text=True, timeout=timeout
@@ -211,41 +236,94 @@ def take_screenshot(url: str, output_path: str = "tests/screenshots/manual.png")
 
 def run_mutation_tests(paths_to_mutate: str = "src/", tests_dir: str = "tests/") -> str:
     """
-    Corre mutation testing con mutmut sobre el path indicado.
-    Instala mutmut si no está disponible.
-    Retorna resumen: mutantes totales, muertos, sobrevivientes y score.
+    Corre mutation testing con mutmut 3.x sobre el path indicado.
+    Mutmut 3.x usa pyproject.toml para configuración — esta función lo genera
+    automáticamente si no existe. Retorna resumen con score.
     """
     # Asegurar que mutmut esté instalado
-    check = subprocess.run("mutmut --version", shell=True, capture_output=True, text=True)
+    check = subprocess.run("python3 -m mutmut --version", shell=True,
+                           capture_output=True, text=True)
     if check.returncode != 0:
         install = subprocess.run(
-            "pip install mutmut --quiet --break-system-packages",
+            "pip3 install mutmut --quiet --break-system-packages",
             shell=True, capture_output=True, text=True, timeout=60
         )
         if install.returncode != 0:
             return json.dumps({"error": "No se pudo instalar mutmut", "stderr": install.stderr})
 
-    # Correr mutmut
-    cmd = f"mutmut run --paths-to-mutate {paths_to_mutate} --tests-dir {tests_dir} 2>&1"
-    try:
-        result = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=300)
-        output = result.stdout + result.stderr
+    # mutmut 3.x requiere configuración en pyproject.toml
+    pyproject_path = "pyproject.toml"
+    mutmut_config = f"""
+[tool.mutmut]
+paths_to_mutate = ["{paths_to_mutate}"]
+runner = "python3 -m pytest {tests_dir} -x -q"
+"""
+    # Agregar config solo si no existe sección [tool.mutmut]
+    existing = ""
+    if os.path.exists(pyproject_path):
+        with open(pyproject_path, "r") as f:
+            existing = f.read()
+    if "[tool.mutmut]" not in existing:
+        with open(pyproject_path, "a") as f:
+            f.write(mutmut_config)
 
-        # Obtener resumen
-        results_cmd = subprocess.run(
-            "mutmut results", shell=True, capture_output=True, text=True, timeout=30
+    try:
+        # Correr mutmut (ignorar returncode — 1 significa mutantes sobrevivieron, no error)
+        subprocess.run(
+            "python3 -m mutmut run 2>/dev/null",
+            shell=True, capture_output=True, text=True, timeout=300
         )
 
+        # Obtener resumen estructurado
+        results_cmd = subprocess.run(
+            "python3 -m mutmut results 2>&1",
+            shell=True, capture_output=True, text=True, timeout=30
+        )
+
+        # Obtener conteo de killed/survived/total
+        junk_cmd = subprocess.run(
+            "python3 -m mutmut junk 2>&1 || true",
+            shell=True, capture_output=True, text=True, timeout=30
+        )
+
+        # Parsear totales desde el output de results
+        results_text = results_cmd.stdout or ""
+        survived = results_text.lower().count("survived") or results_text.count("⏰") or results_text.count("🙁")
+        killed_markers = results_cmd.stdout.count("killed") if results_cmd.stdout else 0
+
+        # Intentar leer .mutmut-cache para estadísticas
+        stats_cmd = subprocess.run(
+            "python3 -c \""
+            "import sqlite3, os; "
+            "db = '.mutmut-cache'; "
+            "conn = sqlite3.connect(db) if os.path.exists(db) else None; "
+            "if conn: "
+            "  c = conn.cursor(); "
+            "  total = c.execute(\\\"SELECT COUNT(*) FROM mutant\\\").fetchone()[0]; "
+            "  killed = c.execute(\\\"SELECT COUNT(*) FROM mutant WHERE status='killed'\\\").fetchone()[0]; "
+            "  survived = c.execute(\\\"SELECT COUNT(*) FROM mutant WHERE status='survived'\\\").fetchone()[0]; "
+            "  print(f'total={total} killed={killed} survived={survived} score={round(killed/total*100) if total else 0}%'); "
+            "  conn.close() "
+            "else: print('no-cache') "
+            "\" 2>&1",
+            shell=True, capture_output=True, text=True, timeout=10
+        )
+        stats = stats_cmd.stdout.strip()
+
         return json.dumps({
-            "run_output": output[-2000:],  # últimas 2000 chars para no saturar contexto
-            "results": results_cmd.stdout,
-            "returncode": result.returncode,
-            "tip": "Score ideal >= 80%. Si hay mutantes sobrevivientes, los tests no validan ese comportamiento."
+            "results": results_text[-1000:] or "(sin resultados — mutmut puede no haber encontrado mutantes)",
+            "stats": stats,
+            "tip": "Score ideal >= 80%. Si stats muestra score, úsalo. Si dice 'no-cache', los tests probablemente mataron todos los mutantes (buena señal).",
+            "status": "completed"
         })
     except subprocess.TimeoutExpired:
-        return json.dumps({"error": "Timeout: mutation testing tomó más de 5 minutos. Reduce el scope con paths_to_mutate."})
+        return json.dumps({
+            "error": "Timeout: mutation testing tomó más de 5 minutos.",
+            "tip": "Reporta en el progress file que mutation testing fue omitido por timeout y continúa.",
+            "status": "timeout"
+        })
     except Exception as e:
-        return json.dumps({"error": str(e)})
+        return json.dumps({"error": str(e), "status": "error"})
 
 # ─── REGISTRO DE SCHEMAS ────────────────────────────────────────────────────
 
@@ -274,7 +352,11 @@ TOOLS_FN = {
 
 TOOLS_SCHEMA = {
     "read_file": _schema("read_file", "Lee un archivo de texto.",
-        {"path": {"type": "string", "description": "Ruta del archivo"}}, ["path"]),
+        {
+            "path":   {"type": "string",  "description": "Ruta del archivo"},
+            "limit":  {"type": "integer", "description": "Número máximo de líneas a leer (opcional)"},
+            "offset": {"type": "integer", "description": "Línea desde la que empezar (opcional, default 0)"}
+        }, ["path"]),
 
     "write_file": _schema("write_file", "Escribe o sobreescribe un archivo.",
         {"path": {"type": "string"}, "content": {"type": "string"}}, ["path", "content"]),
@@ -331,8 +413,19 @@ TOOLS_SCHEMA = {
 def get_schemas(*names):
     return [TOOLS_SCHEMA[n] for n in names if n in TOOLS_SCHEMA]
 
+def _normalize_args(args: dict) -> dict:
+    """
+    Normaliza claves camelCase a snake_case para tolerar variaciones del LLM.
+    Ej: filePath → file_path, fileName → file_name, featureId → feature_id
+    """
+    import re
+    def to_snake(key: str) -> str:
+        return re.sub(r'(?<!^)(?=[A-Z])', '_', key).lower()
+    return {to_snake(k): v for k, v in args.items()}
+
+
 def execute_tool(tool_name: str, args: dict) -> str:
     fn = TOOLS_FN.get(tool_name)
     if fn:
-        return fn(**args)
+        return fn(**_normalize_args(args))
     return json.dumps({"error": f"Herramienta '{tool_name}' no encontrada"})

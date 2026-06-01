@@ -1,0 +1,4 @@
+
+[tool.mutmut]
+paths_to_mutate = ["src/api.py"]
+runner = "python3 -m pytest tests/ -x -q"
