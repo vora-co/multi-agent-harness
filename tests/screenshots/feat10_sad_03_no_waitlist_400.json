@@ -1,6 +1,0 @@
-{
-  "status": 400,
-  "body": {
-    "detail": "No waitlisted users to promote"
-  }
-}

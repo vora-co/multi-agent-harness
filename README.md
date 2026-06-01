@@ -1,241 +1,226 @@
-# App de Reservas de Yoga — Multi-Agent Harness
+# Multi-Agent Harness
 
-Aplicación web de reservas de clases de yoga construida automáticamente por un sistema multi-agente sobre DeepSeek API.
+A multi-agent harness built on DeepSeek API that automatically builds web applications feature by feature — using five specialized AI agents: **Leader**, **Spec Writer**, **Implementer**, **Reviewer**, and **E2E Tester**.
 
-## Arquitectura general
-
-```
-Frontend  (React + Vite + Tailwind — :5173)
-    ↓  proxy /api → :8000
-Backend   (FastAPI — :8000)
-    ↓
-Storage   (JSON files en data/)
-```
-
-**Stack:**
-- Backend: Python 3.10+, FastAPI, JWT (python-jose), bcrypt
-- Frontend: React 18, Vite, Tailwind CSS
-- Storage: archivos JSON (sin base de datos)
-- Tests unitarios: pytest + httpx TestClient
-- Tests E2E: Playwright
+You define what to build in `feature_list.json`. The harness does the rest.
 
 ---
 
-## Instalación
+## How it works
 
-### 1. Clonar y configurar entorno
+```
+You → define features in feature_list.json
+         ↓
+    👑 Leader        — reads your feature list, coordinates the pipeline
+         ↓
+    📋 Spec Writer   — writes a detailed technical spec before any code is written
+         ↓
+    🔨 Implementer   — writes the code and tests following the spec
+         ↓
+    🧪 E2E Tester    — runs Playwright browser tests (only if e2e: true)
+         ↓
+    🔍 Reviewer      — validates tests pass and approves or rejects
+         ↓
+    ✅ Feature marked done — Leader moves to the next one
+```
+
+If the Reviewer rejects, the Implementer retries with the rejection reason injected. The harness retries up to `MAX_RETRIES_REVIEW` times before marking a feature as `failed`.
+
+---
+
+## Prerequisites
+
+- Python 3.9+
+- Node.js 18+ (only if building frontend features)
+- A [DeepSeek API key](https://platform.deepseek.com/)
+
+---
+
+## Setup
+
+### 1. Clone the repo
 
 ```bash
-git clone https://github.com/fmejiavi/agentes-harness
-cd agentes-harness-prueba
+git clone https://github.com/your-username/multi-agent-harness
+cd multi-agent-harness
 ```
 
-Crea un archivo `.env` en la raíz:
+### 2. Configure your API key
+
+Create a `.env` file in the root:
 
 ```env
-DEEPSEEK_API_KEY=tu_api_key_aqui
+DEEPSEEK_API_KEY=your_api_key_here
 ```
 
-### 2. Instalar dependencias backend
+### 3. Install dependencies
 
 ```bash
 bash init.sh
 ```
 
-Esto instala todas las dependencias de `requirements.txt`, verifica la estructura del proyecto y corre los tests existentes.
-
-### 3. Instalar dependencias frontend
-
-```bash
-cd frontend
-npm install
-cd ..
-```
+This installs all Python dependencies from `requirements.txt` and verifies the project structure.
 
 ---
 
-## Ejecutar la aplicación
+## Define your features
 
-### Backend
+Edit `feature_list.json` to describe what you want to build. Each entry is a feature:
 
-```bash
-python3 -m uvicorn src.api:app --reload --port 8000
+```json
+[
+  {
+    "id": 1,
+    "title": "User domain model",
+    "description": "Create src/models/user.py with a User class (id: int, name: str, email: str, role: str). Validate email with regex. Write tests in tests/test_user.py: valid creation, invalid email raises ValueError, to_dict/from_dict round-trip.",
+    "status": "pending",
+    "e2e": false,
+    "created_at": "2025-01-01T00:00:00"
+  },
+  {
+    "id": 2,
+    "title": "REST API: user authentication",
+    "description": "Create src/auth.py with JWT auth (python-jose). Add POST /api/v1/auth/register and POST /api/v1/auth/login endpoints to src/api.py. Hash passwords with bcrypt. Return JWT token with payload {user_id, role, exp: 24h}. Tests in tests/test_auth.py.",
+    "status": "pending",
+    "e2e": false,
+    "created_at": "2025-01-01T00:00:00"
+  }
+]
 ```
 
-- API disponible en: `http://localhost:8000`
-- Documentación Swagger: `http://localhost:8000/docs`
-- Documentación Redoc: `http://localhost:8000/redoc`
+### Feature fields
 
-### Frontend
+| Field | Type | Description |
+|---|---|---|
+| `id` | int | Sequential ID — features run in ascending order |
+| `title` | string | Short name for the feature |
+| `description` | string | Full spec: files to create, logic to implement, tests to write |
+| `status` | string | `pending` \| `in_progress` \| `done` \| `failed` |
+| `e2e` | bool | `true` only for features with browser UI to test with Playwright. Keep `false` for backend features |
+| `created_at` | string | ISO timestamp |
 
-En una segunda terminal:
+### Tips for writing good feature descriptions
 
-```bash
-cd frontend
-npm run dev
-```
-
-- App disponible en: `http://localhost:5173`
-- El proxy de Vite redirige automáticamente `/api/*` → `http://localhost:8000`
+- **Be specific about file paths** — "Create `src/models/user.py`" is better than "create a user model"
+- **List the tests explicitly** — tell the implementer exactly what scenarios to cover
+- **Reference existing files** — "Add endpoints to the existing `src/api.py`" prevents duplication
+- **One deliverable per feature** — keep each feature independently testable
+- **Use `e2e: false` for backend features** — saves tokens and avoids Playwright setup issues
 
 ---
 
-## Tests
-
-### Tests unitarios (backend)
-
-```bash
-# Todos los tests
-python3 -m pytest tests/ -v
-
-# Solo un módulo
-python3 -m pytest tests/test_credits.py -v
-python3 -m pytest tests/test_auth.py -v
-python3 -m pytest tests/test_bookings.py -v
-```
-
-### Tests E2E con Playwright
-
-> **Requisito:** el backend Y el frontend deben estar corriendo antes de ejecutar los tests E2E.
-
-**Paso 1 — Levanta el backend (terminal 1):**
-```bash
-python3 -m uvicorn src.api:app --reload --port 8000
-```
-
-**Paso 2 — Levanta el frontend (terminal 2):**
-```bash
-cd frontend && npm run dev
-```
-
-**Paso 3 — Ejecuta los tests E2E (terminal 3):**
-```bash
-bash run_e2e.sh
-```
-
-O directamente con pytest:
-```bash
-python3 -m pytest tests/e2e/ -v --headed   # con navegador visible
-python3 -m pytest tests/e2e/ -v            # headless
-```
-
-> Los tests E2E **no corren automáticamente** en el harness de agentes. Se ejecutan manualmente después de que el frontend esté construido y verificado.
-
----
-
-## Harness multi-agente
-
-El harness construye la aplicación automáticamente feature por feature.
-
-### Ejecutar el harness
+## Run the harness
 
 ```bash
 python3 harness.py
 ```
 
-### Comandos disponibles en el REPL
+This opens an interactive REPL. Type your instruction and press Enter:
 
-| Comando | Descripción |
+```
+Tú → continúa con las features pendientes
+```
+
+### REPL commands
+
+| Command | What it does |
 |---|---|
-| `continúa con las features pendientes` | Procesa todas las features en orden |
-| `Ejecuta solo la feature 10 y detente` | Procesa únicamente esa feature |
-| `/features` | Muestra el estado de todas las features |
-| `/costos` | Muestra el costo de tokens de la sesión |
-| `/estado` | Muestra el estado actual (progress/current.md) |
-| `/salir` | Sale del harness |
-
-### Estado de features
-
-| # | Feature | Estado |
-|---|---|---|
-| 1 | Modelo User | ✅ done |
-| 2 | Modelo Session | ✅ done |
-| 3 | Modelo Booking | ✅ done |
-| 4 | Storage + Repositories | ✅ done |
-| 5 | Auth JWT | ✅ done |
-| 6 | API sesiones (admin) | ✅ done |
-| 7 | API reservas (cliente) | ✅ done |
-| 8 | Promoción waitlist | ✅ done |
-| 9 | Créditos y panel admin | ✅ done |
-| 10 | Frontend base + auth | ⏳ pending |
-| 11 | Frontend agenda + reservas | ⏳ pending |
-| 12 | Frontend panel admin | ⏳ pending |
-
-### Retomar tras un crash
-
-El harness tiene checkpointing automático. Features en `in_progress` se resetean a `pending` al arrancar. Si una feature quedó en `failed` y quieres reintentarla, edita `feature_list.json` y cambia su `status` a `pending`.
+| `continúa con las features pendientes` | Processes all pending features in order |
+| `Ejecuta solo la feature 3 y detente` | Processes only feature #3 |
+| `Procesa las features 2 y 3` | Processes a specific range |
+| `/features` | Shows the status of all features |
+| `/costos` | Shows token usage and estimated cost for this session |
+| `/estado` | Shows the current state (progress/current.md) |
+| `/salir` | Exits the harness |
 
 ---
 
-## Estructura del proyecto
+## Project structure
 
 ```
-agentes-harness-prueba/
-├── harness.py              # Motor principal del harness
-├── tools.py                # Herramientas disponibles para los agentes
-├── feature_list.json       # Definición y estado de las features
-├── requirements.txt
-├── init.sh                 # Setup inicial
-├── run_e2e.sh              # Ejecutar tests E2E (requiere servidores activos)
+multi-agent-harness/
+├── harness.py              # Main engine — REPL + leader loop
+├── tools.py                # Tools available to agents (file I/O, bash, etc.)
+├── feature_list.json       # Your feature definitions ← edit this
+├── requirements.txt        # Python dependencies
+├── init.sh                 # Setup script
+├── .env                    # API key (not committed)
 ├── agents/
-│   ├── leader.py           # Coordina features
-│   ├── spec_writer.py      # Genera especificaciones técnicas
-│   ├── implementer.py      # Escribe código y tests
-│   ├── reviewer.py         # Valida implementaciones
-│   └── e2e_tester.py       # Tests Playwright (solo features con e2e=true)
-├── src/
-│   ├── api.py              # Endpoints FastAPI
-│   ├── auth.py             # JWT + bcrypt
-│   ├── core.py             # Lógica de negocio (waitlist, notificaciones)
-│   ├── storage.py          # Lectura/escritura JSON atómica
-│   ├── models/             # User, Session, Booking, CreditTransaction
-│   └── repositories/       # UserRepo, SessionRepo, BookingRepo, etc.
-├── frontend/               # React + Vite + Tailwind (generado por harness)
-├── tests/                  # Tests unitarios pytest
-│   └── e2e/                # Tests Playwright por feature
-├── progress/               # Reportes del harness por feature
-└── data/                   # Archivos JSON de datos (generados en runtime)
+│   ├── leader.py           # Coordinates the pipeline
+│   ├── spec_writer.py      # Generates technical specs before implementation
+│   ├── implementer.py      # Writes code and tests following the spec
+│   ├── reviewer.py         # Validates implementation and approves/rejects
+│   └── e2e_tester.py       # Runs Playwright tests (only if e2e: true)
+├── progress/               # Agent reports per feature (auto-generated)
+│   ├── spec_N.md           # Spec written by Spec Writer
+│   ├── impl_N.md           # Implementation report with test results
+│   └── review_N.md         # Reviewer verdict
+└── data/                   # Runtime data (auto-generated, not committed)
 ```
 
 ---
 
-## Variables de entorno
+## Resuming after a crash
 
-| Variable | Descripción |
-|---|---|
-| `DEEPSEEK_API_KEY` | API key de DeepSeek (requerida para el harness) |
+The harness has automatic checkpointing. Features stuck in `in_progress` are reset to `pending` on startup. If a feature is marked `failed` and you want to retry it:
+
+```bash
+python3 -c "
+import json
+with open('feature_list.json') as f: features = json.load(f)
+for feat in features:
+    if feat['id'] == 3:
+        feat['status'] = 'pending'
+with open('feature_list.json', 'w') as f: json.dump(features, f, indent=2)
+"
+```
+
+Then restart the harness and run that feature again.
 
 ---
 
-## Endpoints principales
+## Configuration
 
-### Auth
-| Método | Ruta | Acceso |
-|---|---|---|
-| POST | `/api/v1/auth/register` | Público |
-| POST | `/api/v1/auth/login` | Público |
-| GET | `/api/v1/auth/me` | Autenticado |
+Key settings in `harness.py`:
 
-### Sesiones
-| Método | Ruta | Acceso |
+| Variable | Default | Description |
 |---|---|---|
-| GET | `/api/v1/sessions` | Público (`?style=` `?date=`) |
-| GET | `/api/v1/sessions/{id}` | Público |
-| POST | `/api/v1/sessions` | Admin |
-| PUT | `/api/v1/sessions/{id}` | Admin |
-| DELETE | `/api/v1/sessions/{id}` | Admin |
+| `MODEL` | `deepseek-v4-pro` | DeepSeek model. Use `deepseek-v4-flash` for lower cost |
+| `MAX_ITER_LEADER` | `30` | Max iterations for the Leader agent |
+| `MAX_ITER_IMPL` | `50` | Max iterations for the Implementer |
+| `MAX_ITER_REVIEWER` | `40` | Max iterations for the Reviewer |
+| `MAX_RETRIES_REVIEW` | `2` | Times the impl→review cycle retries before marking failed |
 
-### Reservas
-| Método | Ruta | Acceso |
-|---|---|---|
-| POST | `/api/v1/bookings` | Autenticado |
-| GET | `/api/v1/bookings/me` | Autenticado |
-| DELETE | `/api/v1/bookings/{id}` | Autenticado (solo owner) |
+---
 
-### Admin / Créditos
-| Método | Ruta | Acceso |
-|---|---|---|
-| POST | `/api/v1/users/{id}/credits` | Admin |
-| GET | `/api/v1/users/{id}/credits/history` | Admin o propio usuario |
-| GET | `/api/v1/admin/users` | Admin |
-| GET | `/api/v1/admin/sessions/{id}/attendees` | Admin |
+## Safe write directories
+
+Agents can only write to these directories (controlled in `tools.py`):
+
+```python
+SAFE_WRITE_DIRS = ("src/", "tests/", "progress/", "docs/", "frontend/", "data/")
+```
+
+Add more directories here if your project needs them.
+
+---
+
+## How agents communicate
+
+Agents don't pass results through chat — they write to files in `progress/`. This prevents context bloat and keeps each agent focused on its task.
+
+**Caching:** If a spec or impl file already exists and shows passing tests, the harness reuses it instead of regenerating — saving tokens on retries.
+
+---
+
+## Costs
+
+Token usage is tracked per agent. Run `/costos` in the REPL or check `progress/session_costs.json` after a session.
+
+Typical cost per feature: **~$0.05–0.15 USD** with DeepSeek v4-pro depending on complexity.
+
+---
+
+## License
+
+MIT

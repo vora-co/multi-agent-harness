@@ -1,6 +1,0 @@
-{
-  "status": 403,
-  "body": {
-    "detail": "Cannot cancel another user's booking"
-  }
-}
