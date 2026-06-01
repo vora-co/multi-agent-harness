@@ -1,8 +1,34 @@
 # Multi-Agent Harness
 
-A multi-agent harness built on DeepSeek API that automatically builds web applications feature by feature — using five specialized AI agents: **Leader**, **Spec Writer**, **Implementer**, **Reviewer**, and **E2E Tester**.
+A multi-agent harness that automatically builds web applications feature by feature — using five specialized AI agents: **Leader**, **Spec Writer**, **Implementer**, **Reviewer**, and **E2E Tester**.
 
 You define what to build in `feature_list.json`. The harness does the rest.
+
+---
+
+## Compatible LLM providers
+
+The harness uses the **OpenAI-compatible SDK**, which means it works with any LLM provider that exposes an OpenAI-compatible API. DeepSeek is the default because it offers excellent cost/performance for agentic workloads, but switching to another provider is a two-line change in `harness.py`:
+
+```python
+# Default — DeepSeek
+MODEL    = "deepseek-v4-pro"
+client   = OpenAI(api_key=os.getenv("DEEPSEEK_API_KEY"), base_url="https://api.deepseek.com")
+
+# OpenAI
+MODEL    = "gpt-4o"
+client   = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+
+# Anthropic (via compatible proxy)
+MODEL    = "claude-sonnet-4-5"
+client   = OpenAI(api_key=os.getenv("ANTHROPIC_API_KEY"), base_url="https://api.anthropic.com/v1")
+
+# Any other OpenAI-compatible provider
+MODEL    = "your-model-name"
+client   = OpenAI(api_key=os.getenv("YOUR_API_KEY"), base_url="https://your-provider.com/v1")
+```
+
+Update your `.env` accordingly with the right key for your provider.
 
 ---
 
@@ -32,7 +58,7 @@ If the Reviewer rejects, the Implementer retries with the rejection reason injec
 
 - Python 3.9+
 - Node.js 18+ (only if building frontend features)
-- A [DeepSeek API key](https://platform.deepseek.com/)
+- An API key from your chosen LLM provider ([DeepSeek](https://platform.deepseek.com/), [OpenAI](https://platform.openai.com/), or any OpenAI-compatible provider)
 
 ---
 
@@ -47,11 +73,17 @@ cd multi-agent-harness
 
 ### 2. Configure your API key
 
-Create a `.env` file in the root:
+Create a `.env` file in the root with the key for your chosen provider:
 
 ```env
+# DeepSeek (default)
 DEEPSEEK_API_KEY=your_api_key_here
+
+# Or OpenAI
+OPENAI_API_KEY=your_api_key_here
 ```
+
+Then update `MODEL` and `client` in `harness.py` to match. See the [Compatible LLM providers](#compatible-llm-providers) section above.
 
 ### 3. Install dependencies
 
