@@ -58,30 +58,30 @@ from tools import execute_tool
 
 load_dotenv()
 
-MODEL   = "deepseek-v4-pro"   # opciones: deepseek-v4-flash | deepseek-v4-pro
+MODEL   = "deepseek-v4-pro"   # options: deepseek-v4-flash | deepseek-v4-pro
 VERBOSE = True
 
-# ─── CONFIGURACIÓN DE ROBUSTEZ ───────────────────────────────────────────────
-MAX_RETRIES_API    = 3   # Reintentos ante errores transitorios de la API (rate limit, timeout)
-MAX_RETRIES_IMPL   = 3   # Cuántas veces el implementer puede reintentar una feature
-MAX_RETRIES_REVIEW = 2   # Cuántas veces el ciclo impl→review puede repetirse antes de marcar "failed"
-MAX_ITER_LEADER    = 30  # Iteraciones máximas del loop del leader
+# ─── ROBUSTNESS SETTINGS ─────────────────────────────────────────────────────
+MAX_RETRIES_API    = 3   # Retries on transient API errors (rate limit, timeout)
+MAX_RETRIES_IMPL   = 3   # How many times the implementer can retry a feature
+MAX_RETRIES_REVIEW = 2   # How many times the impl→review cycle repeats before marking "failed"
+MAX_ITER_LEADER    = 30  # Max iterations for the leader loop
 MAX_ITER_AGENT     = 30  # Default — e2e_tester
-MAX_ITER_IMPL      = 50  # Implementer: leer contexto + escribir código + tests
-MAX_ITER_REVIEWER  = 40  # Reviewer: leer reportes + correr tests + mutation testing
-RETRY_BACKOFF      = [2, 4, 8]  # segundos entre retries de API
+MAX_ITER_IMPL      = 50  # Implementer: read context + write code + tests
+MAX_ITER_REVIEWER  = 40  # Reviewer: read reports + run tests + mutation testing
+RETRY_BACKOFF      = [2, 4, 8]  # seconds between API retries
 
-# Compactación de contexto — mejores prácticas 2025:
-# Modelos de 64K tokens: compactar cuando el historial supera ~30% del contexto.
-# Conservador: disparar a los 24 mensajes (~12 intercambios), mantener los últimos 8.
-COMPACT_THRESHOLD  = 24  # mensajes acumulados antes de compactar
-COMPACT_KEEP_TAIL  = 8   # mensajes recientes a preservar intactos tras compactar
+# Context compaction — 2025 best practices:
+# 64K token models: compact when history exceeds ~30% of context.
+# Conservative: trigger at 24 messages (~12 exchanges), keep last 8.
+COMPACT_THRESHOLD  = 24  # accumulated messages before compacting
+COMPACT_KEEP_TAIL  = 8   # recent messages to preserve intact after compacting
 
-# Precios DeepSeek v3 (USD por millón de tokens, cache miss):
+# DeepSeek pricing (USD per million tokens, cache miss):
 _PRICE_INPUT  = 0.27 / 1_000_000
 _PRICE_OUTPUT = 1.10 / 1_000_000
 
-# ─── LOGGING ESTRUCTURADO ───────────────────────────────────────────────────
+# ─── STRUCTURED LOGGING ──────────────────────────────────────────────────────
 logging.basicConfig(
     filename="progress/harness.log",
     level=logging.INFO,
@@ -102,7 +102,7 @@ client = OpenAI(
     base_url="https://api.deepseek.com"
 )
 
-# ─── OBSERVABILIDAD DE COSTOS ────────────────────────────────────────────────
+# ─── COST OBSERVABILITY ──────────────────────────────────────────────────────
 _SESSION_COSTS: dict = {
     "leader":       {"prompt_tokens": 0, "completion_tokens": 0, "calls": 0},
     "spec_writer":  {"prompt_tokens": 0, "completion_tokens": 0, "calls": 0},
@@ -112,7 +112,7 @@ _SESSION_COSTS: dict = {
     "compaction":   {"prompt_tokens": 0, "completion_tokens": 0, "calls": 0},
 }
 
-# ─── UTILIDADES DE CONSOLA ───────────────────────────────────────────────────
+# ─── CONSOLE UTILITIES ───────────────────────────────────────────────────────
 
 _AGENT_STYLES = {
     "leader":      ("green",   "👑"),
@@ -124,13 +124,13 @@ _AGENT_STYLES = {
 
 def _phase_header(agent: str, action: str, feature_id: int = None,
                   attempt: int = None, total_features: int = None, current_feature: int = None):
-    """Imprime un header claro de fase con agente, acción y contexto."""
+    """Print a clear phase header with agent, action and context."""
     color, icon = _AGENT_STYLES.get(agent, ("white", "•"))
     progress = ""
     if total_features and current_feature:
         progress = f" [dim]({current_feature}/{total_features})[/]"
     feat_info = f" → Feature #{feature_id}" if feature_id else ""
-    attempt_info = f" [dim](intento {attempt})[/]" if attempt and attempt > 1 else ""
+    attempt_info = f" [dim](attempt {attempt})[/]" if attempt and attempt > 1 else ""
 
     console.rule(
         f"[{color}]{icon} {agent.upper()} — {action}{feat_info}[/]{attempt_info}{progress}",
@@ -138,22 +138,22 @@ def _phase_header(agent: str, action: str, feature_id: int = None,
     )
 
 def _agent_action(agent: str, tool: str, args_preview: str, step: int):
-    """Línea compacta mostrando qué herramienta está usando el agente."""
+    """Compact line showing which tool the agent is using."""
     color, icon = _AGENT_STYLES.get(agent, ("white", "•"))
     console.print(
-        f"  [{color}]{icon}[/] [dim]paso {step:02d}[/] "
+        f"  [{color}]{icon}[/] [dim]step {step:02d}[/] "
         f"[bold]{tool}[/] [dim]{args_preview[:80]}[/]"
     )
 
 def _agent_result(result_preview: str, success: bool = True):
-    """Resultado compacto de una herramienta."""
+    """Compact tool result."""
     icon = "✓" if success else "✗"
     color = "green" if success else "red"
     console.print(f"         [{color}]{icon}[/] [dim]{result_preview[:120]}[/]")
 _SESSION_START = datetime.datetime.now()
 
 def _track_usage(role: str, usage) -> None:
-    """Acumula tokens de cada llamada a la API por rol."""
+    """Accumulate tokens from each API call by role."""
     if usage is None:
         return
     bucket = _SESSION_COSTS.get(role, _SESSION_COSTS["leader"])
@@ -162,7 +162,7 @@ def _track_usage(role: str, usage) -> None:
     bucket["calls"]             += 1
 
 def _write_session_costs() -> None:
-    """Escribe el resumen de costos de la sesión en progress/session_costs.json."""
+    """Write session cost summary to progress/session_costs.json."""
     total_prompt     = sum(v["prompt_tokens"]     for v in _SESSION_COSTS.values())
     total_completion = sum(v["completion_tokens"] for v in _SESSION_COSTS.values())
     total_cost_usd   = total_prompt * _PRICE_INPUT + total_completion * _PRICE_OUTPUT
@@ -186,18 +186,18 @@ def _write_session_costs() -> None:
 
     console.print(Panel(
         f"Total tokens: [cyan]{total_prompt + total_completion:,}[/]  |  "
-        f"Costo estimado: [yellow]USD {total_cost_usd:.4f}[/]",
-        title="[dim]Costos de sesión → progress/session_costs.json[/]",
+        f"Estimated cost: [yellow]USD {total_cost_usd:.4f}[/]",
+        title="[dim]Session costs → progress/session_costs.json[/]",
         border_style="dim",
         padding=(0, 1)
     ))
 
-# ─── CHECKPOINTING ──────────────────────────────────────────────────────────
+# ─── CHECKPOINTING ───────────────────────────────────────────────────────────
 
 def recover_stale_features() -> list[int]:
     """
-    Al arrancar, detecta features atascadas en 'in_progress' por un crash anterior
-    y las resetea a 'pending'. Retorna lista de IDs recuperados.
+    On startup, detects features stuck in 'in_progress' from a previous crash
+    and resets them to 'pending'. Returns list of recovered IDs.
     """
     try:
         with open("feature_list.json", "r") as f:
@@ -210,36 +210,36 @@ def recover_stale_features() -> list[int]:
         if feat.get("status") == "in_progress":
             feat["status"] = "pending"
             feat["updated_at"] = datetime.datetime.now().isoformat()
-            feat["recovery_note"] = "Reseteada a pending por harness tras arranque (posible crash previo)"
+            feat["recovery_note"] = "Reset to pending by harness on startup (possible previous crash)"
             recovered.append(feat["id"])
 
     if recovered:
         with open("feature_list.json", "w") as f:
             json.dump(features, f, indent=2, ensure_ascii=False)
         _log("harness", "CHECKPOINT_RECOVERY",
-             f"Features reseteadas a pending: {recovered}", level="warning")
+             f"Features reset to pending: {recovered}", level="warning")
         console.print(Panel(
-            f"[yellow]Features {recovered} estaban en 'in_progress' — reseteadas a 'pending'[/]\n"
-            "[dim]Posible crash en sesión anterior. El leader las retomará.[/]",
+            f"[yellow]Features {recovered} were 'in_progress' — reset to 'pending'[/]\n"
+            "[dim]Possible crash in previous session. The leader will resume them.[/]",
             title="[yellow]⚠ Checkpoint Recovery[/]",
             border_style="yellow",
             padding=(0, 1)
         ))
     return recovered
 
-# ─── COMPACTACIÓN DE CONTEXTO ────────────────────────────────────────────────
+# ─── CONTEXT COMPACTION ──────────────────────────────────────────────────────
 
 def _msg_field(m, field, default=""):
-    """Accede a un campo de un mensaje que puede ser dict o ChatCompletionMessage (Pydantic)."""
+    """Access a field from a message that can be dict or ChatCompletionMessage (Pydantic)."""
     if isinstance(m, dict):
         return m.get(field, default)
     return getattr(m, field, default)
 
 def _compact_messages(messages: list, role: str) -> list:
     """
-    Cuando el historial supera COMPACT_THRESHOLD mensajes, resume el bloque
-    intermedio en una sola entrada para evitar exceder el context window.
-    Siempre conserva: system (0), tarea inicial (1), y los últimos COMPACT_KEEP_TAIL.
+    When history exceeds COMPACT_THRESHOLD messages, summarize the middle block
+    into a single entry to avoid exceeding the context window.
+    Always preserves: system (0), initial task (1), and last COMPACT_KEEP_TAIL messages.
     """
     if len(messages) <= COMPACT_THRESHOLD:
         return messages
@@ -248,9 +248,9 @@ def _compact_messages(messages: list, role: str) -> list:
     initial_task = messages[1]
     raw_tail     = messages[-COMPACT_KEEP_TAIL:]
 
-    # Garantizar que el tail empiece en un límite seguro: el primer mensaje
-    # 'assistant' o 'user'. Un tail que empieza con 'tool' causaría error 400
-    # porque la API exige que 'tool' siempre siga a un 'assistant' con tool_calls.
+    # Ensure tail starts at a safe boundary: first 'assistant' or 'user' message.
+    # A tail starting with 'tool' would cause a 400 error because the API requires
+    # 'tool' to always follow an 'assistant' message with tool_calls.
     safe_start = 0
     for i, m in enumerate(raw_tail):
         if _msg_field(m, "role", "") in ("assistant", "user"):
@@ -262,7 +262,7 @@ def _compact_messages(messages: list, role: str) -> list:
     if not middle:
         return messages
 
-    # Construir texto del bloque medio para resumir.
+    # Build text of the middle block to summarize.
     middle_text = ""
     for m in middle:
         role_label = (_msg_field(m, "role", "?") or "?").upper()
@@ -272,56 +272,56 @@ def _compact_messages(messages: list, role: str) -> list:
         middle_text += f"[{role_label}]: {str(content)[:300]}\n"
 
     _log(role, "COMPACTING",
-         f"Compactando {len(middle)} mensajes intermedios (total={len(messages)})")
+         f"Compacting {len(middle)} intermediate messages (total={len(messages)})")
 
     try:
         summary_response = client.chat.completions.create(
             model=MODEL,
             messages=[
                 {"role": "system",
-                 "content": "Eres un asistente técnico. Resume de forma concisa el historial de trabajo de un agente de software."},
+                 "content": "You are a technical assistant. Concisely summarize the work history of a software agent."},
                 {"role": "user",
                  "content": (
-                     "Resume este historial en máximo 400 palabras. Preserva: "
-                     "decisiones de diseño tomadas, herramientas ejecutadas y sus resultados clave, "
-                     "errores encontrados y cómo se resolvieron, estado actual del trabajo.\n\n"
+                     "Summarize this history in at most 400 words. Preserve: "
+                     "design decisions made, tools executed and their key results, "
+                     "errors encountered and how they were resolved, current state of work.\n\n"
                      f"{middle_text}"
                  )}
             ],
             max_tokens=500,
         )
         _track_usage("compaction", summary_response.usage)
-        summary_text = summary_response.choices[0].message.content or "(sin resumen)"
+        summary_text = summary_response.choices[0].message.content or "(no summary)"
     except Exception as e:
-        summary_text = f"(resumen no disponible: {e})"
+        summary_text = f"(summary unavailable: {e})"
 
     compact_msg = {
         "role": "system",
-        "content": f"## Resumen de contexto anterior\n{summary_text}"
+        "content": f"## Previous context summary\n{summary_text}"
     }
 
     compacted = [system_msg, initial_task, compact_msg] + list(tail)
     _log(role, "COMPACTED",
-         f"Reducido de {len(messages)} a {len(compacted)} mensajes")
+         f"Reduced from {len(messages)} to {len(compacted)} messages")
     return compacted
 
-# ─── UTILIDADES ─────────────────────────────────────────────────────────────
+# ─── UTILITIES ───────────────────────────────────────────────────────────────
 
 def _safe_parse_args(raw: str, tool_name: str):
-    """Parsea argumentos JSON de una tool call. Retorna (args, error_msg)."""
+    """Parse JSON arguments from a tool call. Returns (args, error_msg)."""
     try:
         return json.loads(raw), ""
     except json.JSONDecodeError as e:
-        err = f"JSON inválido en args de '{tool_name}': {e}"
+        err = f"Invalid JSON in args of '{tool_name}': {e}"
         _log("harness", "PARSE_ERROR", err, level="error")
         return None, err
 
 def _classify_error(error_msg: str) -> str:
     """
-    Clasifica un error para decidir la estrategia de retry.
-    TRANSIENT → reintentable con backoff (rate limit, timeout de red)
-    LOGICAL   → requiere cambio de enfoque (error de lógica, test falla)
-    FATAL     → detener (credenciales, archivo no encontrado crítico)
+    Classify an error to decide the retry strategy.
+    TRANSIENT → retryable with backoff (rate limit, network timeout)
+    LOGICAL   → requires a different approach (logic error, test failure)
+    FATAL     → stop (credentials, critical file not found)
     """
     msg = error_msg.lower()
     if any(k in msg for k in ("rate limit", "timeout", "connection", "503", "502", "429")):
@@ -330,10 +330,10 @@ def _classify_error(error_msg: str) -> str:
         return "LOGICAL"
     return "FATAL"
 
-# ─── MOTOR DE AGENTE GENÉRICO ───────────────────────────────────────────────
+# ─── GENERIC AGENT ENGINE ────────────────────────────────────────────────────
 
 def run_agent(system_prompt: str, tools: list, task: str,
-              role: str = "agente", color: str = "white",
+              role: str = "agent", color: str = "white",
               max_iter: int = MAX_ITER_AGENT) -> str:
     messages = [
         {"role": "system", "content": system_prompt},
@@ -342,7 +342,7 @@ def run_agent(system_prompt: str, tools: list, task: str,
     _log(role, "START", task[:120])
 
     for i in range(max_iter):
-        # Retry ante errores transitorios de API
+        # Retry on transient API errors
         api_response = None
         for attempt in range(MAX_RETRIES_API):
             try:
@@ -357,14 +357,14 @@ def run_agent(system_prompt: str, tools: list, task: str,
                 err_type = _classify_error(str(e))
                 if err_type == "TRANSIENT" and attempt < MAX_RETRIES_API - 1:
                     wait = RETRY_BACKOFF[attempt]
-                    _log(role, "API_RETRY", f"intento {attempt+1}/{MAX_RETRIES_API} — espera {wait}s — {e}", level="warning")
+                    _log(role, "API_RETRY", f"attempt {attempt+1}/{MAX_RETRIES_API} — wait {wait}s — {e}", level="warning")
                     time.sleep(wait)
                 else:
                     _log(role, "API_FATAL", str(e), level="error")
                     return f"[ERROR API: {e}]"
 
         if api_response is None:
-            return "[ERROR: no se obtuvo respuesta de la API]"
+            return "[ERROR: no response received from API]"
 
         _track_usage(role, api_response.usage)
         msg = api_response.choices[0].message
@@ -381,7 +381,7 @@ def run_agent(system_prompt: str, tools: list, task: str,
             fn_args, parse_err = _safe_parse_args(tc.function.arguments, fn_name)
 
             if fn_args is None:
-                # Devolver el error al agente para que corrija
+                # Return the error to the agent so it can correct
                 messages.append({
                     "role": "tool",
                     "tool_call_id": tc.id,
@@ -415,14 +415,14 @@ def run_agent(system_prompt: str, tools: list, task: str,
                 "content": result
             })
 
-    _log(role, "MAX_ITER", f"Alcanzado el límite de {max_iter} iteraciones", level="warning")
-    return f"[ERROR: max_iter {max_iter} alcanzado]"
+    _log(role, "MAX_ITER", f"Reached iteration limit of {max_iter}", level="warning")
+    return f"[ERROR: max_iter {max_iter} reached]"
 
 
 # ─── SPAWNERS ────────────────────────────────────────────────────────────────
 
 def _file_tree(path: str, max_files: int = 60) -> str:
-    """Snapshot compacto del árbol de archivos relevantes (sin node_modules)."""
+    """Compact snapshot of the relevant file tree (without node_modules)."""
     try:
         result = subprocess.run(
             ["find", path, "-type", "f",
@@ -432,27 +432,27 @@ def _file_tree(path: str, max_files: int = 60) -> str:
             capture_output=True, text=True, timeout=5
         )
         lines = sorted(result.stdout.strip().splitlines())[:max_files]
-        return "\n".join(lines) or "(vacío)"
+        return "\n".join(lines) or "(empty)"
     except Exception:
-        return "(no disponible)"
+        return "(not available)"
 
 
 def spawn_implementer(feature_id: int, description: str, attempt: int = 1,
                       rejection_reason: str = "", spec_path: str = None) -> str:
     """
-    Lanza el implementer. Si es un primer intento y el impl anterior pasó tests,
-    lo reutiliza. Si es reintento, inyecta el motivo de rechazo.
+    Launch the implementer. On first attempt, reuses existing impl if tests passed.
+    On retry, injects the rejection reason so the agent doesn't repeat the same mistake.
     """
     impl_path = f"progress/impl_{feature_id}.md"
 
-    # Fix 2: Reutilizar impl si ya existe y muestra tests pasando
+    # Reuse existing impl if it already exists and shows passing tests
     if attempt == 1 and os.path.exists(impl_path):
         try:
             with open(impl_path, "r", encoding="utf-8") as f:
                 content = f.read()
             if "passed" in content and "[ERROR" not in content:
-                _log("implementer", "SKIP", f"Impl existente con tests OK: {impl_path}")
-                console.print(f"  [blue]🔨 IMPLEMENTER[/] [dim]↩ reutilizando impl existente →[/] {impl_path}")
+                _log("implementer", "SKIP", f"Existing impl with passing tests: {impl_path}")
+                console.print(f"  [blue]🔨 IMPLEMENTER[/] [dim]↩ reusing existing impl →[/] {impl_path}")
                 return impl_path
         except Exception:
             pass
@@ -460,114 +460,114 @@ def spawn_implementer(feature_id: int, description: str, attempt: int = 1,
     context = ""
     if attempt > 1 and rejection_reason:
         context = (
-            f"\n\n⚠️  REINTENTO #{attempt} — El reviewer rechazó el intento anterior.\n"
-            f"Razón del rechazo: {rejection_reason}\n"
-            f"Debes corregir exactamente esos puntos antes de volver a reportar."
+            f"\n\n⚠️  RETRY #{attempt} — The reviewer rejected the previous attempt.\n"
+            f"Rejection reason: {rejection_reason}\n"
+            f"You must fix exactly those points before reporting again."
         )
 
-    _phase_header("implementer", "Implementando", feature_id, attempt)
+    _phase_header("implementer", "Implementing", feature_id, attempt)
     _log("implementer", "SPAWN", f"feature={feature_id} attempt={attempt}")
 
     cwd = os.getcwd()
 
-    # Fix 1: Pre-inyectar árbol de archivos para evitar reads exploratorios
-    tree_src     = _file_tree("src")
-    tree_frontend = _file_tree("frontend/src") if os.path.exists("frontend/src") else "(no existe aún)"
-    tree_tests   = _file_tree("tests")
+    # Pre-inject file tree to avoid exploratory reads
+    tree_src      = _file_tree("src")
+    tree_frontend = _file_tree("frontend/src") if os.path.exists("frontend/src") else "(not created yet)"
+    tree_tests    = _file_tree("tests")
 
     spec_content = ""
     if spec_path and os.path.exists(spec_path):
         try:
             with open(spec_path, "r", encoding="utf-8") as f:
-                spec_content = f"\n## Especificación técnica ({spec_path}):\n{f.read()}\n"
+                spec_content = f"\n## Technical specification ({spec_path}):\n{f.read()}\n"
         except Exception:
-            spec_content = f"\nLee la especificación técnica en {spec_path} ANTES de escribir código.\n"
+            spec_content = f"\nRead the technical specification at {spec_path} BEFORE writing code.\n"
 
     task = (
-        f"DIRECTORIO DE TRABAJO: {cwd}\n"
-        f"Todos los comandos bash deben ejecutarse desde este directorio.\n\n"
-        f"## Árbol de archivos actual (src/):\n{tree_src}\n\n"
-        f"## Árbol de archivos actual (frontend/src/):\n{tree_frontend}\n\n"
-        f"## Árbol de archivos actual (tests/):\n{tree_tests}\n"
+        f"WORKING DIRECTORY: {cwd}\n"
+        f"All bash commands must be run from this directory.\n\n"
+        f"## Current file tree (src/):\n{tree_src}\n\n"
+        f"## Current file tree (frontend/src/):\n{tree_frontend}\n\n"
+        f"## Current file tree (tests/):\n{tree_tests}\n"
         f"{spec_content}\n"
-        f"Implementa la feature #{feature_id}: {description}{context}\n"
-        f"Escribe tu reporte en {impl_path}\n"
-        f"Devuelve solo la ruta del archivo cuando termines."
+        f"Implement feature #{feature_id}: {description}{context}\n"
+        f"Write your report to {impl_path}\n"
+        f"Return only the file path when done."
     )
     result = run_agent(impl_cfg.SYSTEM_PROMPT, impl_cfg.TOOLS, task,
                        role="implementer", color="blue", max_iter=MAX_ITER_IMPL)
     done = not result.startswith("[ERROR")
-    console.print(f"  [blue]🔨 IMPLEMENTER[/] {'[green]✓ terminó[/]' if done else '[red]✗ error[/]'} → {result[:80]}")
+    console.print(f"  [blue]🔨 IMPLEMENTER[/] {'[green]✓ done[/]' if done else '[red]✗ error[/]'} → {result[:80]}")
     return result
 
 
 def spawn_spec_writer(feature_id: int, description: str) -> str:
-    """Genera la spec técnica detallada antes de implementar.
-    Si la spec ya existe en disco, la reutiliza sin llamar al agente.
+    """Generate the detailed technical spec before implementing.
+    If the spec already exists on disk, reuse it without calling the agent.
     """
     spec_path = f"progress/spec_{feature_id}.md"
 
-    # Reutilizar spec existente — evita gastar iteraciones regenerando
+    # Reuse existing spec — avoids spending iterations regenerating
     if os.path.exists(spec_path):
-        _log("spec_writer", "SKIP", f"Spec ya existe: {spec_path}")
-        console.print(f"  [cyan]📋 SPEC_WRITER[/] [dim]↩ reutilizando spec existente →[/] {spec_path}")
+        _log("spec_writer", "SKIP", f"Spec already exists: {spec_path}")
+        console.print(f"  [cyan]📋 SPEC_WRITER[/] [dim]↩ reusing existing spec →[/] {spec_path}")
         return spec_path
 
-    _phase_header("spec_writer", "Escribiendo spec", feature_id)
+    _phase_header("spec_writer", "Writing spec", feature_id)
     cwd = os.getcwd()
     task = (
-        f"DIRECTORIO DE TRABAJO: {cwd}\n\n"
-        f"Escribe la especificación técnica para la feature #{feature_id}: {description}\n"
-        f"Guarda la spec en {spec_path}\n"
-        f"Devuelve SOLO la ruta: {spec_path}"
+        f"WORKING DIRECTORY: {cwd}\n\n"
+        f"Write the technical specification for feature #{feature_id}: {description}\n"
+        f"Save the spec to {spec_path}\n"
+        f"Return ONLY the path: {spec_path}"
     )
     result = run_agent(spec_cfg.SYSTEM_PROMPT, spec_cfg.TOOLS, task,
                        role="spec_writer", color="cyan", max_iter=35)
     done = not result.startswith("[ERROR")
-    console.print(f"  [cyan]📋 SPEC_WRITER[/] {'[green]✓ spec lista[/]' if done else '[red]✗ error[/]'} → {result[:80]}")
+    console.print(f"  [cyan]📋 SPEC_WRITER[/] {'[green]✓ spec ready[/]' if done else '[red]✗ error[/]'} → {result[:80]}")
     return result
 
 
 def spawn_reviewer(feature_id: int, e2e: bool = True) -> str:
-    _phase_header("reviewer", "Revisando", feature_id)
+    _phase_header("reviewer", "Reviewing", feature_id)
     _log("reviewer", "SPAWN", f"feature={feature_id} e2e={e2e}")
 
     cwd = os.getcwd()
 
-    # Fix 1: Pre-inyectar árbol de archivos relevante
+    # Pre-inject relevant file tree
     tree_src      = _file_tree("src")
-    tree_frontend = _file_tree("frontend/src") if os.path.exists("frontend/src") else "(no existe)"
+    tree_frontend = _file_tree("frontend/src") if os.path.exists("frontend/src") else "(not present)"
     tree_tests    = _file_tree("tests")
 
-    # Fix 3: Instrucción de validación según tipo de feature
+    # Validation mode depends on feature type
     if not e2e:
         validation_mode = (
-            "MODO REVISIÓN FRONTEND (e2e=false):\n"
-            "- Lee el reporte del implementer en progress/impl_{fid}.md\n"
-            "- Verifica que los archivos listados en el reporte existan en disco (usa run_bash con 'ls')\n"
-            "- Verifica que el código JSX/JS no tenga errores de sintaxis obvios (usa run_bash con 'node --check' si aplica)\n"
-            "- NO intentes levantar el servidor de desarrollo\n"
-            "- NO intentes correr Playwright ni tests E2E\n"
-            "- NO corras 'npm run dev' ni 'npm run build'\n"
-            "- Si los archivos existen y el reporte indica éxito, aprueba.\n"
+            "FRONTEND REVIEW MODE (e2e=false):\n"
+            "- Read the implementer report at progress/impl_{fid}.md\n"
+            "- Verify that the files listed in the report exist on disk (use run_bash with 'ls')\n"
+            "- Check that JSX/JS code has no obvious syntax errors (use run_bash with 'node --check' if applicable)\n"
+            "- DO NOT attempt to start the dev server\n"
+            "- DO NOT attempt to run Playwright or E2E tests\n"
+            "- DO NOT run 'npm run dev' or 'npm run build'\n"
+            "- If files exist and the report indicates success, approve.\n"
         ).format(fid=feature_id)
-        max_iter = 15  # revisión liviana — no necesita más
+        max_iter = 15  # lightweight review — doesn't need more
     else:
         validation_mode = (
-            "Revisa el trabajo del implementer para la feature #{fid}.\n"
-            "Corre los tests con pytest y valida que pasen.\n"
+            "Review the implementer's work for feature #{fid}.\n"
+            "Run tests with pytest and validate that they pass.\n"
         ).format(fid=feature_id)
         max_iter = MAX_ITER_REVIEWER
 
     task = (
-        f"DIRECTORIO DE TRABAJO: {cwd}\n\n"
-        f"## Árbol de archivos actual (src/):\n{tree_src}\n\n"
-        f"## Árbol de archivos actual (frontend/src/):\n{tree_frontend}\n\n"
-        f"## Árbol de archivos actual (tests/):\n{tree_tests}\n\n"
+        f"WORKING DIRECTORY: {cwd}\n\n"
+        f"## Current file tree (src/):\n{tree_src}\n\n"
+        f"## Current file tree (frontend/src/):\n{tree_frontend}\n\n"
+        f"## Current file tree (tests/):\n{tree_tests}\n\n"
         f"{validation_mode}\n"
-        f"El reporte del implementer está en progress/impl_{feature_id}.md\n"
-        f"Escribe tu veredicto en progress/review_{feature_id}.md\n"
-        f"Devuelve SOLO: 'APPROVED' o 'REJECTED: <razón>'"
+        f"The implementer report is at progress/impl_{feature_id}.md\n"
+        f"Write your verdict to progress/review_{feature_id}.md\n"
+        f"Return ONLY: 'APPROVED' or 'REJECTED: <reason>'"
     )
     result = run_agent(reviewer_cfg.SYSTEM_PROMPT, reviewer_cfg.TOOLS, task,
                        role="reviewer", color="magenta", max_iter=max_iter)
@@ -586,12 +586,12 @@ def spawn_e2e_tester(feature_id: int) -> str:
 
     cwd = os.getcwd()
     task = (
-        f"DIRECTORIO DE TRABAJO: {cwd}\n"
-        f"Todos los comandos bash deben ejecutarse desde este directorio.\n\n"
-        f"Ejecuta los tests E2E para la feature #{feature_id}.\n"
-        f"El reporte del implementer está en progress/impl_{feature_id}.md\n"
-        f"Escribe tu reporte en progress/e2e_{feature_id}.md\n"
-        f"Devuelve SOLO: 'E2E_PASSED' o 'E2E_FAILED: <razón>'"
+        f"WORKING DIRECTORY: {cwd}\n"
+        f"All bash commands must be run from this directory.\n\n"
+        f"Run E2E tests for feature #{feature_id}.\n"
+        f"The implementer report is at progress/impl_{feature_id}.md\n"
+        f"Write your report to progress/e2e_{feature_id}.md\n"
+        f"Return ONLY: 'E2E_PASSED' or 'E2E_FAILED: <reason>'"
     )
     result = run_agent(e2e_cfg.SYSTEM_PROMPT, e2e_cfg.TOOLS, task,
                        role="e2e_tester", color="yellow")
@@ -601,7 +601,7 @@ def spawn_e2e_tester(feature_id: int) -> str:
     _log("e2e_tester", "VERDICT", result[:200], level="info" if passed else "warning")
     console.print(Panel(
         f"[bold]{result[:200]}[/]",
-        title=f"[{color}]<< E2E_TESTER veredicto[/]",
+        title=f"[{color}]<< E2E_TESTER verdict[/]",
         border_style=color,
         padding=(0, 1)
     ))
@@ -610,23 +610,23 @@ def spawn_e2e_tester(feature_id: int) -> str:
 
 def run_feature_cycle(feature_id: int, description: str, e2e: bool = True) -> dict:
     """
-    Ciclo completo: spec → impl → (e2e) → review con reintentos.
-    Flujo:
-      1. Spec Writer produce la especificación técnica detallada.
-      2. Implementer escribe código + tests siguiendo la spec.
-      3. E2E Tester (solo si e2e=True) valida con Playwright.
-      4. Reviewer verifica tests + checkpoints.
-    Si el reviewer rechaza, reintenta impl→e2e→review con el motivo inyectado.
-    Retorna dict con: approved (bool), attempts (int), final_verdict (str).
+    Full cycle: spec → impl → (e2e) → review with retries.
+    Flow:
+      1. Spec Writer produces the detailed technical specification.
+      2. Implementer writes code + tests following the spec.
+      3. E2E Tester (only if e2e=True) validates with Playwright.
+      4. Reviewer validates tests + checkpoints.
+    If the reviewer rejects, retries impl→e2e→review with the injected reason.
+    Returns dict with: approved (bool), attempts (int), final_verdict (str).
     """
-    # ── Paso 1: Spec (solo en el primer intento) ─────────────────────────────
+    # ── Step 1: Spec (only on first attempt) ─────────────────────────────────
     spec_result = spawn_spec_writer(feature_id, description)
     spec_path = spec_result.strip() if not spec_result.startswith("[ERROR") else None
 
     rejection_reason = ""
     for attempt in range(1, MAX_RETRIES_REVIEW + 1):
 
-        # ── Paso 2: Implementar ──────────────────────────────────────────────
+        # ── Step 2: Implement ────────────────────────────────────────────────
         impl_result = spawn_implementer(
             feature_id, description,
             attempt=attempt,
@@ -642,27 +642,27 @@ def run_feature_cycle(feature_id: int, description: str, e2e: bool = True) -> di
             rejection_reason = impl_result
             continue
 
-        # ── Paso 2: E2E Testing (solo si la feature lo requiere) ────────────
+        # ── Step 3: E2E Testing (only if the feature requires it) ────────────
         if not e2e:
-            e2e_result = "E2E_PASSED"  # no aplica — saltear silenciosamente
+            e2e_result = "E2E_PASSED"  # not applicable — skip silently
         else:
             e2e_result = spawn_e2e_tester(feature_id)
         if e2e_result.strip().startswith("E2E_FAILED"):
             e2e_reason = e2e_result.replace("E2E_FAILED:", "").strip()
             _log("harness", "E2E_FAILED",
                  f"feature={feature_id} attempt={attempt} reason={e2e_reason[:100]}", level="warning")
-            # E2E failure cuenta como rejection — el implementer corrige
-            rejection_reason = f"E2E falló: {e2e_reason}"
+            # E2E failure counts as rejection — implementer fixes it
+            rejection_reason = f"E2E failed: {e2e_reason}"
             if attempt < MAX_RETRIES_REVIEW:
                 console.print(Panel(
-                    f"[red]E2E falló — reintentando impl (intento {attempt+1}/{MAX_RETRIES_REVIEW})[/]\n"
+                    f"[red]E2E failed — retrying impl (attempt {attempt+1}/{MAX_RETRIES_REVIEW})[/]\n"
                     f"[dim]{e2e_reason[:200]}[/]",
                     title=f"[red]↻ E2E → impl — feature #{feature_id}[/]",
                     border_style="red", padding=(0, 1)
                 ))
             continue
 
-        # ── Paso 3: Revisar ──────────────────────────────────────────────────
+        # ── Step 4: Review ───────────────────────────────────────────────────
         review_result = spawn_reviewer(feature_id, e2e=e2e)
         if review_result.strip().startswith("APPROVED"):
             return {"approved": True, "attempts": attempt, "final_verdict": review_result}
@@ -673,43 +673,43 @@ def run_feature_cycle(feature_id: int, description: str, e2e: bool = True) -> di
              level="warning")
         if attempt < MAX_RETRIES_REVIEW:
             console.print(Panel(
-                f"[yellow]Reviewer rechazó — reintento {attempt+1}/{MAX_RETRIES_REVIEW}[/]\n"
+                f"[yellow]Reviewer rejected — retry {attempt+1}/{MAX_RETRIES_REVIEW}[/]\n"
                 f"[dim]{rejection_reason[:200]}[/]",
-                title=f"[yellow]↻ Ciclo impl→e2e→review — feature #{feature_id}[/]",
+                title=f"[yellow]↻ impl→e2e→review cycle — feature #{feature_id}[/]",
                 border_style="yellow", padding=(0, 1)
             ))
 
     return {
         "approved": False,
         "attempts": MAX_RETRIES_REVIEW,
-        "final_verdict": f"REJECTED tras {MAX_RETRIES_REVIEW} intentos: {rejection_reason}"
+        "final_verdict": f"REJECTED after {MAX_RETRIES_REVIEW} attempts: {rejection_reason}"
     }
 
 
-# ─── LOOP DEL LEADER ─────────────────────────────────────────────────────────
+# ─── LEADER LOOP ─────────────────────────────────────────────────────────────
 
 def _build_leader_task(user_task: str) -> str:
     """
-    Pre-inyecta feature_list.json y progress/current.md en el mensaje del leader
-    para eliminar 2-3 tool calls de overhead por sesión.
+    Pre-inject feature_list.json and progress/current.md into the leader's message
+    to eliminate 2-3 overhead tool calls per session.
     """
     try:
         with open("feature_list.json", "r", encoding="utf-8") as f:
             features = json.load(f)
         features_json = json.dumps(features, indent=2, ensure_ascii=False)
     except Exception as e:
-        features_json = f"(no disponible: {e})"
+        features_json = f"(not available: {e})"
 
     try:
         with open("progress/current.md", "r", encoding="utf-8") as f:
             current_md = f.read().strip()
     except Exception:
-        current_md = "(sin estado previo)"
+        current_md = "(no previous state)"
 
     return (
-        f"## feature_list.json (estado actual)\n```json\n{features_json}\n```\n\n"
+        f"## feature_list.json (current state)\n```json\n{features_json}\n```\n\n"
         f"## progress/current.md\n{current_md}\n\n"
-        f"## Instrucción del usuario\n{user_task}"
+        f"## User instruction\n{user_task}"
     )
 
 
@@ -717,7 +717,7 @@ def run_leader(user_task: str) -> str:
     enriched_task = _build_leader_task(user_task)
     console.print(Panel(
         f"[dim]{user_task}[/]",
-        title="[green]>> LEADER activo[/]",
+        title="[green]>> LEADER active[/]",
         border_style="green",
         padding=(0, 1)
     ))
@@ -728,17 +728,17 @@ def run_leader(user_task: str) -> str:
             "function": {
                 "name": "run_feature_cycle",
                 "description": (
-                    "Ejecuta el ciclo completo implementar → revisar para una feature. "
-                    f"Reintenta automáticamente hasta {MAX_RETRIES_REVIEW} veces si el reviewer rechaza. "
-                    "Devuelve JSON con: approved (bool), attempts (int), final_verdict (str). "
-                    "Pasa e2e=false para features sin interfaz web (modelos, storage, API pura)."
+                    "Runs the full implement → review cycle for a feature. "
+                    f"Automatically retries up to {MAX_RETRIES_REVIEW} times if the reviewer rejects. "
+                    "Returns JSON with: approved (bool), attempts (int), final_verdict (str). "
+                    "Pass e2e=false for features without a web UI (models, storage, pure API)."
                 ),
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "feature_id":  {"type": "integer", "description": "ID de la feature"},
-                        "description": {"type": "string",  "description": "Descripción completa de la tarea"},
-                        "e2e":         {"type": "boolean", "description": "true si la feature tiene UI web que probar con Playwright. false para backend/dominio puro. Leer el campo 'e2e' de feature_list.json."}
+                        "feature_id":  {"type": "integer", "description": "Feature ID"},
+                        "description": {"type": "string",  "description": "Full task description"},
+                        "e2e":         {"type": "boolean", "description": "true if the feature has a web UI to test with Playwright. false for backend/domain only. Read the 'e2e' field from feature_list.json."}
                     },
                     "required": ["feature_id", "description"]
                 }
@@ -754,7 +754,7 @@ def run_leader(user_task: str) -> str:
     _log("leader", "START", user_task[:120])
 
     for iteration in range(MAX_ITER_LEADER):
-        # Retry ante errores de API del leader
+        # Retry on transient API errors
         api_response = None
         for attempt in range(MAX_RETRIES_API):
             try:
@@ -769,14 +769,14 @@ def run_leader(user_task: str) -> str:
                 err_type = _classify_error(str(e))
                 if err_type == "TRANSIENT" and attempt < MAX_RETRIES_API - 1:
                     wait = RETRY_BACKOFF[attempt]
-                    _log("leader", "API_RETRY", f"intento {attempt+1} — espera {wait}s — {e}", level="warning")
+                    _log("leader", "API_RETRY", f"attempt {attempt+1} — wait {wait}s — {e}", level="warning")
                     time.sleep(wait)
                 else:
                     _log("leader", "API_FATAL", str(e), level="error")
                     return f"[ERROR API leader: {e}]"
 
         if api_response is None:
-            return "[ERROR: leader no obtuvo respuesta de la API]"
+            return "[ERROR: leader received no response from API]"
 
         _track_usage("leader", api_response.usage)
         msg = api_response.choices[0].message
@@ -831,8 +831,8 @@ def run_leader(user_task: str) -> str:
                 "content": result
             })
 
-    _log("leader", "MAX_ITER", f"Alcanzado el límite de {MAX_ITER_LEADER} iteraciones", level="error")
-    return f"[ERROR: leader max_iter {MAX_ITER_LEADER} alcanzado]"
+    _log("leader", "MAX_ITER", f"Reached iteration limit of {MAX_ITER_LEADER}", level="error")
+    return f"[ERROR: leader max_iter {MAX_ITER_LEADER} reached]"
 
 
 # ─── REPL ─────────────────────────────────────────────────────────────────────
@@ -841,9 +841,9 @@ def print_features():
     with open("feature_list.json", "r") as f:
         features = json.load(f)
     table = Table(show_header=True, header_style="bold")
-    table.add_column("ID",     style="dim",    width=4)
-    table.add_column("Estado", width=14)
-    table.add_column("Título")
+    table.add_column("ID",     style="dim", width=4)
+    table.add_column("Status", width=14)
+    table.add_column("Title")
     color_map = {"pending": "white", "in_progress": "cyan", "done": "green", "failed": "red"}
     for feat in features:
         status = feat["status"]
@@ -857,49 +857,49 @@ def print_features():
 
 
 def main():
-    # Verificar e instalar dependencias antes de mostrar cualquier UI
+    # Verify and install dependencies before showing any UI
     _ensure_deps()
 
-    console.rule("DeepSeek Multi-Agent Harness", style="white")
+    console.rule("Multi-Agent Harness", style="white")
     console.print(
-        f"  Modelo: [cyan]{MODEL}[/]  |  "
-        f"Flujo: [green]👑 Leader[/] → [cyan]📋 Spec[/] → [blue]🔨 Impl[/] → [yellow]🧪 E2E[/] → [magenta]🔍 Reviewer[/]\n"
-        f"  [dim]Comandos: /salir | /estado | /features | /costos[/]"
+        f"  Model: [cyan]{MODEL}[/]  |  "
+        f"Flow: [green]👑 Leader[/] → [cyan]📋 Spec[/] → [blue]🔨 Impl[/] → [yellow]🧪 E2E[/] → [magenta]🔍 Reviewer[/]\n"
+        f"  [dim]Commands: /quit | /status | /features | /costs[/]"
     )
     console.rule(style="dim")
 
-    # Checkpointing: recuperar features atascadas de sesiones anteriores
+    # Checkpointing: recover features stuck from previous sessions
     recover_stale_features()
 
     try:
         while True:
             try:
-                user_input = console.input("[bold white]Tú →[/] ").strip()
+                user_input = console.input("[bold white]You →[/] ").strip()
             except (KeyboardInterrupt, EOFError):
-                console.print("\n[dim]Saliendo...[/]")
+                console.print("\n[dim]Exiting...[/]")
                 break
 
             if not user_input:
                 continue
 
-            if user_input == "/salir":
+            if user_input in ("/quit", "/salir"):
                 break
-            elif user_input == "/estado":
+            elif user_input in ("/status", "/estado"):
                 with open("progress/current.md", "r") as f:
                     console.print(Markdown(f.read()))
                 continue
             elif user_input == "/features":
                 print_features()
                 continue
-            elif user_input == "/costos":
+            elif user_input in ("/costs", "/costos"):
                 _write_session_costs()
                 continue
 
             result = run_leader(user_input)
-            console.rule("[green]✅ Sesión completada[/]", style="green")
+            console.rule("[green]✅ Session complete[/]", style="green")
             console.print(f"  [green]👑 LEADER[/] {result}")
     finally:
-        # Siempre escribir costos al salir, incluso si hay crash
+        # Always write costs on exit, even if there's a crash
         _write_session_costs()
 
 

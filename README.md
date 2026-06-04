@@ -247,9 +247,53 @@ Agents don't pass results through chat — they write to files in `progress/`. T
 
 ## Costs
 
-Token usage is tracked per agent. Run `/costos` in the REPL or check `progress/session_costs.json` after a session.
+Token usage is tracked per agent. Run `/costs` in the REPL or check `progress/session_costs.json` after a session.
 
 Typical cost per feature: **~$0.05–0.15 USD** with DeepSeek v4-pro depending on complexity.
+
+---
+
+## Roadmap
+
+Known improvements identified during development. Contributions welcome.
+
+### Storage backends
+Currently the harness writes everything to JSON files in `data/` and `progress/`. This works well for small projects but doesn't scale. Planned improvements:
+- **Pluggable storage layer** — abstract `tools.py` reads/writes behind an interface so you can swap JSON files for SQLite, PostgreSQL, MongoDB, or any other backend without changing agent logic
+- **Remote storage** — support S3 or Google Cloud Storage for `progress/` reports, enabling distributed or cloud-based runs
+
+### Agent improvements
+- **Parallel feature execution** — independent features could run simultaneously instead of sequentially, reducing total build time significantly
+- **Feature dependency graph** — declare that feature 5 depends on feature 3, so the harness can determine which features can run in parallel
+- **Per-agent model selection** — use a cheaper model (e.g. flash) for the Spec Writer and a more capable one for the Implementer, reducing cost without sacrificing quality
+- **Agent memory across features** — agents currently start fresh each feature; persisting learned conventions and decisions across features would reduce repeated mistakes
+
+### Harness UX
+- **Web dashboard** — replace the terminal REPL with a browser UI showing live agent progress, feature status, cost tracking, and logs
+- **Cost budgets** — set a maximum spend per session or per feature; the harness stops and alerts when the budget is reached
+- **Webhook notifications** — notify Slack, email, or any webhook when a feature completes or fails
+
+### Reliability
+- **Smarter retry logic** — currently retries with the full rejection reason; could extract specific failing tests and inject only the relevant context
+- **Spec validation** — the Spec Writer could verify its own spec against existing code before handing off to the Implementer, catching contradictions earlier
+- **Incremental context compaction** — the current compaction strategy is conservative; a more aggressive approach could reduce token usage on long sessions by 30–40%
+
+---
+
+## Changelog
+
+### v1.1.0
+- All code, comments, and agent prompts translated to English
+- REPL commands now accept both English (`/quit`, `/costs`, `/status`) and Spanish aliases
+- Added Roadmap section to README
+
+### v1.0.0
+- Initial release — multi-agent harness with Leader, Spec Writer, Implementer, E2E Tester, Reviewer
+- OpenAI-compatible SDK — works with DeepSeek, OpenAI, Anthropic, and any compatible provider
+- Spec and impl caching — reuses existing reports on retries to save tokens
+- Pre-injected file tree context — eliminates exploratory reads at the start of each agent cycle
+- Lightweight frontend reviewer mode — skips Playwright when `e2e: false`
+- Automatic checkpointing — recovers `in_progress` features after crashes
 
 ---
 

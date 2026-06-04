@@ -1,46 +1,46 @@
 import os, json, subprocess, datetime, re
 
-# ─── SEGURIDAD ───────────────────────────────────────────────────────────────
+# ─── SECURITY ────────────────────────────────────────────────────────────────
 
-# Directorios donde los agentes pueden escribir (relativo al CWD del proyecto)
+# Directories where agents are allowed to write (relative to project CWD)
 SAFE_WRITE_DIRS = ("src/", "tests/", "progress/", "docs/", "tests/e2e/", "tests/screenshots/", "frontend/")
 
-# Patrones de comandos bash bloqueados — evita destrucción accidental
+# Blocked bash command patterns — prevents accidental destruction
 BLOCKED_BASH_PATTERNS = [
     r"rm\s+-rf\s+/",          # rm -rf /
     r"rm\s+-rf\s+\.\.",       # rm -rf ..
-    r">\s*/dev/sd",           # sobreescribir disco
-    r"mkfs",                  # formatear partición
-    r"dd\s+if=",              # copia raw de disco
-    r"chmod\s+-R\s+777\s+/",  # permisos globales
+    r">\s*/dev/sd",           # overwrite disk
+    r"mkfs",                  # format partition
+    r"dd\s+if=",              # raw disk copy
+    r"chmod\s+-R\s+777\s+/",  # global permissions
     r":()\{.*\};:",           # fork bomb
 ]
 
-# Estados válidos para features
+# Valid feature statuses
 VALID_FEATURE_STATUSES = {"pending", "in_progress", "done", "failed"}
 
 def _is_safe_path(path: str) -> bool:
-    """Verifica que el path esté dentro de los directorios permitidos.
-    Acepta rutas absolutas convirtiéndolas a relativas respecto al cwd.
+    """Check that the path is within the allowed directories.
+    Accepts absolute paths by converting them to relative paths from cwd.
     """
     normalized = os.path.normpath(path).replace("\\", "/")
-    # Convertir ruta absoluta a relativa si apunta al cwd
+    # Convert absolute path to relative if it points to cwd
     cwd = os.getcwd().replace("\\", "/")
     if normalized.startswith(cwd + "/"):
         normalized = normalized[len(cwd) + 1:]
-    # Bloquea traversal
+    # Block path traversal
     if ".." in normalized:
         return False
     return any(normalized.startswith(d) for d in SAFE_WRITE_DIRS)
 
 def _is_safe_command(command: str) -> tuple[bool, str]:
-    """Retorna (es_seguro, razón_si_no_lo_es)."""
+    """Returns (is_safe, reason_if_not)."""
     for pattern in BLOCKED_BASH_PATTERNS:
         if re.search(pattern, command):
-            return False, f"Comando bloqueado por patrón de seguridad: '{pattern}'"
+            return False, f"Command blocked by security pattern: '{pattern}'"
     return True, ""
 
-# ─── IMPLEMENTACIONES ───────────────────────────────────────────────────────
+# ─── TOOL IMPLEMENTATIONS ───────────────────────────────────────────────────
 
 def read_file(path: str = None, limit: int = None, offset: int = 0,
               file_path: str = None, file: str = None, filename: str = None) -> str:
@@ -60,11 +60,11 @@ def write_file(path: str = None, content: str = "", file_path: str = None,
                file: str = None, filename: str = None) -> str:
     path = path or file_path or file or filename
     if not path:
-        return json.dumps({"error": "Se requiere el argumento 'path' o 'file_path'"})
+        return json.dumps({"error": "Required argument 'path' or 'file_path' is missing"})
     if not _is_safe_path(path):
         return json.dumps({
-            "error": f"Path '{path}' fuera de los directorios permitidos: {SAFE_WRITE_DIRS}. "
-                     "Revisa que el archivo esté en src/, tests/, progress/ o docs/."
+            "error": f"Path '{path}' is outside the allowed directories: {SAFE_WRITE_DIRS}. "
+                     "Make sure the file is in src/, tests/, progress/ or docs/."
         })
     try:
         os.makedirs(os.path.dirname(path), exist_ok=True) if os.path.dirname(path) else None
@@ -78,10 +78,10 @@ def append_file(path: str = None, content: str = "", file_path: str = None,
                 file: str = None, filename: str = None) -> str:
     path = path or file_path or file or filename
     if not path:
-        return json.dumps({"error": "Se requiere el argumento 'path' o 'file_path'"})
+        return json.dumps({"error": "Required argument 'path' or 'file_path' is missing"})
     if not _is_safe_path(path):
         return json.dumps({
-            "error": f"Path '{path}' fuera de los directorios permitidos: {SAFE_WRITE_DIRS}."
+            "error": f"Path '{path}' is outside the allowed directories: {SAFE_WRITE_DIRS}."
         })
     try:
         with open(path, "a", encoding="utf-8") as f:
@@ -105,7 +105,7 @@ def run_bash(command: str, timeout: int = 60) -> str:
     safe, reason = _is_safe_command(command)
     if not safe:
         return json.dumps({"error": reason, "blocked": True})
-    # En macOS 'python' no existe por defecto — normalizar a python3
+    # On macOS 'python' may not exist — normalize to python3
     command = command.replace("python -m", "python3 -m").replace("python3 -m mutmut", "python3 -m mutmut")
     if command.strip().startswith("python ") and not command.strip().startswith("python3"):
         command = "python3" + command[len("python"):]
@@ -120,14 +120,14 @@ def run_bash(command: str, timeout: int = 60) -> str:
             "success": result.returncode == 0
         })
     except subprocess.TimeoutExpired:
-        return json.dumps({"error": f"Timeout después de {timeout}s", "timeout": True})
+        return json.dumps({"error": f"Timeout after {timeout}s", "timeout": True})
     except Exception as e:
         return json.dumps({"error": str(e)})
 
 def update_feature_status(feature_id: int, status: str) -> str:
     if status not in VALID_FEATURE_STATUSES:
         return json.dumps({
-            "error": f"Status '{status}' inválido. Valores permitidos: {sorted(VALID_FEATURE_STATUSES)}"
+            "error": f"Invalid status '{status}'. Allowed values: {sorted(VALID_FEATURE_STATUSES)}"
         })
     try:
         with open("feature_list.json", "r") as f:
@@ -140,7 +140,7 @@ def update_feature_status(feature_id: int, status: str) -> str:
                 updated = True
                 break
         if not updated:
-            return json.dumps({"error": f"Feature #{feature_id} no encontrada en feature_list.json"})
+            return json.dumps({"error": f"Feature #{feature_id} not found in feature_list.json"})
         with open("feature_list.json", "w") as f:
             json.dump(features, f, indent=2, ensure_ascii=False)
         return json.dumps({"status": "ok", "feature_id": feature_id, "new_status": status})
@@ -157,11 +157,11 @@ def read_feature_list() -> str:
 def run_playwright_tests(test_path: str = "tests/e2e/", base_url: str = "http://localhost:8000",
                          headed: bool = False, timeout_ms: int = 30000) -> str:
     """
-    Corre tests E2E con Playwright/pytest-playwright.
-    Instala dependencias si no están disponibles.
-    Captura screenshots en failures automáticamente.
+    Run E2E tests with Playwright/pytest-playwright.
+    Installs dependencies if not available.
+    Automatically captures screenshots on failures.
     """
-    # Verificar/instalar pytest-playwright
+    # Check/install pytest-playwright
     check = subprocess.run("python -m pytest --co -q tests/e2e/ 2>&1 | head -5",
                            shell=True, capture_output=True, text=True)
     if "No module named" in check.stdout or "playwright" not in check.stdout.lower():
@@ -171,7 +171,7 @@ def run_playwright_tests(test_path: str = "tests/e2e/", base_url: str = "http://
             shell=True, capture_output=True, text=True, timeout=120
         )
         if install.returncode != 0:
-            return json.dumps({"error": "No se pudo instalar playwright", "stderr": install.stderr[:500]})
+            return json.dumps({"error": "Failed to install playwright", "stderr": install.stderr[:500]})
 
     os.makedirs("tests/screenshots", exist_ok=True)
 
@@ -188,7 +188,7 @@ def run_playwright_tests(test_path: str = "tests/e2e/", base_url: str = "http://
         result = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=300)
         output = result.stdout + result.stderr
 
-        # Listar screenshots generados si hubo fallos
+        # List generated screenshots if there were failures
         screenshots = []
         if os.path.exists("tests/screenshots"):
             screenshots = [f for f in os.listdir("tests/screenshots") if f.endswith(".png")]
@@ -198,21 +198,21 @@ def run_playwright_tests(test_path: str = "tests/e2e/", base_url: str = "http://
             "returncode": result.returncode,
             "success": result.returncode == 0,
             "screenshots": screenshots,
-            "tip": "Si hay screenshots, léelos con read_file para ver el estado de la UI en el fallo."
+            "tip": "If there are screenshots, read them with read_file to see the UI state at failure."
         })
     except subprocess.TimeoutExpired:
-        return json.dumps({"error": "Timeout: los tests E2E tardaron más de 5 minutos."})
+        return json.dumps({"error": "Timeout: E2E tests took more than 5 minutes."})
     except Exception as e:
         return json.dumps({"error": str(e)})
 
 
 def take_screenshot(url: str, output_path: str = "tests/screenshots/manual.png") -> str:
     """
-    Toma un screenshot de una URL usando Playwright (headless).
-    Útil para verificar el estado visual de la app en un punto específico.
+    Takes a screenshot of a URL using Playwright (headless).
+    Useful for verifying the visual state of the app at a specific point.
     """
     if not _is_safe_path(output_path):
-        return json.dumps({"error": f"Path '{output_path}' fuera de los directorios permitidos."})
+        return json.dumps({"error": f"Path '{output_path}' is outside the allowed directories."})
     script = (
         f"from playwright.sync_api import sync_playwright; "
         f"p = sync_playwright().start(); "
@@ -221,7 +221,7 @@ def take_screenshot(url: str, output_path: str = "tests/screenshots/manual.png")
         f"page.goto('{url}'); "
         f"page.screenshot(path='{output_path}', full_page=True); "
         f"b.close(); p.stop(); "
-        f"print('screenshot guardado en {output_path}')"
+        f"print('screenshot saved to {output_path}')"
     )
     try:
         result = subprocess.run(
@@ -236,11 +236,11 @@ def take_screenshot(url: str, output_path: str = "tests/screenshots/manual.png")
 
 def run_mutation_tests(paths_to_mutate: str = "src/", tests_dir: str = "tests/") -> str:
     """
-    Corre mutation testing con mutmut 3.x sobre el path indicado.
-    Mutmut 3.x usa pyproject.toml para configuración — esta función lo genera
-    automáticamente si no existe. Retorna resumen con score.
+    Run mutation testing with mutmut 3.x on the specified path.
+    mutmut 3.x uses pyproject.toml for configuration — this function generates it
+    automatically if it doesn't exist. Returns summary with score.
     """
-    # Asegurar que mutmut esté instalado
+    # Ensure mutmut is installed
     check = subprocess.run("python3 -m mutmut --version", shell=True,
                            capture_output=True, text=True)
     if check.returncode != 0:
@@ -249,16 +249,16 @@ def run_mutation_tests(paths_to_mutate: str = "src/", tests_dir: str = "tests/")
             shell=True, capture_output=True, text=True, timeout=60
         )
         if install.returncode != 0:
-            return json.dumps({"error": "No se pudo instalar mutmut", "stderr": install.stderr})
+            return json.dumps({"error": "Failed to install mutmut", "stderr": install.stderr})
 
-    # mutmut 3.x requiere configuración en pyproject.toml
+    # mutmut 3.x requires configuration in pyproject.toml
     pyproject_path = "pyproject.toml"
     mutmut_config = f"""
 [tool.mutmut]
 paths_to_mutate = ["{paths_to_mutate}"]
 runner = "python3 -m pytest {tests_dir} -x -q"
 """
-    # Agregar config solo si no existe sección [tool.mutmut]
+    # Add config only if [tool.mutmut] section doesn't exist
     existing = ""
     if os.path.exists(pyproject_path):
         with open(pyproject_path, "r") as f:
@@ -268,30 +268,30 @@ runner = "python3 -m pytest {tests_dir} -x -q"
             f.write(mutmut_config)
 
     try:
-        # Correr mutmut (ignorar returncode — 1 significa mutantes sobrevivieron, no error)
+        # Run mutmut (ignore returncode — 1 means mutants survived, not an error)
         subprocess.run(
             "python3 -m mutmut run 2>/dev/null",
             shell=True, capture_output=True, text=True, timeout=300
         )
 
-        # Obtener resumen estructurado
+        # Get structured summary
         results_cmd = subprocess.run(
             "python3 -m mutmut results 2>&1",
             shell=True, capture_output=True, text=True, timeout=30
         )
 
-        # Obtener conteo de killed/survived/total
+        # Get killed/survived/total counts
         junk_cmd = subprocess.run(
             "python3 -m mutmut junk 2>&1 || true",
             shell=True, capture_output=True, text=True, timeout=30
         )
 
-        # Parsear totales desde el output de results
+        # Parse totals from results output
         results_text = results_cmd.stdout or ""
         survived = results_text.lower().count("survived") or results_text.count("⏰") or results_text.count("🙁")
         killed_markers = results_cmd.stdout.count("killed") if results_cmd.stdout else 0
 
-        # Intentar leer .mutmut-cache para estadísticas
+        # Try reading .mutmut-cache for statistics
         stats_cmd = subprocess.run(
             "python3 -c \""
             "import sqlite3, os; "
@@ -311,21 +311,21 @@ runner = "python3 -m pytest {tests_dir} -x -q"
         stats = stats_cmd.stdout.strip()
 
         return json.dumps({
-            "results": results_text[-1000:] or "(sin resultados — mutmut puede no haber encontrado mutantes)",
+            "results": results_text[-1000:] or "(no results — mutmut may not have found any mutants)",
             "stats": stats,
-            "tip": "Score ideal >= 80%. Si stats muestra score, úsalo. Si dice 'no-cache', los tests probablemente mataron todos los mutantes (buena señal).",
+            "tip": "Ideal score >= 80%. If stats shows a score, use it. If it says 'no-cache', tests likely killed all mutants (good sign).",
             "status": "completed"
         })
     except subprocess.TimeoutExpired:
         return json.dumps({
-            "error": "Timeout: mutation testing tomó más de 5 minutos.",
-            "tip": "Reporta en el progress file que mutation testing fue omitido por timeout y continúa.",
+            "error": "Timeout: mutation testing took more than 5 minutes.",
+            "tip": "Report in the progress file that mutation testing was skipped due to timeout and continue.",
             "status": "timeout"
         })
     except Exception as e:
         return json.dumps({"error": str(e), "status": "error"})
 
-# ─── REGISTRO DE SCHEMAS ────────────────────────────────────────────────────
+# ─── SCHEMA REGISTRY ────────────────────────────────────────────────────────
 
 def _schema(name, desc, props, required):
     return {
@@ -351,62 +351,62 @@ TOOLS_FN = {
 }
 
 TOOLS_SCHEMA = {
-    "read_file": _schema("read_file", "Lee un archivo de texto.",
+    "read_file": _schema("read_file", "Read a text file.",
         {
-            "path":   {"type": "string",  "description": "Ruta del archivo"},
-            "limit":  {"type": "integer", "description": "Número máximo de líneas a leer (opcional)"},
-            "offset": {"type": "integer", "description": "Línea desde la que empezar (opcional, default 0)"}
+            "path":   {"type": "string",  "description": "File path"},
+            "limit":  {"type": "integer", "description": "Maximum number of lines to read (optional)"},
+            "offset": {"type": "integer", "description": "Line to start from (optional, default 0)"}
         }, ["path"]),
 
-    "write_file": _schema("write_file", "Escribe o sobreescribe un archivo.",
+    "write_file": _schema("write_file", "Write or overwrite a file.",
         {"path": {"type": "string"}, "content": {"type": "string"}}, ["path", "content"]),
 
-    "append_file": _schema("append_file", "Agrega contenido al final de un archivo.",
+    "append_file": _schema("append_file", "Append content to the end of a file.",
         {"path": {"type": "string"}, "content": {"type": "string"}}, ["path", "content"]),
 
-    "list_files": _schema("list_files", "Lista todos los archivos de un directorio.",
-        {"directory": {"type": "string", "description": "Directorio a listar. Default: '.'"}}, []),
+    "list_files": _schema("list_files", "List all files in a directory.",
+        {"directory": {"type": "string", "description": "Directory to list. Default: '.'"}}, []),
 
     "run_bash": _schema("run_bash",
-        "Ejecuta un comando bash. Usa para correr tests, instalar deps, etc. "
-        "Comandos destructivos (rm -rf /, mkfs, etc.) están bloqueados.",
+        "Execute a bash command. Use to run tests, install deps, etc. "
+        "Destructive commands (rm -rf /, mkfs, etc.) are blocked.",
         {
             "command": {"type": "string"},
-            "timeout": {"type": "integer", "description": "Timeout en segundos. Default: 60"}
+            "timeout": {"type": "integer", "description": "Timeout in seconds. Default: 60"}
         }, ["command"]),
 
     "update_feature_status": _schema("update_feature_status",
-        "Actualiza el estado de una feature en feature_list.json. Estados: pending, in_progress, done, failed.",
+        "Update the status of a feature in feature_list.json. Statuses: pending, in_progress, done, failed.",
         {"feature_id": {"type": "integer"}, "status": {"type": "string"}}, ["feature_id", "status"]),
 
-    "read_feature_list": _schema("read_feature_list", "Lee feature_list.json completo.", {}, []),
+    "read_feature_list": _schema("read_feature_list", "Read the full feature_list.json.", {}, []),
 
     "run_playwright_tests": _schema(
         "run_playwright_tests",
-        "Corre tests E2E con Playwright. Ejecutar DESPUÉS de que los tests unitarios pasen. "
-        "Captura screenshots automáticamente en fallos. Retorna output, success y lista de screenshots.",
+        "Run E2E tests with Playwright. Execute AFTER unit tests pass. "
+        "Automatically captures screenshots on failures. Returns output, success, and screenshot list.",
         {
-            "test_path":   {"type": "string", "description": "Carpeta o archivo de tests E2E. Default: 'tests/e2e/'"},
-            "base_url":    {"type": "string", "description": "URL base de la app. Default: 'http://localhost:8000'"},
-            "headed":      {"type": "boolean","description": "Mostrar navegador. Default: false (headless)"},
-            "timeout_ms":  {"type": "integer","description": "Timeout por test en ms. Default: 30000"}
+            "test_path":   {"type": "string", "description": "E2E test folder or file. Default: 'tests/e2e/'"},
+            "base_url":    {"type": "string", "description": "App base URL. Default: 'http://localhost:8000'"},
+            "headed":      {"type": "boolean","description": "Show browser. Default: false (headless)"},
+            "timeout_ms":  {"type": "integer","description": "Timeout per test in ms. Default: 30000"}
         }, []),
 
     "take_screenshot": _schema(
         "take_screenshot",
-        "Toma un screenshot de una URL con Playwright (headless). Útil para verificar estado visual.",
+        "Take a screenshot of a URL with Playwright (headless). Useful for verifying visual state.",
         {
-            "url":         {"type": "string", "description": "URL a capturar"},
-            "output_path": {"type": "string", "description": "Ruta de salida .png. Default: 'tests/screenshots/manual.png'"}
+            "url":         {"type": "string", "description": "URL to capture"},
+            "output_path": {"type": "string", "description": "Output .png path. Default: 'tests/screenshots/manual.png'"}
         }, ["url"]),
 
     "run_mutation_tests": _schema(
         "run_mutation_tests",
-        "Corre mutation testing con mutmut. Verifica que los tests realmente validen comportamiento, "
-        "no solo cobertura. Retorna: mutantes totales, muertos, sobrevivientes y score. Score ideal >= 80%.",
+        "Run mutation testing with mutmut. Verifies that tests actually validate behavior, "
+        "not just coverage. Returns: total mutants, killed, survived and score. Ideal score >= 80%.",
         {
-            "paths_to_mutate": {"type": "string", "description": "Directorio o archivo a mutar. Default: 'src/'"},
-            "tests_dir":       {"type": "string", "description": "Directorio de tests. Default: 'tests/'"}
+            "paths_to_mutate": {"type": "string", "description": "Directory or file to mutate. Default: 'src/'"},
+            "tests_dir":       {"type": "string", "description": "Tests directory. Default: 'tests/'"}
         }, []),
 }
 
@@ -415,8 +415,8 @@ def get_schemas(*names):
 
 def _normalize_args(args: dict) -> dict:
     """
-    Normaliza claves camelCase a snake_case para tolerar variaciones del LLM.
-    Ej: filePath → file_path, fileName → file_name, featureId → feature_id
+    Normalize camelCase keys to snake_case to tolerate LLM variations.
+    E.g.: filePath → file_path, fileName → file_name, featureId → feature_id
     """
     import re
     def to_snake(key: str) -> str:
@@ -428,4 +428,4 @@ def execute_tool(tool_name: str, args: dict) -> str:
     fn = TOOLS_FN.get(tool_name)
     if fn:
         return fn(**_normalize_args(args))
-    return json.dumps({"error": f"Herramienta '{tool_name}' no encontrada"})
+    return json.dumps({"error": f"Tool '{tool_name}' not found"})
