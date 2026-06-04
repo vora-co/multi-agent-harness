@@ -86,6 +86,45 @@ MODEL_BY_ROLE: dict[str, str] = {
 
 VERBOSE = True
 
+# ─── ORCHESTRATOR SELECTION ──────────────────────────────────────────────────
+# Controls whether the harness runs in plain Python mode or wraps execution
+# in Prefect for dashboard observability, scheduling, and future parallelism.
+#
+#   "local"   — default, no external dependencies, identical runtime behavior.
+#   "prefect" — each REPL command becomes a tracked Prefect flow run;
+#               each feature cycle becomes a Prefect task visible in the dashboard.
+#               Requires: pip install prefect
+#               To activate: add ORCHESTRATOR=prefect to your .env
+#               Optional: run `prefect cloud login` to stream runs to Prefect Cloud.
+#               Without login, runs are tracked locally via the Prefect API
+#               (start with `prefect server start`).
+#
+# No other code changes are needed when switching modes — the decorators are
+# no-ops in local mode, so all logic, tools, and agent prompts stay identical.
+ORCHESTRATOR = os.getenv("ORCHESTRATOR", "local")
+
+# ─── COST BUDGET ──────────────────────────────────────────────────────────────
+# Maximum USD spend per session. Set in .env as COST_BUDGET_USD=1.50
+# When the budget is reached, no new features are started; the current agent
+# finishes its step and then the harness stops gracefully.
+# Set to 0 (default) to disable budget enforcement.
+COST_BUDGET_USD = float(os.getenv("COST_BUDGET_USD", "0"))
+
+# Module-level flag set by _track_usage when the budget is exceeded.
+# Checked at the start of run_feature_cycle to skip new work without raising exceptions.
+_BUDGET_EXCEEDED: bool = False
+
+if ORCHESTRATOR == "prefect":
+    from prefect import task, flow
+else:
+    # No-op decorators — make @task and @flow transparent in local mode.
+    # Supports both bare usage (@task) and parameterized usage (@task(name="...")).
+    def task(fn=None, **kwargs):  # type: ignore[misc]
+        return fn if fn is not None else lambda f: f
+
+    def flow(fn=None, **kwargs):  # type: ignore[misc]
+        return fn if fn is not None else lambda f: f
+
 # ─── ROBUSTNESS SETTINGS ─────────────────────────────────────────────────────
 MAX_RETRIES_API    = 3   # Retries on transient API errors (rate limit, timeout)
 MAX_RETRIES_IMPL   = 3   # How many times the implementer can retry a feature
@@ -178,13 +217,30 @@ def _agent_result(result_preview: str, success: bool = True):
 _SESSION_START = datetime.datetime.now()
 
 def _track_usage(role: str, usage) -> None:
-    """Accumulate tokens from each API call by role."""
+    """Accumulate tokens from each API call by role. Triggers budget enforcement if enabled."""
+    global _BUDGET_EXCEEDED
     if usage is None:
         return
     bucket = _SESSION_COSTS.get(role, _SESSION_COSTS["leader"])
     bucket["prompt_tokens"]     += getattr(usage, "prompt_tokens", 0)
     bucket["completion_tokens"] += getattr(usage, "completion_tokens", 0)
     bucket["calls"]             += 1
+
+    if COST_BUDGET_USD > 0 and not _BUDGET_EXCEEDED:
+        total_prompt     = sum(v["prompt_tokens"]     for v in _SESSION_COSTS.values())
+        total_completion = sum(v["completion_tokens"] for v in _SESSION_COSTS.values())
+        current_usd      = total_prompt * _PRICE_INPUT + total_completion * _PRICE_OUTPUT
+        if current_usd >= COST_BUDGET_USD:
+            _BUDGET_EXCEEDED = True
+            _log("harness", "BUDGET_EXCEEDED",
+                 f"USD {current_usd:.4f} >= limit {COST_BUDGET_USD:.2f}", level="warning")
+            console.print(Panel(
+                f"[yellow]Spent: USD {current_usd:.4f}  ·  Limit: USD {COST_BUDGET_USD:.2f}[/]\n"
+                "[dim]Current agent step will finish. No new features will be started.[/]",
+                title="[yellow]⚠ Session budget reached[/]",
+                border_style="yellow",
+                padding=(0, 1)
+            ))
 
 def _write_session_costs() -> None:
     """Write session cost summary to progress/session_costs.json."""
@@ -529,6 +585,144 @@ def run_agent(system_prompt: str, tools: list, task: str,
     return f"[ERROR: max_iter {max_iter} reached]"
 
 
+# ─── SPEC VALIDATION ─────────────────────────────────────────────────────────
+
+def _validate_spec(spec_path: str) -> str:
+    """
+    Cross-check a freshly generated spec against the existing codebase using a
+    single cheap LLM call.
+
+    What it catches:
+      - References to files that don't exist yet and aren't being created
+        by this feature (wrong import paths, missing modules).
+      - Interface assumptions that contradict what's already in src/
+        (e.g. spec says User.from_dict() but existing code has User.load()).
+      - Duplicate work — spec asks to create a file that already exists
+        with the same responsibility.
+
+    What it does NOT do:
+      - It does not re-run the spec writer or block the pipeline.
+      - It does not fail loudly — if the validation call fails for any reason
+        (network, timeout, unexpected response), the harness continues normally.
+      - It is non-blocking by design: issues are appended to the spec file as
+        a warning section so the implementer sees them and can compensate.
+
+    Returns a string with the identified issues, or an empty string if none.
+    Uses MODEL_BY_ROLE["spec_writer"] (typically a flash model) to keep cost low.
+    """
+    try:
+        with open(spec_path, "r", encoding="utf-8") as f:
+            spec_content = f.read()
+    except Exception:
+        return ""
+
+    tree_src   = _file_tree("src")
+    tree_tests = _file_tree("tests")
+
+    try:
+        response = client.chat.completions.create(
+            model=MODEL_BY_ROLE.get("spec_writer", MODEL),
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "You are a senior engineer doing a quick pre-implementation spec review. "
+                        "Your only job is to find concrete contradictions or false assumptions "
+                        "between the spec and the existing codebase. "
+                        "Be brief and specific — one line per issue. "
+                        "If nothing is wrong, reply with exactly the word: OK"
+                    )
+                },
+                {
+                    "role": "user",
+                    "content": (
+                        f"Spec to review:\n{spec_content[:3000]}\n\n"
+                        f"Existing files in src/:\n{tree_src}\n\n"
+                        f"Existing files in tests/:\n{tree_tests}\n\n"
+                        "List only concrete issues: wrong file paths, conflicting interfaces, "
+                        "duplicate responsibilities, or missing prerequisite files. "
+                        "Ignore style and completeness. If none, reply: OK"
+                    )
+                }
+            ],
+            max_tokens=300,
+        )
+        _track_usage("spec_writer", response.usage)
+        result = (response.choices[0].message.content or "").strip()
+        return "" if result.upper() == "OK" else result
+    except Exception:
+        return ""  # validation is best-effort — never block the pipeline
+
+
+# ─── RETRY CONTEXT EXTRACTION ────────────────────────────────────────────────
+
+def _extract_retry_context(rejection_reason: str) -> str:
+    """
+    Distill a reviewer rejection into the minimal actionable context needed
+    for the next implementation attempt.
+
+    Why this matters: injecting the full rejection reason on every retry bloats
+    the implementer's context with stack traces, passing test output, and prose
+    that isn't actionable. This function extracts only:
+      1. The names of specifically failing tests (pytest FAILED lines).
+      2. The first unique assertion / exception message per test.
+      3. Any explicit file-level issues mentioned in the rejection.
+
+    Falls back to a truncated version of the raw reason if no structured output
+    is detected (e.g. the reviewer returned plain prose instead of pytest output).
+
+    The goal is to reduce per-retry token consumption by 40–70% while making
+    the injected context *more* targeted, not less.
+    """
+    import re
+
+    lines = rejection_reason.splitlines()
+
+    # ── Collect failing test identifiers (pytest format) ─────────────────────
+    # Matches: "FAILED tests/test_auth.py::test_login_invalid_password"
+    failed_tests = [
+        l.strip() for l in lines
+        if re.match(r"FAILED\s+\S+::\S+", l.strip())
+    ]
+
+    # ── Collect the first unique error/assertion line per block ───────────────
+    error_keywords = ("AssertionError", "Error:", "assert ", "TypeError",
+                      "ValueError", "AttributeError", "ImportError", "FAILED")
+    seen_errors: set[str] = set()
+    error_lines: list[str] = []
+    for line in lines:
+        stripped = line.strip()
+        if any(kw in stripped for kw in error_keywords):
+            # Normalize whitespace to deduplicate similar messages
+            key = re.sub(r"\s+", " ", stripped)[:120]
+            if key not in seen_errors:
+                seen_errors.add(key)
+                error_lines.append(stripped)
+        if len(error_lines) >= 6:  # cap to avoid bloating context
+            break
+
+    # ── Build the distilled context ───────────────────────────────────────────
+    if failed_tests or error_lines:
+        parts: list[str] = []
+        if failed_tests:
+            parts.append(
+                "Failing tests (fix these specifically):\n"
+                + "\n".join(f"  - {t}" for t in failed_tests[:10])
+            )
+        if error_lines:
+            parts.append(
+                "Key errors:\n"
+                + "\n".join(f"  {e}" for e in error_lines)
+            )
+        return "\n".join(parts)
+
+    # ── Fallback: no structured output detected ───────────────────────────────
+    # Truncate to avoid bloating the implementer's context on prose rejections.
+    if len(rejection_reason) > 600:
+        return rejection_reason[:600] + "\n[...truncated — fix the issues above]"
+    return rejection_reason
+
+
 # ─── SPAWNERS ────────────────────────────────────────────────────────────────
 
 def _file_tree(path: str, max_files: int = 60) -> str:
@@ -569,10 +763,11 @@ def spawn_implementer(feature_id: int, description: str, attempt: int = 1,
 
     context = ""
     if attempt > 1 and rejection_reason:
+        retry_context = _extract_retry_context(rejection_reason)
         context = (
             f"\n\n⚠️  RETRY #{attempt} — The reviewer rejected the previous attempt.\n"
-            f"Rejection reason: {rejection_reason}\n"
-            f"You must fix exactly those points before reporting again."
+            f"Fix exactly these issues (do not rewrite unrelated code):\n"
+            f"{retry_context}"
         )
 
     _phase_header("implementer", "Implementing", feature_id, attempt)
@@ -635,6 +830,28 @@ def spawn_spec_writer(feature_id: int, description: str) -> str:
                        role="spec_writer", color="cyan", max_iter=35)
     done = not result.startswith("[ERROR")
     console.print(f"  [cyan]📋 SPEC_WRITER[/] {'[green]✓ spec ready[/]' if done else '[red]✗ error[/]'} → {result[:80]}")
+
+    # Validate the freshly generated spec against the current codebase.
+    # Skipped if the spec failed to generate or the agent returned an error.
+    if done and os.path.exists(spec_path):
+        issues = _validate_spec(spec_path)
+        if issues:
+            _log("spec_writer", "SPEC_VALIDATION_ISSUES", issues[:300], level="warning")
+            console.print(f"  [cyan]📋 SPEC_WRITER[/] [yellow]⚠ validation issues found — annotating spec[/]")
+            try:
+                with open(spec_path, "a", encoding="utf-8") as f:
+                    f.write(
+                        f"\n\n---\n"
+                        f"## ⚠ Spec validation warnings\n"
+                        f"The following issues were detected when cross-checking this spec "
+                        f"against the existing codebase. Review and adjust before implementing:\n\n"
+                        f"{issues}\n"
+                    )
+            except Exception:
+                pass
+        else:
+            console.print(f"  [cyan]📋 SPEC_WRITER[/] [dim]✓ spec validated — no issues[/]")
+
     return result
 
 
@@ -718,6 +935,7 @@ def spawn_e2e_tester(feature_id: int) -> str:
     return result
 
 
+@task(name="feature-cycle")
 def run_feature_cycle(feature_id: int, description: str, e2e: bool = True) -> dict:
     """
     Full cycle: spec → impl → (e2e) → review with retries.
@@ -729,6 +947,13 @@ def run_feature_cycle(feature_id: int, description: str, e2e: bool = True) -> di
     If the reviewer rejects, retries impl→e2e→review with the injected reason.
     Returns dict with: approved (bool), attempts (int), final_verdict (str).
     """
+    # ── Budget guard ─────────────────────────────────────────────────────────
+    if _BUDGET_EXCEEDED:
+        msg = f"[BUDGET_EXCEEDED] Feature #{feature_id} skipped — session budget of USD {COST_BUDGET_USD:.2f} was reached."
+        _log("harness", "BUDGET_SKIP", msg, level="warning")
+        console.print(f"  [yellow]⚠ skipping feature #{feature_id} — budget exhausted[/]")
+        return {"approved": False, "attempts": 0, "final_verdict": msg}
+
     # ── Step 1: Spec (only on first attempt) ─────────────────────────────────
     spec_result = spawn_spec_writer(feature_id, description)
     spec_path = spec_result.strip() if not spec_result.startswith("[ERROR") else None
@@ -978,6 +1203,27 @@ def run_leader(user_task: str) -> str:
     return f"[ERROR: leader max_iter {MAX_ITER_LEADER} reached]"
 
 
+# ─── FLOW ENTRY POINT ────────────────────────────────────────────────────────
+
+@flow(name="harness-session", log_prints=True)
+def _run_leader_flow(user_task: str) -> str:
+    """
+    Thin Prefect @flow wrapper around run_leader.
+
+    In local mode (ORCHESTRATOR=local) the @flow decorator is a no-op and this
+    function is identical to calling run_leader directly.
+
+    In Prefect mode (ORCHESTRATOR=prefect) each REPL command becomes a named
+    flow run in the Prefect dashboard. Each run_feature_cycle call inside it
+    surfaces as a child task with its own state, logs, and duration.
+
+    run_leader itself is intentionally not decorated — it contains the LLM
+    agent loop and should remain a plain Python function. Only the entry point
+    and the feature cycle (the unit of work) are Prefect-aware.
+    """
+    return run_leader(user_task)
+
+
 # ─── REPL ─────────────────────────────────────────────────────────────────────
 
 def print_features():
@@ -1004,10 +1250,12 @@ def main():
     _ensure_deps()
 
     console.rule("Multi-Agent Harness", style="white")
+    orch_label   = "[cyan]Prefect[/]" if ORCHESTRATOR == "prefect" else "[dim]local[/]"
+    budget_label = f"[yellow]USD {COST_BUDGET_USD:.2f} limit[/]" if COST_BUDGET_USD > 0 else "[dim]no limit[/]"
     console.print(
-        f"  Model: [cyan]{MODEL}[/]  |  "
-        f"Flow: [green]👑 Leader[/] → [cyan]📋 Spec[/] → [blue]🔨 Impl[/] → [yellow]🧪 E2E[/] → [magenta]🔍 Reviewer[/]\n"
-        f"  [dim]Commands: /quit | /status | /features | /costs[/]"
+        f"  Model: [cyan]{MODEL}[/]  |  Orchestrator: {orch_label}  |  Budget: {budget_label}\n"
+        f"  Flow: [green]👑 Leader[/] → [cyan]📋 Spec[/] → [blue]🔨 Impl[/] → [yellow]🧪 E2E[/] → [magenta]🔍 Reviewer[/]\n"
+        f"  [dim]Commands: /quit | /status | /features | /costs | /budget[/]"
     )
     console.rule(style="dim")
 
@@ -1060,8 +1308,26 @@ def main():
             elif user_input in ("/costs", "/costos"):
                 _write_session_costs()
                 continue
+            elif user_input == "/budget":
+                total_prompt     = sum(v["prompt_tokens"]     for v in _SESSION_COSTS.values())
+                total_completion = sum(v["completion_tokens"] for v in _SESSION_COSTS.values())
+                current_usd      = total_prompt * _PRICE_INPUT + total_completion * _PRICE_OUTPUT
+                if COST_BUDGET_USD > 0:
+                    pct = min(current_usd / COST_BUDGET_USD * 100, 100)
+                    bar = "█" * int(pct / 5) + "░" * (20 - int(pct / 5))
+                    status = "[red]EXCEEDED[/]" if _BUDGET_EXCEEDED else "[green]OK[/]"
+                    console.print(
+                        f"  Budget: [cyan]USD {current_usd:.4f}[/] / [cyan]USD {COST_BUDGET_USD:.2f}[/]  "
+                        f"[dim]{bar}[/] {pct:.1f}%  {status}"
+                    )
+                else:
+                    console.print(
+                        f"  Spent this session: [cyan]USD {current_usd:.4f}[/]  "
+                        f"[dim](no budget limit set — add COST_BUDGET_USD=N to .env to enable)[/]"
+                    )
+                continue
 
-            result = run_leader(user_input)
+            result = _run_leader_flow(user_input)
             console.rule("[green]✅ Session complete[/]", style="green")
             console.print(f"  [green]👑 LEADER[/] {result}")
     finally:

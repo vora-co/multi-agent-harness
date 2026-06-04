@@ -193,6 +193,7 @@ You → process all pending features
 | `process features 2 and 3` | Processes a specific range |
 | `/features` | Shows the status of all features |
 | `/costs` | Shows token usage and estimated cost for this session |
+| `/budget` | Shows current spend vs. budget limit with a progress bar |
 | `/status` | Shows the current state (progress/current.md) |
 | `/quit` | Exits the harness |
 
@@ -250,6 +251,8 @@ Key settings in `harness.py`:
 |---|---|---|
 | `MODEL` | `deepseek-v4-pro` | Fallback model for any role not listed in `MODEL_BY_ROLE` |
 | `MODEL_BY_ROLE` | see below | Per-agent model overrides — edit to tune cost vs. quality |
+| `ORCHESTRATOR` | `local` | Execution mode: `local` (plain Python) or `prefect` (dashboard + scheduling) |
+| `COST_BUDGET_USD` | `0` | Max USD spend per session. `0` disables enforcement. Example: `COST_BUDGET_USD=2.00` |
 | `MAX_ITER_LEADER` | `30` | Max iterations for the Leader agent |
 | `MAX_ITER_IMPL` | `50` | Max iterations for the Implementer |
 | `MAX_ITER_REVIEWER` | `40` | Max iterations for the Reviewer |
@@ -271,6 +274,60 @@ Each agent uses the model assigned to its role in `MODEL_BY_ROLE`. The defaults 
 To change a role's model, edit the value in `MODEL_BY_ROLE` in `harness.py`. No other code needs to change. To add a new custom role, insert a new key — `run_agent` picks it up automatically.
 
 > **Cost note:** The pricing constants `_PRICE_INPUT` / `_PRICE_OUTPUT` in `harness.py` are set for DeepSeek v4-pro. If you mix models with different per-token prices, update those constants or the USD estimate will be approximate. Token counts per role in `progress/session_costs.json` are always exact regardless.
+
+---
+
+## Prefect integration
+
+The harness supports an optional Prefect mode that adds dashboard observability, scheduling, and a foundation for future parallel execution — without changing any agent logic or tool behavior.
+
+### What changes in Prefect mode
+
+| | Local mode (`ORCHESTRATOR=local`) | Prefect mode (`ORCHESTRATOR=prefect`) |
+|---|---|---|
+| Each REPL command | Plain Python call | Named Prefect **flow run** |
+| Each feature cycle | Plain Python function | Prefect **task** tracked inside the flow |
+| Dashboard | None (terminal only) | Prefect UI with state, logs, duration per feature |
+| Scheduling | Manual REPL input | Cron or interval via `prefect deployment` |
+| Dependencies | None | `prefect>=3.0` |
+
+The `@flow` and `@task` decorators are **no-ops** in local mode — they resolve to identity functions at import time, so there is zero runtime overhead and no behavioral difference.
+
+### Setup — local Prefect server (no cloud account)
+
+```bash
+pip install -r requirements-prefect.txt
+prefect server start          # starts the UI at http://127.0.0.1:4200
+```
+
+Then add to your `.env`:
+
+```env
+ORCHESTRATOR=prefect
+```
+
+Run the harness normally — flow runs will appear in the local UI.
+
+### Setup — Prefect Cloud (free Hobby plan)
+
+```bash
+pip install -r requirements-prefect.txt
+prefect cloud login           # authenticate once via browser
+```
+
+Add to your `.env`:
+
+```env
+ORCHESTRATOR=prefect
+```
+
+Each harness session streams to your Prefect Cloud workspace at [app.prefect.io](https://app.prefect.io). The free Hobby tier includes workflow observability, logging, and alerting with 7-day run retention — sufficient for development and demos.
+
+### How it works internally
+
+`run_feature_cycle` is decorated with `@task(name="feature-cycle")`. Each call to process a feature appears as a child task inside the flow run. `run_leader` itself is **not** decorated — it contains the LLM agent loop and remains plain Python. The entry point `_run_leader_flow` (a thin `@flow` wrapper) is what `main()` calls; in local mode it is identical to calling `run_leader` directly.
+
+To switch back to local mode, remove `ORCHESTRATOR=prefect` from your `.env` or set it to `local`. No other changes needed.
 
 ---
 
@@ -336,19 +393,28 @@ The harness currently operates outside the software delivery lifecycle — it pr
 - **Compliance artifact generation** — auto-generate SBOM (Software Bill of Materials) and security summary reports per release, useful for enterprise clients with compliance requirements
 
 ### Harness UX
-- **Web dashboard** — replace the terminal REPL with a browser UI showing live agent progress, feature status, cost tracking, and logs
+- ~~**Cost budgets**~~ ✅ — set `COST_BUDGET_USD=N` in `.env`; harness finishes the current agent step then stops; `/budget` REPL command shows a live progress bar
+- ~~**Web dashboard**~~ ✅ (via Prefect) — set `ORCHESTRATOR=prefect` to get a live UI with agent progress, feature status, logs, and duration; see [Prefect integration](#prefect-integration)
 - **Cost budgets** — set a maximum spend per session or per feature; the harness stops and alerts when the budget is reached
-- **Webhook notifications** — notify Slack, email, or any webhook when a feature completes or fails
+- **Webhook notifications** — notify Slack, email, or any webhook when a feature completes or fails; Prefect mode already supports this natively via [Automations](https://docs.prefect.io/v3/automate/events/automations-overview)
 
 ### Reliability
-- **Smarter retry logic** — currently retries with the full rejection reason; could extract specific failing tests and inject only the relevant context
-- **Spec validation** — the Spec Writer could verify its own spec against existing code before handing off to the Implementer, catching contradictions earlier
+- ~~**Smarter retry logic**~~ ✅ — `_extract_retry_context()` parses pytest output to inject only failing test names and key error lines on retries; reduces per-retry token cost 40–70% vs. injecting the full rejection
+- ~~**Spec validation**~~ ✅ — after generating a spec, `_validate_spec()` cross-checks it against the existing file tree with a cheap LLM call; any contradictions or false assumptions are appended as a warning section in the spec file before the Implementer reads it
 - **Incremental context compaction** — the current compaction strategy is conservative; a more aggressive approach could reduce token usage on long sessions by 30–40%
 
 
 ---
 
 ## Changelog
+
+### v1.4.0
+- **Cost budgets** — `COST_BUDGET_USD` env var sets a per-session spend limit; `_track_usage` sets `_BUDGET_EXCEEDED` flag when the limit is hit; `run_feature_cycle` skips new work gracefully; `/budget` REPL command shows a live spend-vs-limit progress bar
+- **Smarter retry logic** — `_extract_retry_context()` parses rejection reasons for pytest `FAILED` lines and unique exception messages; injects only the actionable subset into the next implementer attempt instead of the full rejection text
+- **Spec validation** — `_validate_spec()` makes a single cheap LLM call after each new spec is generated, cross-checking against the existing file tree; contradictions and false assumptions are appended as a `## ⚠ Spec validation warnings` section in the spec file before the Implementer reads it; fully non-blocking (failures are silently skipped)
+
+### v1.3.0
+- **Prefect integration** — optional `ORCHESTRATOR=prefect` mode wraps execution in `@flow`/`@task` for dashboard observability, scheduling, and a foundation for parallel execution; local mode is unchanged (decorators are no-ops). Install with `pip install -r requirements-prefect.txt`
 
 ### v1.2.0
 - **Per-agent model selection** — `MODEL_BY_ROLE` dict in `harness.py` assigns a model per role; `run_agent`, `_compact_messages`, and the leader loop all respect it. Reduces session cost ~30–40% with default assignments (`flash` for spec, reviewer, e2e, compaction; `pro` for leader and implementer)

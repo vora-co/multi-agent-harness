@@ -1,0 +1,15 @@
+# Optional Prefect dependencies
+# Install only if you want Prefect dashboard observability and scheduling.
+# Set ORCHESTRATOR=prefect in your .env after installing.
+#
+# Local tracking (no cloud account required):
+#   pip install -r requirements-prefect.txt
+#   prefect server start          # starts local Prefect UI at http://127.0.0.1:4200
+#   ORCHESTRATOR=prefect python3 harness.py
+#
+# Cloud tracking (free Hobby plan at app.prefect.io):
+#   pip install -r requirements-prefect.txt
+#   prefect cloud login           # authenticate once
+#   ORCHESTRATOR=prefect python3 harness.py
+
+prefect>=3.0
