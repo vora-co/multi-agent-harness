@@ -150,7 +150,7 @@ python3 harness.py
 This opens an interactive REPL. Type your instruction and press Enter:
 
 ```
-Tú → continúa con las features pendientes
+You → process all pending features
 ```
 
 ### REPL commands
@@ -284,7 +284,7 @@ Currently the harness writes everything to JSON files in `data/` and `progress/`
 
 ### v1.1.0
 - All code, comments, and agent prompts translated to English
-- REPL commands now accept both English (`/quit`, `/costs`, `/status`) and Spanish aliases
+- REPL commands updated to English (`/quit`, `/costs`, `/status`)
 - Added Roadmap section to README
 
 ### v1.0.0
