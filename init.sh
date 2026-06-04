@@ -1,27 +1,22 @@
 #!/bin/bash
 set -e
-echo "=== DeepSeek Harness - init ==="
+echo "=== Multi-Agent Harness - init ==="
 
-echo "[1/4] Instalando dependencias de requirements.txt..."
+echo "[1/3] Installing dependencies from requirements.txt..."
 pip3 install -r requirements.txt --quiet
-echo "  OK: dependencias instaladas"
+echo "  OK: dependencies installed"
 
-echo "[2/4] Instalando browsers de Playwright..."
+echo "[2/3] Installing Playwright browsers..."
 python3 -m playwright install chromium --with-deps 2>/dev/null || \
   python3 -m playwright install chromium 2>/dev/null || \
-  echo "  AVISO: playwright browsers no instalados (solo afecta tests E2E)"
+  echo "  WARNING: playwright browsers not installed (only affects E2E tests)"
 
-echo "[3/4] Verificando estructura del proyecto..."
-for f in feature_list.json AGENTS.md CHECKPOINTS.md progress/current.md; do
-  [ -f "$f" ] && echo "  OK: $f" || (echo "  FALTA: $f" && exit 1)
-done
-
-echo "[4/4] Corriendo tests existentes..."
+echo "[3/3] Running existing tests..."
 if ls tests/test_*.py 2>/dev/null | grep -q .; then
   python3 -m pytest tests/ -q --tb=short
 else
-  echo "  Sin tests aún — OK para sesión inicial"
+  echo "  No tests yet — OK for initial session"
 fi
 
 echo ""
-echo "=== Todo listo. Ejecuta: python3 harness.py ==="
+echo "=== All set. Run: python3 harness.py ==="

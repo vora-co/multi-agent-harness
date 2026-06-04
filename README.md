@@ -157,13 +157,13 @@ Tú → continúa con las features pendientes
 
 | Command | What it does |
 |---|---|
-| `continúa con las features pendientes` | Processes all pending features in order |
-| `Ejecuta solo la feature 3 y detente` | Processes only feature #3 |
-| `Procesa las features 2 y 3` | Processes a specific range |
+| `process all pending features` | Processes all pending features in order |
+| `run only feature 3 and stop` | Processes only feature #3 |
+| `process features 2 and 3` | Processes a specific range |
 | `/features` | Shows the status of all features |
-| `/costos` | Shows token usage and estimated cost for this session |
-| `/estado` | Shows the current state (progress/current.md) |
-| `/salir` | Exits the harness |
+| `/costs` | Shows token usage and estimated cost for this session |
+| `/status` | Shows the current state (progress/current.md) |
+| `/quit` | Exits the harness |
 
 ---
 

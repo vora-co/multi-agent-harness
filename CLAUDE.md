@@ -31,10 +31,10 @@ progress/           # Reports per feature (spec_N.md, impl_N.md, review_N.md)
 ## How to use the harness
 ```
 python3 harness.py
-You → continúa con las features pendientes     # process all in order
-You → Ejecuta solo la feature 2 y detente      # run a specific feature
+You → process all pending features     # process all in order
+You → run only feature 2 and stop      # run a specific feature
 /features   # view status
-/costos     # token costs
+/costs      # token costs
 ```
 
 ## Key design decisions

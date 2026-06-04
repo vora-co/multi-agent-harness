@@ -18,7 +18,7 @@
   {
     "id": 3,
     "title": "Your third feature title here",
-    "description": "Add as many features as your project requires. The harness processes them in ascending id order. You can run a single feature with: 'Ejecuta solo la feature 3 y detente'. Failed features can be retried by resetting their status to 'pending' — see the README for the reset command.",
+    "description": "Add as many features as your project requires. The harness processes them in ascending id order. You can run a single feature with: 'run only feature 3 and stop'. Failed features can be retried by resetting their status to 'pending' — see the README for the reset command.",
     "status": "pending",
     "e2e": false,
     "created_at": "2025-01-01T00:00:00"
