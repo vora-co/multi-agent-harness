@@ -343,6 +343,76 @@ Add more directories here if your project needs them.
 
 ---
 
+## Plugin system
+
+The harness exposes a lifecycle hook system that lets you extend behavior without modifying any base file. This is the foundation for an open-core fork: the public repo ships with an empty `plugins/` directory; a premium fork adds modules there.
+
+### How it works
+
+At startup, the harness calls `_load_plugins()`, which imports every `*.py` file in `plugins/` alphabetically. Each module registers callbacks via `register_hook()` at import time. The harness fires the registered callbacks at key points in the pipeline.
+
+Files whose names start with `_` are skipped by the loader — use `_disabled_plugin.py` to park code that isn't ready.
+
+### Available events
+
+| Event | When it fires | Keyword arguments |
+|---|---|---|
+| `before_feature` | Start of each feature cycle, before spec or code | `feature_id`, `description`, `e2e` |
+| `after_spec_generated` | After spec is written and validated | `feature_id`, `spec_path`, `issues` (list) |
+| `after_feature_approved` | Reviewer approves the feature | `feature_id`, `description`, `attempts` |
+| `after_feature_failed` | Feature exhausts all retries | `feature_id`, `description`, `attempts`, `final_verdict` |
+| `after_session` | Harness exits (including on crash) | `session_costs` (dict) |
+
+### Writing a plugin
+
+Create a `.py` file in `plugins/`. Call `register_hook()` at module level:
+
+```python
+# plugins/my_plugin.py
+from harness import register_hook
+
+def on_approved(feature_id: int, description: str, attempts: int, **kwargs):
+    print(f"Feature #{feature_id} done in {attempts} attempt(s)")
+
+register_hook("after_feature_approved", on_approved)
+```
+
+Always add `**kwargs` to callback signatures — new arguments may be added to events in future versions and `**kwargs` keeps your plugin compatible.
+
+See `plugins/example_plugin.py` for a fully documented template with commented-out examples for Slack notifications, GitHub PR creation, external logging, and session cost reporting.
+
+### Rules
+
+- Plugins import from `harness`, never the other way around.
+- Callbacks run synchronously in the main thread — keep them fast. For slow operations (HTTP, file uploads), spawn a background thread.
+- Errors inside callbacks are caught and logged; they never stop the pipeline.
+
+### Open-core fork setup
+
+To maintain a premium fork that extends the public harness:
+
+```bash
+# Initial setup (one time)
+git clone <public-repo-url> multi-agent-harness-premium
+cd multi-agent-harness-premium
+git remote rename origin upstream
+git remote add origin <private-repo-url>
+git remote set-url --push upstream DISABLE   # prevent accidental push to public
+git push -u origin main
+```
+
+Add premium-only modules to `plugins/`. Never edit `harness.py` or any other base file in the premium fork — all extensions go through the plugin system.
+
+To pull upstream improvements from the public repo into the premium fork:
+
+```bash
+git fetch upstream
+git merge upstream/main    # conflicts are rare because premium only adds files
+git push origin main
+```
+
+---
+
 ## How agents communicate
 
 Agents don't pass results through chat — they write to files in `progress/`. This prevents context bloat and keeps each agent focused on its task.
@@ -407,6 +477,9 @@ The harness currently operates outside the software delivery lifecycle — it pr
 ---
 
 ## Changelog
+
+### v1.5.0
+- **Plugin system** — lifecycle hook registry (`before_feature`, `after_spec_generated`, `after_feature_approved`, `after_feature_failed`, `after_session`) with `register_hook()` / `_fire()` API; `_load_plugins()` auto-imports all `*.py` files in `plugins/` at startup; `plugins/example_plugin.py` ships as a fully documented template; designed for open-core forks that extend the harness without touching base files
 
 ### v1.4.0
 - **Cost budgets** — `COST_BUDGET_USD` env var sets a per-session spend limit; `_track_usage` sets `_BUDGET_EXCEEDED` flag when the limit is hit; `run_feature_cycle` skips new work gracefully; `/budget` REPL command shows a live spend-vs-limit progress bar

@@ -585,6 +585,130 @@ def run_agent(system_prompt: str, tools: list, task: str,
     return f"[ERROR: max_iter {max_iter} reached]"
 
 
+# ─── PLUGIN / HOOK SYSTEM ────────────────────────────────────────────────────
+#
+# The harness fires lifecycle events at key points in the pipeline. Plugins
+# register Python callables for these events via register_hook() at import time.
+#
+# This is the extension mechanism for the open-core model: the public harness
+# ships with an empty plugins/ directory; a premium fork drops additional
+# modules there without ever touching harness.py or any base file.
+#
+# All callbacks receive **kwargs so plugins stay compatible when new arguments
+# are added to an event in future versions — always add **kwargs to signatures.
+# Errors inside individual callbacks are caught and logged; a buggy plugin
+# never crashes the harness.
+
+_HOOKS: dict[str, list] = {
+    # Fired at the start of run_feature_cycle, before spec or code is written.
+    # kwargs: feature_id (int), description (str), e2e (bool)
+    "before_feature": [],
+
+    # Fired after spawn_spec_writer finishes and validation runs.
+    # kwargs: feature_id (int), spec_path (str), issues (list[str])
+    "after_spec_generated": [],
+
+    # Fired when the Reviewer approves a feature cycle.
+    # kwargs: feature_id (int), description (str), attempts (int)
+    "after_feature_approved": [],
+
+    # Fired when a feature exhausts all retries and is marked failed.
+    # kwargs: feature_id (int), description (str), attempts (int), final_verdict (str)
+    "after_feature_failed": [],
+
+    # Fired once when the harness exits — even on crash (called from finally).
+    # kwargs: session_costs (dict)  — same structure as progress/session_costs.json
+    "after_session": [],
+}
+
+
+def register_hook(event: str, fn) -> None:
+    """
+    Register a callback for a lifecycle event.
+
+    Plugins call this at module import time:
+
+        from harness import register_hook
+
+        def my_callback(feature_id, **kwargs):
+            ...
+
+        register_hook("after_feature_approved", my_callback)
+
+    Safe to call multiple times with different functions for the same event.
+    Registering an unknown event name logs a warning and is ignored.
+    """
+    if event not in _HOOKS:
+        _log("harness", "UNKNOWN_HOOK",
+             f"Plugin tried to register unknown event '{event}'. "
+             f"Valid events: {list(_HOOKS)}", level="warning")
+        return
+    _HOOKS[event].append(fn)
+
+
+def _fire(event: str, **kwargs) -> None:
+    """
+    Invoke all callbacks registered for an event.
+    Errors in individual callbacks are caught and logged so a buggy plugin
+    never interrupts the pipeline.
+    """
+    for fn in _HOOKS.get(event, []):
+        try:
+            fn(**kwargs)
+        except Exception as exc:
+            _log("harness", "HOOK_ERROR",
+                 f"event={event} fn={getattr(fn, '__name__', fn)} error={exc}",
+                 level="error")
+            console.print(f"  [red]✗ plugin error[/] [{event}] {exc}")
+
+
+def _load_plugins() -> None:
+    """
+    Auto-load all *.py modules found in the plugins/ directory.
+
+    Each module is imported once at startup. Plugins register their hooks
+    via register_hook() at import time — no explicit activation needed beyond
+    dropping the file in the directory.
+
+    Naming rules:
+      - Any file ending in .py is loaded, in alphabetical order.
+      - Files starting with _ are skipped (use _disabled_plugin.py to park code).
+
+    Errors in individual plugins are caught, logged, and skipped — a broken
+    plugin never prevents the harness from starting.
+
+    If plugins/ is absent or empty, this function is a no-op.
+    """
+    import importlib.util
+
+    plugin_dir = "plugins"
+    if not os.path.isdir(plugin_dir):
+        return
+
+    plugin_files = sorted(
+        f for f in os.listdir(plugin_dir)
+        if f.endswith(".py") and not f.startswith("_")
+    )
+    if not plugin_files:
+        return
+
+    console.print(
+        f"  [dim]Plugins: {', '.join(p[:-3] for p in plugin_files)}[/]"
+    )
+
+    for filename in plugin_files:
+        module_name = f"harness_plugin_{filename[:-3]}"
+        plugin_path = os.path.join(plugin_dir, filename)
+        try:
+            spec = importlib.util.spec_from_file_location(module_name, plugin_path)
+            mod  = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(mod)
+            _log("harness", "PLUGIN_LOADED", filename)
+        except Exception as exc:
+            _log("harness", "PLUGIN_ERROR", f"{filename}: {exc}", level="error")
+            console.print(f"  [red]✗ failed to load plugin[/] {filename} — {exc}")
+
+
 # ─── SPEC VALIDATION ─────────────────────────────────────────────────────────
 
 def _validate_spec(spec_path: str) -> str:
@@ -833,10 +957,12 @@ def spawn_spec_writer(feature_id: int, description: str) -> str:
 
     # Validate the freshly generated spec against the current codebase.
     # Skipped if the spec failed to generate or the agent returned an error.
+    spec_issues: list[str] = []
     if done and os.path.exists(spec_path):
-        issues = _validate_spec(spec_path)
-        if issues:
-            _log("spec_writer", "SPEC_VALIDATION_ISSUES", issues[:300], level="warning")
+        issues_text = _validate_spec(spec_path)
+        if issues_text:
+            spec_issues = [l for l in issues_text.splitlines() if l.strip()]
+            _log("spec_writer", "SPEC_VALIDATION_ISSUES", issues_text[:300], level="warning")
             console.print(f"  [cyan]📋 SPEC_WRITER[/] [yellow]⚠ validation issues found — annotating spec[/]")
             try:
                 with open(spec_path, "a", encoding="utf-8") as f:
@@ -845,12 +971,15 @@ def spawn_spec_writer(feature_id: int, description: str) -> str:
                         f"## ⚠ Spec validation warnings\n"
                         f"The following issues were detected when cross-checking this spec "
                         f"against the existing codebase. Review and adjust before implementing:\n\n"
-                        f"{issues}\n"
+                        f"{issues_text}\n"
                     )
             except Exception:
                 pass
         else:
             console.print(f"  [cyan]📋 SPEC_WRITER[/] [dim]✓ spec validated — no issues[/]")
+
+    _fire("after_spec_generated",
+          feature_id=feature_id, spec_path=spec_path, issues=spec_issues)
 
     return result
 
@@ -947,6 +1076,9 @@ def run_feature_cycle(feature_id: int, description: str, e2e: bool = True) -> di
     If the reviewer rejects, retries impl→e2e→review with the injected reason.
     Returns dict with: approved (bool), attempts (int), final_verdict (str).
     """
+    # ── Lifecycle hook ───────────────────────────────────────────────────────
+    _fire("before_feature", feature_id=feature_id, description=description, e2e=e2e)
+
     # ── Budget guard ─────────────────────────────────────────────────────────
     if _BUDGET_EXCEEDED:
         msg = f"[BUDGET_EXCEEDED] Feature #{feature_id} skipped — session budget of USD {COST_BUDGET_USD:.2f} was reached."
@@ -1000,6 +1132,8 @@ def run_feature_cycle(feature_id: int, description: str, e2e: bool = True) -> di
         # ── Step 4: Review ───────────────────────────────────────────────────
         review_result = spawn_reviewer(feature_id, e2e=e2e)
         if review_result.strip().startswith("APPROVED"):
+            _fire("after_feature_approved",
+                  feature_id=feature_id, description=description, attempts=attempt)
             return {"approved": True, "attempts": attempt, "final_verdict": review_result}
 
         rejection_reason = review_result.replace("REJECTED:", "").strip()
@@ -1014,11 +1148,11 @@ def run_feature_cycle(feature_id: int, description: str, e2e: bool = True) -> di
                 border_style="yellow", padding=(0, 1)
             ))
 
-    return {
-        "approved": False,
-        "attempts": MAX_RETRIES_REVIEW,
-        "final_verdict": f"REJECTED after {MAX_RETRIES_REVIEW} attempts: {rejection_reason}"
-    }
+    final_verdict = f"REJECTED after {MAX_RETRIES_REVIEW} attempts: {rejection_reason}"
+    _fire("after_feature_failed",
+          feature_id=feature_id, description=description,
+          attempts=MAX_RETRIES_REVIEW, final_verdict=final_verdict)
+    return {"approved": False, "attempts": MAX_RETRIES_REVIEW, "final_verdict": final_verdict}
 
 
 # ─── LEADER LOOP ─────────────────────────────────────────────────────────────
@@ -1249,6 +1383,9 @@ def main():
     # Verify and install dependencies before showing any UI
     _ensure_deps()
 
+    # Load plugins before the banner so hooks are registered before anything runs
+    _load_plugins()
+
     console.rule("Multi-Agent Harness", style="white")
     orch_label   = "[cyan]Prefect[/]" if ORCHESTRATOR == "prefect" else "[dim]local[/]"
     budget_label = f"[yellow]USD {COST_BUDGET_USD:.2f} limit[/]" if COST_BUDGET_USD > 0 else "[dim]no limit[/]"
@@ -1333,6 +1470,7 @@ def main():
     finally:
         # Always write costs on exit, even if there's a crash
         _write_session_costs()
+        _fire("after_session", session_costs=_SESSION_COSTS)
 
 
 if __name__ == "__main__":
