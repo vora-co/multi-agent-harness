@@ -107,6 +107,7 @@ Edit `feature_list.json` to describe what you want to build. Each entry is a fea
     "description": "Create src/models/user.py with a User class (id: int, name: str, email: str, role: str). Validate email with regex. Write tests in tests/test_user.py: valid creation, invalid email raises ValueError, to_dict/from_dict round-trip.",
     "status": "pending",
     "e2e": false,
+    "depends_on": [],
     "created_at": "2025-01-01T00:00:00"
   },
   {
@@ -115,6 +116,7 @@ Edit `feature_list.json` to describe what you want to build. Each entry is a fea
     "description": "Create src/auth.py with JWT auth (python-jose). Add POST /api/v1/auth/register and POST /api/v1/auth/login endpoints to src/api.py. Hash passwords with bcrypt. Return JWT token with payload {user_id, role, exp: 24h}. Tests in tests/test_auth.py.",
     "status": "pending",
     "e2e": false,
+    "depends_on": [1],
     "created_at": "2025-01-01T00:00:00"
   }
 ]
@@ -124,12 +126,41 @@ Edit `feature_list.json` to describe what you want to build. Each entry is a fea
 
 | Field | Type | Description |
 |---|---|---|
-| `id` | int | Sequential ID — features run in ascending order |
+| `id` | int | Sequential ID |
 | `title` | string | Short name for the feature |
 | `description` | string | Full spec: files to create, logic to implement, tests to write |
 | `status` | string | `pending` \| `in_progress` \| `done` \| `failed` |
 | `e2e` | bool | `true` only for features with browser UI to test with Playwright. Keep `false` for backend features |
+| `depends_on` | int[] | IDs of features that must be `done` before this one runs. Use `[]` for no dependencies |
 | `created_at` | string | ISO timestamp |
+
+### Feature dependencies
+
+The `depends_on` field lets you declare that a feature requires one or more others to be completed first. The harness resolves the full dependency graph on startup and injects a computed execution order into the Leader's context — the Leader does not need to infer ordering itself.
+
+```json
+{ "id": 3, "title": "Protected API endpoints", "depends_on": [1, 2] }
+```
+
+The harness resolves this into:
+
+```
+#1 (User domain model) → #2 (REST API: user auth) → #3 (Protected API endpoints)
+```
+
+At startup, the resolved order is printed to the terminal:
+
+```
+Execution order (depends_on resolved): #1 → #2 → #3
+```
+
+**Rules:**
+- A feature with `"depends_on": []` (or omitting the field entirely) has no prerequisites and can run first.
+- `depends_on` accepts a list of feature IDs. All listed IDs must be present in `feature_list.json`.
+- A feature cannot depend on itself.
+- Circular dependencies are not allowed (e.g. #2 depends on #3 and #3 depends on #2).
+
+**Error handling:** The harness validates the graph on startup using `_validate_dependencies()` in `harness.py`. If errors are found, they are printed as a panel in the terminal and logged to `progress/harness.log`. The harness will still start, but the Leader will receive the error list in its context and will refuse to process features until the graph is fixed. Fix the issue in `feature_list.json` and restart.
 
 ### Tips for writing good feature descriptions
 
@@ -217,11 +248,29 @@ Key settings in `harness.py`:
 
 | Variable | Default | Description |
 |---|---|---|
-| `MODEL` | `deepseek-v4-pro` | DeepSeek model. Use `deepseek-v4-flash` for lower cost |
+| `MODEL` | `deepseek-v4-pro` | Fallback model for any role not listed in `MODEL_BY_ROLE` |
+| `MODEL_BY_ROLE` | see below | Per-agent model overrides — edit to tune cost vs. quality |
 | `MAX_ITER_LEADER` | `30` | Max iterations for the Leader agent |
 | `MAX_ITER_IMPL` | `50` | Max iterations for the Implementer |
 | `MAX_ITER_REVIEWER` | `40` | Max iterations for the Reviewer |
 | `MAX_RETRIES_REVIEW` | `2` | Times the impl→review cycle retries before marking failed |
+
+### Per-agent model selection
+
+Each agent uses the model assigned to its role in `MODEL_BY_ROLE`. The defaults balance cost and quality:
+
+| Role | Default model | Rationale |
+|---|---|---|
+| `leader` | `deepseek-v4-pro` | Multi-step orchestration requires strong reasoning |
+| `spec_writer` | `deepseek-v4-flash` | Structured output from a clear template — cheaper model is fine |
+| `implementer` | `deepseek-v4-pro` | Code generation benefits from the highest-quality model |
+| `reviewer` | `deepseek-v4-flash` | Reads files and runs tests — no deep reasoning needed |
+| `e2e_tester` | `deepseek-v4-flash` | Executes existing test scripts mechanically |
+| `compaction` | `deepseek-v4-flash` | Context summarization — fast and cheap |
+
+To change a role's model, edit the value in `MODEL_BY_ROLE` in `harness.py`. No other code needs to change. To add a new custom role, insert a new key — `run_agent` picks it up automatically.
+
+> **Cost note:** The pricing constants `_PRICE_INPUT` / `_PRICE_OUTPUT` in `harness.py` are set for DeepSeek v4-pro. If you mix models with different per-token prices, update those constants or the USD estimate will be approximate. Token counts per role in `progress/session_costs.json` are always exact regardless.
 
 ---
 
@@ -264,9 +313,27 @@ Currently the harness writes everything to JSON files in `data/` and `progress/`
 
 ### Agent improvements
 - **Parallel feature execution** — independent features could run simultaneously instead of sequentially, reducing total build time significantly
-- **Feature dependency graph** — declare that feature 5 depends on feature 3, so the harness can determine which features can run in parallel
-- **Per-agent model selection** — use a cheaper model (e.g. flash) for the Spec Writer and a more capable one for the Implementer, reducing cost without sacrificing quality
+- ~~**Feature dependency graph**~~ ✅ — `depends_on` field added to `feature_list.json`; harness validates and resolves the graph on startup and injects execution order into the Leader's context
+- ~~**Per-agent model selection**~~ ✅ — `MODEL_BY_ROLE` dict in `harness.py` assigns a model per role; heavier roles (`leader`, `implementer`) use `pro`, mechanical roles use `flash`
 - **Agent memory across features** — agents currently start fresh each feature; persisting learned conventions and decisions across features would reduce repeated mistakes
+
+### Parallel execution
+The current pipeline is strictly sequential: one feature at a time, one agent at a time. In real engineering teams this never happens. Planned improvements:
+- **Concurrent feature workers** — spawn an agent pool where features without dependencies run simultaneously using `asyncio` or `concurrent.futures`; implement a shared lock manager to prevent agents from writing to the same file
+- **DAG-based scheduler** — replace the ordered list in `feature_list.json` with a directed acyclic graph; the harness computes which features are unblocked at any point and dispatches them in parallel
+- **Shared context bus** — agents working in parallel need to broadcast decisions (e.g. "I created `src/models/user.py`") so sibling agents don't duplicate work; implement a lightweight pub/sub layer over the `progress/` directory
+- **Token budget manager for parallel runs** — parallel execution multiplies cost; add a concurrency cap (e.g. max 3 features at once) and a global session token budget that pauses new dispatches when the limit is approached
+- **Human-in-the-loop gates** — in hybrid human+agent teams, some checkpoints require human approval before the next parallel batch runs; add an optional `requires_human_gate: true` field on features that pauses the DAG until a human signs off
+
+### SDLC governance and DevOps integration
+The harness currently operates outside the software delivery lifecycle — it produces code but doesn't integrate with the version control and quality pipeline that real teams depend on. Planned improvements:
+- **Automatic branch and PR creation** — each feature runs on its own Git branch (`feature/N-title`); on Reviewer approval the harness opens a pull request automatically via GitHub/GitLab API with the spec, implementation report, and test results as PR description
+- **SAST integration** — run static analysis (Bandit for Python, ESLint security plugin for JS/TS, Semgrep) as a mandatory gate inside the Reviewer step; block approval if high-severity findings are present
+- **DAST integration** — for features with `e2e: true`, spin up the app in a sandbox and run OWASP ZAP or Nuclei against it; attach the report to the PR before merge
+- **SonarQube / SonarCloud gate** — push coverage and code-quality metrics to Sonar after each feature; the Reviewer reads the quality gate result and rejects if coverage drops below threshold or new code smells are introduced
+- **Full traceability chain** — link every artifact: `feature_list.json` entry → `spec_N.md` → `impl_N.md` → Git commit SHA → PR number → deployment tag; store this chain in `progress/trace_N.json` so auditors can follow a feature from business requirement to production
+- **Dependency vulnerability scanning** — after the Implementer adds a new package, run `pip-audit` or `npm audit` and fail the feature if critical CVEs are introduced
+- **Compliance artifact generation** — auto-generate SBOM (Software Bill of Materials) and security summary reports per release, useful for enterprise clients with compliance requirements
 
 ### Harness UX
 - **Web dashboard** — replace the terminal REPL with a browser UI showing live agent progress, feature status, cost tracking, and logs
@@ -278,9 +345,14 @@ Currently the harness writes everything to JSON files in `data/` and `progress/`
 - **Spec validation** — the Spec Writer could verify its own spec against existing code before handing off to the Implementer, catching contradictions earlier
 - **Incremental context compaction** — the current compaction strategy is conservative; a more aggressive approach could reduce token usage on long sessions by 30–40%
 
+
 ---
 
 ## Changelog
+
+### v1.2.0
+- **Per-agent model selection** — `MODEL_BY_ROLE` dict in `harness.py` assigns a model per role; `run_agent`, `_compact_messages`, and the leader loop all respect it. Reduces session cost ~30–40% with default assignments (`flash` for spec, reviewer, e2e, compaction; `pro` for leader and implementer)
+- **Feature dependency graph** — `depends_on: []` field added to `feature_list.json`; `_topological_sort` and `_validate_dependencies` in `harness.py` resolve execution order and detect cycles/missing IDs on startup; resolved order is injected into the Leader's context so it never has to infer ordering itself
 
 ### v1.1.0
 - All code, comments, and agent prompts translated to English

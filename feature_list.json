@@ -5,6 +5,7 @@
     "description": "Describe exactly what needs to be built. Be specific: list files to create, classes or functions to implement, validations required, and tests to write. The more detail you provide, the better the agents perform. Example: 'Create src/models/user.py with a User class (id: int, name: str, email: str). Validate email with a basic regex. Write tests in tests/test_user.py covering: valid user creation, invalid email raises ValueError, to_dict/from_dict round-trip.'",
     "status": "pending",
     "e2e": false,
+    "depends_on": [],
     "created_at": "2025-01-01T00:00:00"
   },
   {
@@ -13,14 +14,16 @@
     "description": "Another feature description. Tips: (1) Reference files created by previous features so agents know what already exists. (2) Set 'e2e' to true only for features with a browser UI that needs Playwright testing — keep it false for backend features to save tokens. (3) Each feature should be independently deliverable and testable.",
     "status": "pending",
     "e2e": false,
+    "depends_on": [],
     "created_at": "2025-01-01T00:00:00"
   },
   {
     "id": 3,
     "title": "Your third feature title here",
-    "description": "Add as many features as your project requires. The harness processes them in ascending id order. You can run a single feature with: 'run only feature 3 and stop'. Failed features can be retried by resetting their status to 'pending' — see the README for the reset command.",
+    "description": "Add as many features as your project requires. Features that depend on earlier ones should declare that in 'depends_on' — the harness will enforce the order automatically. You can run a single feature with: 'run only feature 3 and stop'. Failed features can be retried by resetting their status to 'pending' — see the README for the reset command.",
     "status": "pending",
     "e2e": false,
+    "depends_on": [1, 2],
     "created_at": "2025-01-01T00:00:00"
   }
 ]

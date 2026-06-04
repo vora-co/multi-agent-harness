@@ -58,7 +58,32 @@ from tools import execute_tool
 
 load_dotenv()
 
-MODEL   = "deepseek-v4-pro"   # options: deepseek-v4-flash | deepseek-v4-pro
+# ─── MODEL SELECTION ─────────────────────────────────────────────────────────
+# Default model used as a fallback for any role not listed in MODEL_BY_ROLE,
+# and for direct callers that don't pass a role (e.g. one-off API calls).
+MODEL = "deepseek-v4-pro"
+
+# Per-role model overrides.
+# Assign heavier/more expensive models only where reasoning quality matters most.
+# Assign lighter/cheaper models to roles that do structured or mechanical work.
+#
+# Guidelines:
+#   "pro"   — use when the agent must reason about ambiguous requirements,
+#             design architecture, or write non-trivial code from scratch.
+#   "flash" — use when the agent follows a clear template, reads existing files,
+#             runs commands, or produces structured output (JSON, Markdown).
+#
+# To change a role's model, edit the value here — no other code needs to change.
+# To add a new role, insert a new key; it will be picked up automatically by run_agent.
+MODEL_BY_ROLE: dict[str, str] = {
+    "leader":      "deepseek-v4-pro",    # orchestration requires multi-step reasoning
+    "spec_writer": "deepseek-v4-flash",  # structured output from a clear template
+    "implementer": "deepseek-v4-pro",    # code generation benefits from the best model
+    "reviewer":    "deepseek-v4-flash",  # reads files, runs tests — no deep reasoning needed
+    "e2e_tester":  "deepseek-v4-flash",  # executes existing test scripts mechanically
+    "compaction":  "deepseek-v4-flash",  # context summarization: fast and cheap
+}
+
 VERBOSE = True
 
 # ─── ROBUSTNESS SETTINGS ─────────────────────────────────────────────────────
@@ -192,6 +217,91 @@ def _write_session_costs() -> None:
         padding=(0, 1)
     ))
 
+# ─── FEATURE DEPENDENCY GRAPH ────────────────────────────────────────────────
+
+def _topological_sort(features: list) -> tuple[list, list]:
+    """
+    Sort features into a valid execution order that respects all depends_on
+    declarations. Uses Kahn's algorithm (BFS-based topological sort).
+
+    Returns:
+        ordered_ids  — feature IDs in execution order (safe to process left to right).
+        cycle_ids    — IDs involved in a circular dependency; empty list if none.
+
+    Features with no depends_on field (or an empty list) are treated as roots
+    and may be scheduled first. Among features at the same depth level, ordering
+    is stable (ascending ID within each batch).
+    """
+    from collections import deque
+
+    id_set = {f["id"] for f in features}
+    in_degree: dict[int, int] = {f["id"]: 0 for f in features}
+    # dependents[x] = list of feature IDs that require x to be done first
+    dependents: dict[int, list[int]] = {f["id"]: [] for f in features}
+
+    for feat in features:
+        for dep_id in feat.get("depends_on", []):
+            if dep_id not in id_set:
+                continue  # missing dep — reported by _validate_dependencies
+            in_degree[feat["id"]] += 1
+            dependents[dep_id].append(feat["id"])
+
+    # Seed the queue with all features that have no pending dependencies
+    queue: deque[int] = deque(sorted(fid for fid, deg in in_degree.items() if deg == 0))
+    ordered: list[int] = []
+
+    while queue:
+        fid = queue.popleft()
+        ordered.append(fid)
+        for dependent_id in sorted(dependents[fid]):
+            in_degree[dependent_id] -= 1
+            if in_degree[dependent_id] == 0:
+                queue.append(dependent_id)
+
+    # Any feature still with in_degree > 0 is part of a cycle
+    cycle_ids = [fid for fid, deg in in_degree.items() if deg > 0]
+    return ordered, cycle_ids
+
+
+def _validate_dependencies(features: list) -> list[str]:
+    """
+    Validate the dependency graph for structural errors.
+
+    Checks performed:
+      1. Self-dependency — a feature lists its own ID in depends_on.
+      2. Missing dependency — depends_on references an ID not in feature_list.json.
+      3. Circular dependency — detected via _topological_sort cycle output.
+
+    Returns a list of human-readable error strings (empty list = graph is valid).
+    Call this on startup and surface any errors before the Leader runs.
+    """
+    errors: list[str] = []
+    id_set = {f["id"] for f in features}
+
+    for feat in features:
+        for dep_id in feat.get("depends_on", []):
+            if dep_id == feat["id"]:
+                errors.append(
+                    f"Feature #{feat['id']} (\"{feat.get('title', '')}\") "
+                    f"depends on itself."
+                )
+            elif dep_id not in id_set:
+                errors.append(
+                    f"Feature #{feat['id']} (\"{feat.get('title', '')}\") "
+                    f"depends on #{dep_id} which does not exist in feature_list.json."
+                )
+
+    _, cycle_ids = _topological_sort(features)
+    if cycle_ids:
+        errors.append(
+            f"Circular dependency detected — the following features form a cycle "
+            f"and cannot be resolved: {sorted(cycle_ids)}. "
+            f"Break the cycle by removing at least one depends_on edge."
+        )
+
+    return errors
+
+
 # ─── CHECKPOINTING ───────────────────────────────────────────────────────────
 
 def recover_stale_features() -> list[int]:
@@ -276,7 +386,7 @@ def _compact_messages(messages: list, role: str) -> list:
 
     try:
         summary_response = client.chat.completions.create(
-            model=MODEL,
+            model=MODEL_BY_ROLE.get("compaction", MODEL),
             messages=[
                 {"role": "system",
                  "content": "You are a technical assistant. Concisely summarize the work history of a software agent."},
@@ -347,7 +457,7 @@ def run_agent(system_prompt: str, tools: list, task: str,
         for attempt in range(MAX_RETRIES_API):
             try:
                 api_response = client.chat.completions.create(
-                    model=MODEL,
+                    model=MODEL_BY_ROLE.get(role, MODEL),
                     messages=messages,
                     tools=tools if tools else None,
                     tool_choice="auto" if tools else None,
@@ -690,9 +800,15 @@ def run_feature_cycle(feature_id: int, description: str, e2e: bool = True) -> di
 
 def _build_leader_task(user_task: str) -> str:
     """
-    Pre-inject feature_list.json and progress/current.md into the leader's message
-    to eliminate 2-3 overhead tool calls per session.
+    Pre-inject feature_list.json, dependency execution order, and
+    progress/current.md into the leader's message.
+
+    Injecting the resolved execution order eliminates the need for the Leader
+    to infer ordering from depends_on fields itself, and makes dependency
+    violations immediately visible in logs.
     """
+    features = []
+    features_json = "(not available)"
     try:
         with open("feature_list.json", "r", encoding="utf-8") as f:
             features = json.load(f)
@@ -706,8 +822,35 @@ def _build_leader_task(user_task: str) -> str:
     except Exception:
         current_md = "(no previous state)"
 
+    # Build and inject the dependency-resolved execution order
+    dep_section = ""
+    if features:
+        dep_errors = _validate_dependencies(features)
+        if dep_errors:
+            dep_section = (
+                "\n## ⚠ Dependency graph errors (fix before running)\n"
+                + "\n".join(f"- {e}" for e in dep_errors)
+                + "\n"
+            )
+            for err in dep_errors:
+                _log("harness", "DEP_ERROR", err, level="error")
+                console.print(f"  [bold red]⚠ DEP ERROR:[/] {err}")
+        else:
+            ordered_ids, _ = _topological_sort(features)
+            id_to_title = {f["id"]: f.get("title", f"Feature #{f['id']}") for f in features}
+            order_lines = " → ".join(
+                f"#{fid} ({id_to_title[fid]})" for fid in ordered_ids
+            )
+            dep_section = (
+                f"\n## Resolved execution order (respects depends_on)\n"
+                f"{order_lines}\n"
+                f"Process features in exactly this order. "
+                f"Do not start a feature until all its depends_on features are 'done'.\n"
+            )
+
     return (
-        f"## feature_list.json (current state)\n```json\n{features_json}\n```\n\n"
+        f"## feature_list.json (current state)\n```json\n{features_json}\n```\n"
+        f"{dep_section}\n"
         f"## progress/current.md\n{current_md}\n\n"
         f"## User instruction\n{user_task}"
     )
@@ -759,7 +902,7 @@ def run_leader(user_task: str) -> str:
         for attempt in range(MAX_RETRIES_API):
             try:
                 api_response = client.chat.completions.create(
-                    model=MODEL,
+                    model=MODEL_BY_ROLE.get("leader", MODEL),
                     messages=messages,
                     tools=LEADER_TOOLS,
                     tool_choice="auto",
@@ -870,6 +1013,29 @@ def main():
 
     # Checkpointing: recover features stuck from previous sessions
     recover_stale_features()
+
+    # Validate the dependency graph on startup and warn immediately if broken.
+    # This catches cycles and missing IDs before the Leader wastes tokens on them.
+    try:
+        with open("feature_list.json", "r", encoding="utf-8") as f:
+            _startup_features = json.load(f)
+        _dep_errors = _validate_dependencies(_startup_features)
+        if _dep_errors:
+            console.print(Panel(
+                "\n".join(f"[red]• {e}[/]" for e in _dep_errors),
+                title="[red]⚠ Dependency graph errors — fix feature_list.json before running[/]",
+                border_style="red",
+                padding=(0, 1)
+            ))
+        else:
+            _ordered, _ = _topological_sort(_startup_features)
+            _id_to_title = {f["id"]: f.get("title", f"#{f['id']}") for f in _startup_features}
+            _order_str = " → ".join(f"#{fid}" for fid in _ordered)
+            console.print(
+                f"  [dim]Execution order (depends_on resolved): {_order_str}[/]"
+            )
+    except FileNotFoundError:
+        pass  # feature_list.json doesn't exist yet — that's fine
 
     try:
         while True:
