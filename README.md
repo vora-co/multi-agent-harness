@@ -439,12 +439,12 @@ Currently the harness writes everything to JSON files in `data/` and `progress/`
 - **Remote storage** — support S3 or Google Cloud Storage for `progress/` reports, enabling distributed or cloud-based runs
 
 ### Agent improvements
-- **Parallel feature execution** — independent features could run simultaneously instead of sequentially, reducing total build time significantly
+- **Parallel feature execution** — independent features could run simultaneously instead of sequentially, reducing total build time significantly ⭐ _available in [Premium](#-premium-modules)_
 - ~~**Feature dependency graph**~~ ✅ — `depends_on` field added to `feature_list.json`; harness validates and resolves the graph on startup and injects execution order into the Leader's context
 - ~~**Per-agent model selection**~~ ✅ — `MODEL_BY_ROLE` dict in `harness.py` assigns a model per role; heavier roles (`leader`, `implementer`) use `pro`, mechanical roles use `flash`
-- **Agent memory across features** — agents currently start fresh each feature; persisting learned conventions and decisions across features would reduce repeated mistakes
+- **Agent memory across features** — agents currently start fresh each feature; persisting learned conventions and decisions across features would reduce repeated mistakes ⭐ _available in [Premium](#-premium-modules)_
 
-### Parallel execution
+### Parallel execution ⭐ _available in [Premium](#-premium-modules)_
 The current pipeline is strictly sequential: one feature at a time, one agent at a time. In real engineering teams this never happens. Planned improvements:
 - **Concurrent feature workers** — spawn an agent pool where features without dependencies run simultaneously using `asyncio` or `concurrent.futures`; implement a shared lock manager to prevent agents from writing to the same file
 - **DAG-based scheduler** — replace the ordered list in `feature_list.json` with a directed acyclic graph; the harness computes which features are unblocked at any point and dispatches them in parallel
@@ -452,7 +452,7 @@ The current pipeline is strictly sequential: one feature at a time, one agent at
 - **Token budget manager for parallel runs** — parallel execution multiplies cost; add a concurrency cap (e.g. max 3 features at once) and a global session token budget that pauses new dispatches when the limit is approached
 - **Human-in-the-loop gates** — in hybrid human+agent teams, some checkpoints require human approval before the next parallel batch runs; add an optional `requires_human_gate: true` field on features that pauses the DAG until a human signs off
 
-### SDLC governance and DevOps integration
+### SDLC governance and DevOps integration ⭐ _available in [Premium](#-premium-modules)_
 The harness currently operates outside the software delivery lifecycle — it produces code but doesn't integrate with the version control and quality pipeline that real teams depend on. Planned improvements:
 - **Automatic branch and PR creation** — each feature runs on its own Git branch (`feature/N-title`); on Reviewer approval the harness opens a pull request automatically via GitHub/GitLab API with the spec, implementation report, and test results as PR description
 - **SAST integration** — run static analysis (Bandit for Python, ESLint security plugin for JS/TS, Semgrep) as a mandatory gate inside the Reviewer step; block approval if high-severity findings are present
@@ -505,6 +505,28 @@ The harness currently operates outside the software delivery lifecycle — it pr
 - Pre-injected file tree context — eliminates exploratory reads at the start of each agent cycle
 - Lightweight frontend reviewer mode — skips Playwright when `e2e: false`
 - Automatic checkpointing — recovers `in_progress` features after crashes
+
+---
+
+## ⭐ Premium modules
+
+The following capabilities are available in the **multi-agent-harness-premium** edition, built on top of this open-source core:
+
+| Module | Description |
+|---|---|
+| **RAG for legacy code** | Indexes an existing codebase into a local vector store (ChromaDB + sentence-transformers). Automatically injects relevant existing code snippets into each spec before implementation — reduces hallucinations and duplicate logic when extending legacy systems. |
+| **Parallel feature execution** | Concurrent agent workers with a shared lock manager and token budget per worker. Features without dependencies run simultaneously, reducing total build time on large projects. |
+| **Agent memory across features** | Persists conventions, architecture decisions, and learned patterns across the full feature list. Agents on feature #10 know what agents on feature #1 decided. |
+| **SDLC governance** | Automatic Git branch + PR creation on feature approval, SAST (Bandit, Semgrep), DAST (OWASP ZAP), SonarQube quality gate, and full traceability chain from feature → spec → commit → PR. |
+| **Human-in-the-loop gates** | `requires_human_gate: true` on any feature pauses the pipeline until a human approves in the Prefect dashboard — designed for hybrid human+agent teams. |
+| **Pre-analysis agent** | Reads an existing codebase before the Leader runs and auto-generates `feature_list.json` for refactoring or extension work. |
+
+Premium is distributed as a private fork. All premium modules are implemented as plugins and never modify the open-source base — your public fork stays clean and mergeable.
+
+**Contact us to learn more or request access:**
+
+- ✉ [felipe.mejia@vora.software](mailto:felipe.mejia@vora.software)
+- 🌐 [vora.software](https://vora.software)
 
 ---
 
