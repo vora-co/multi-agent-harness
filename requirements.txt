@@ -18,3 +18,4 @@ openai>=1.0.0
 python-dotenv>=1.0.0
 rich>=13.0.0
 mutmut>=2.4.0
+docker>=7.0.0

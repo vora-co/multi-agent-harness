@@ -257,6 +257,8 @@ Key settings in `harness.py`:
 | `MAX_ITER_IMPL` | `50` | Max iterations for the Implementer |
 | `MAX_ITER_REVIEWER` | `40` | Max iterations for the Reviewer |
 | `MAX_RETRIES_REVIEW` | `2` | Times the impl→review cycle retries before marking failed |
+| `SANDBOX_MODE` | `docker` | Where `run_bash` executes — `docker` (isolated container, recommended) or `local` (direct on host). See [Sandboxed execution](#sandboxed-execution) |
+| `SANDBOX_NETWORK_MODE` | `bridge` | Container network mode — `bridge` (outbound internet for installs) or `none` (fully air-gapped) |
 
 ### Per-agent model selection
 
@@ -340,6 +342,60 @@ SAFE_WRITE_DIRS = ("src/", "tests/", "progress/", "docs/", "frontend/", "data/")
 ```
 
 Add more directories here if your project needs them.
+
+---
+
+## Sandboxed execution
+
+Agent-issued shell commands (`run_bash` — used to install deps, run tests, start
+servers, etc.) execute inside an isolated Docker container **by default**. This
+closes a real gap that existed before: `write_file`/`append_file` always respected
+`SAFE_WRITE_DIRS`, but `run_bash` did not — a command like `echo … > /etc/hosts` or
+`cat ~/.ssh/id_rsa` would run with your full user privileges. Filesystem confinement
+is now enforced at the OS/mount-namespace boundary instead of by parsing commands in
+Python: the container simply cannot see anything outside what's mounted.
+
+```env
+SANDBOX_MODE=docker   # default — isolate run_bash in a locked-down container
+SANDBOX_MODE=local    # opt out — run directly on the host (clearly less safe)
+```
+
+**What the container gets:**
+- The project mounted read-only at `/workspace`, with each `SAFE_WRITE_DIRS` entry
+  re-mounted read-write on top — agents can write where they're supposed to and
+  nowhere else
+- Read-only root filesystem, non-root user, all Linux capabilities dropped
+- Memory / CPU / process-count limits (`SANDBOX_MEM_LIMIT`, `SANDBOX_CPU_LIMIT`,
+  `SANDBOX_PIDS_LIMIT`)
+- A wall-clock kill switch independent of the command's own `timeout` — a runaway
+  loop cannot outlive the container
+
+**Prerequisites:** a Docker daemon. On macOS/Windows that means Docker Desktop,
+[OrbStack](https://orbstack.dev) (free for commercial use, fastest startup — our
+recommendation), or [Colima](https://github.com/abiosoft/colima) (CLI-only, fully
+open source). `bash init.sh` detects whichever you have, builds the sandbox image
+from the bundled `Dockerfile` automatically, and offers a `brew install` command
+for whichever is missing.
+
+**No Docker available?** The harness still runs — it falls back to `local` mode
+with a one-time warning so you always know which mode you're in. You can also set
+`SANDBOX_MODE=local` explicitly to silence that warning if you've made a deliberate
+choice to run unsandboxed (e.g. inside a CI container that's already isolated).
+
+```env
+# Optional tuning — sensible defaults are baked in
+SANDBOX_IMAGE=harness-sandbox:latest
+SANDBOX_MEM_LIMIT=1g
+SANDBOX_CPU_LIMIT=2
+SANDBOX_PIDS_LIMIT=256
+SANDBOX_NETWORK_MODE=bridge   # set to "none" for fully offline runs
+```
+
+> **Note on network egress:** `bridge` mode gives the container the same outbound
+> internet access the host has (needed for `pip install` / `npm install`). A
+> default-deny egress allowlist (only package registries) is on the
+> [roadmap](#roadmap) as a follow-up hardening layer — for now, `SANDBOX_NETWORK_MODE=none`
+> is available if you want to fully air-gap a run (no installs will work in that mode).
 
 ---
 
@@ -437,6 +493,9 @@ Active development continues in the premium edition. See the [⭐ Premium module
 ---
 
 ## Changelog
+
+### v1.6.0
+- **Sandboxed execution** — `run_bash` now executes inside a locked-down Docker container by default (`SANDBOX_MODE=docker`); new `sandbox.py` module (`SandboxRunner` interface, `LocalSubprocessRunner`, `DockerSandboxRunner`) preserves `run_bash`'s exact signature/return shape so the rest of the pipeline is unaffected. Closes the long-standing write-confinement bypass — `SAFE_WRITE_DIRS` is now enforced at the OS/mount-namespace boundary (read-only project mount with rw remounts per safe dir) instead of by string-matching commands. Adds a non-root user, dropped capabilities, read-only rootfs, memory/CPU/PID limits, and a wall-clock kill switch independent of the per-command timeout. Falls back to `SANDBOX_MODE=local` (today's pre-sandbox behavior) with a one-time warning when no Docker daemon is reachable. New `Dockerfile` ships the sandbox image (Python 3.11 + Node 18 + project deps); `init.sh` detects Docker Desktop/OrbStack/Colima, builds the image, and offers a `brew install` for whichever is missing. See [Sandboxed execution](#sandboxed-execution)
 
 ### v1.5.0
 - **Plugin system** — lifecycle hook registry (`before_feature`, `after_spec_generated`, `after_feature_approved`, `after_feature_failed`, `after_session`) with `register_hook()` / `_fire()` API; `_load_plugins()` auto-imports all `*.py` files in `plugins/` at startup; `plugins/example_plugin.py` ships as a fully documented template; designed for open-core forks that extend the harness without touching base files

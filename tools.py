@@ -102,6 +102,20 @@ def list_files(directory: str = ".") -> str:
         return json.dumps({"error": str(e)})
 
 def run_bash(command: str, timeout: int = 60) -> str:
+    """
+    Execute a bash command on behalf of an agent.
+
+    SECURITY: this delegates to sandbox.get_runner(), which by default (SANDBOX_MODE=docker)
+    runs the command inside a locked-down container — read-only root filesystem, only
+    SAFE_WRITE_DIRS mounted read-write, non-root, capabilities dropped, resource limits,
+    and a wall-clock kill switch. That confinement happens at the OS/mount-namespace
+    boundary, which is what actually closes the old write-confinement bypass (the regex
+    blocklist below is kept only as a fast first-pass filter for obviously destructive
+    intent — it is NOT the security boundary).
+
+    Falls back to running directly on the host (with a one-time warning) if no
+    container runtime is available, or if SANDBOX_MODE=local is set explicitly.
+    """
     safe, reason = _is_safe_command(command)
     if not safe:
         return json.dumps({"error": reason, "blocked": True})
@@ -109,20 +123,10 @@ def run_bash(command: str, timeout: int = 60) -> str:
     command = command.replace("python -m", "python3 -m").replace("python3 -m mutmut", "python3 -m mutmut")
     if command.strip().startswith("python ") and not command.strip().startswith("python3"):
         command = "python3" + command[len("python"):]
-    try:
-        result = subprocess.run(
-            command, shell=True, capture_output=True, text=True, timeout=timeout
-        )
-        return json.dumps({
-            "stdout": result.stdout,
-            "stderr": result.stderr,
-            "returncode": result.returncode,
-            "success": result.returncode == 0
-        })
-    except subprocess.TimeoutExpired:
-        return json.dumps({"error": f"Timeout after {timeout}s", "timeout": True})
-    except Exception as e:
-        return json.dumps({"error": str(e)})
+
+    from sandbox import get_runner
+    result = get_runner().run(command, timeout=timeout, cwd=os.getcwd(), safe_write_dirs=SAFE_WRITE_DIRS)
+    return json.dumps(result)
 
 def update_feature_status(feature_id: int, status: str) -> str:
     if status not in VALID_FEATURE_STATUSES:
