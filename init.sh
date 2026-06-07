@@ -26,6 +26,19 @@ elif command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
   echo "  Showing live build output below so you can see it's progressing:"
   echo ""
   docker build -t harness-sandbox:latest . && echo "  OK: sandbox image ready"
+
+  SANDBOX_NET_VAL="$(grep -m1 '^SANDBOX_NETWORK_MODE=' .env 2>/dev/null | cut -d= -f2 | tr -d '[:space:]')"
+  SANDBOX_NET_VAL="${SANDBOX_NET_VAL:-egress-proxy}"
+  if [ "$SANDBOX_NET_VAL" = "egress-proxy" ]; then
+    echo ""
+    echo "  Building egress allowlist proxy image 'harness-egress-proxy:latest'"
+    echo "  (default-deny network egress — see 'Sandboxed execution' in the README; quick build, ~10s):"
+    echo ""
+    docker build -f Dockerfile.proxy -t harness-egress-proxy:latest . && echo "  OK: egress proxy image ready"
+  else
+    echo "  SANDBOX_NETWORK_MODE=$SANDBOX_NET_VAL in .env — skipping egress proxy image"
+    echo "  (only used in the default 'egress-proxy' mode)."
+  fi
 else
   echo "  No Docker daemon detected. The harness defaults to SANDBOX_MODE=docker,"
   echo "  which keeps agent-issued shell commands isolated in a container — without"

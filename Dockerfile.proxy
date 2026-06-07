@@ -1,0 +1,20 @@
+# Dockerfile.proxy — minimal image for the default-deny egress proxy
+# (egress_proxy.py). This is the only container sandbox.py attaches to both
+# the isolated internal sandbox network AND the default bridge — i.e. the
+# only thing on the sandbox's network that can reach the internet at all.
+# Every other sandboxed container is routed through it and limited to
+# SANDBOX_EGRESS_ALLOWLIST.
+FROM python:3.11-slim
+
+# NOTE: the base Debian image already ships a system account named "proxy"
+# (uid 13, from base-passwd) — using that name here collides with it
+# ("useradd: user 'proxy' already exists"). Pick a name that can't collide.
+RUN useradd --uid 1000 --create-home --shell /usr/sbin/nologin harnessproxy
+
+COPY egress_proxy.py /app/egress_proxy.py
+WORKDIR /app
+
+USER harnessproxy
+EXPOSE 3128
+
+CMD ["python3", "egress_proxy.py"]

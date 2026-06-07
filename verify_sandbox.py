@@ -1,6 +1,8 @@
 """
 verify_sandbox.py — quick manual check that SANDBOX_MODE=docker is actually
-isolating run_bash, not just that the image was built.
+isolating run_bash (filesystem + home dir), and that the default-deny egress
+proxy (SANDBOX_NETWORK_MODE=egress-proxy) lets allowlisted hosts through while
+blocking everything else — not just that the images were built.
 
 Run from the project root:
     python3 verify_sandbox.py
@@ -59,6 +61,35 @@ res = json.loads(tools.run_bash("echo \"home=$HOME\"; ls -la $HOME 2>&1 | head -
 print(json.dumps(res, indent=2))
 print("✓ PASS if $HOME is something like /home/sandbox (empty), NOT your Mac user folder,")
 print("  and the .ssh/id_rsa read fails with 'No such file or directory'")
+
+print()
+print("=" * 60)
+print("Test 6 — egress allowlist: can it reach an ALLOWED host? (should succeed)")
+print("=" * 60)
+from sandbox import SANDBOX_NETWORK
+if SANDBOX_NETWORK != "egress-proxy":
+    print(f"  SKIPPED — SANDBOX_NETWORK_MODE={SANDBOX_NETWORK!r}, not 'egress-proxy'.")
+else:
+    res = json.loads(tools.run_bash(
+        "curl -s -o /dev/null -w 'http_code=%{http_code}\\n' --max-time 20 https://pypi.org/simple/ || echo CURL_FAILED"
+    ))
+    print(json.dumps(res, indent=2))
+    print("✓ PASS if you see 'http_code=200' (or similar 2xx/3xx) — pypi.org is in the")
+    print("  default SANDBOX_EGRESS_ALLOWLIST and the proxy let the connection through")
+
+print()
+print("=" * 60)
+print("Test 7 — egress allowlist: can it reach a NON-ALLOWED host? (should FAIL)")
+print("=" * 60)
+if SANDBOX_NETWORK != "egress-proxy":
+    print(f"  SKIPPED — SANDBOX_NETWORK_MODE={SANDBOX_NETWORK!r}, not 'egress-proxy'.")
+else:
+    res = json.loads(tools.run_bash(
+        "curl -s -o /dev/null -w 'http_code=%{http_code}\\n' --max-time 20 https://example.com/ || echo CURL_FAILED"
+    ))
+    print(json.dumps(res, indent=2))
+    print("✓ PASS if the request fails or returns a non-2xx code — example.com is NOT in")
+    print("  the allowlist, so the proxy returned 403 (or there's simply no route to it)")
 
 print()
 print("=" * 60)

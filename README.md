@@ -258,7 +258,8 @@ Key settings in `harness.py`:
 | `MAX_ITER_REVIEWER` | `40` | Max iterations for the Reviewer |
 | `MAX_RETRIES_REVIEW` | `2` | Times the impl→review cycle retries before marking failed |
 | `SANDBOX_MODE` | `docker` | Where `run_bash` executes — `docker` (isolated container, recommended) or `local` (direct on host). See [Sandboxed execution](#sandboxed-execution) |
-| `SANDBOX_NETWORK_MODE` | `bridge` | Container network mode — `bridge` (outbound internet for installs) or `none` (fully air-gapped) |
+| `SANDBOX_NETWORK_MODE` | `egress-proxy` | Container network mode — `egress-proxy` (default-deny allowlist, most secure), `bridge` (full outbound, opt out), or `none` (fully air-gapped) |
+| `SANDBOX_EGRESS_ALLOWLIST` | *(registries)* | Comma-separated hostnames reachable in `egress-proxy` mode; `*.example.com` matches subdomains too. See [Sandboxed execution](#sandboxed-execution) |
 
 ### Per-agent model selection
 
@@ -369,13 +370,50 @@ SANDBOX_MODE=local    # opt out — run directly on the host (clearly less safe)
   `SANDBOX_PIDS_LIMIT`)
 - A wall-clock kill switch independent of the command's own `timeout` — a runaway
   loop cannot outlive the container
+- **Default-deny network egress** — see below
+
+### Network egress: default-deny allowlist
+
+By default (`SANDBOX_NETWORK_MODE=egress-proxy`), sandboxed containers are attached
+only to an *internal* Docker network with **no route to the internet at all**. The
+only way out is a small forward-proxy container (`egress_proxy.py`, built from
+`Dockerfile.proxy`) that is the single thing on that network also connected to the
+default bridge. It tunnels traffic through to its destination only when the
+hostname matches `SANDBOX_EGRESS_ALLOWLIST` — everything else gets a 403, and a
+tool that ignores the proxy env vars simply has no route and fails closed anyway.
+This is enforced at the network boundary, not by guessing what an LLM-generated
+command might try.
+
+No TLS interception happens — for HTTPS the proxy reads only the plaintext
+`CONNECT host:port` request line, checks the hostname, and (if allowed) tunnels
+the encrypted bytes through opaquely. It never sees certificates or payloads.
+
+```env
+SANDBOX_NETWORK_MODE=egress-proxy   # default — default-deny allowlist (most secure)
+SANDBOX_NETWORK_MODE=bridge         # opt out — full outbound access, same as the host
+SANDBOX_NETWORK_MODE=none           # fully air-gapped — no network at all
+```
+
+```env
+# Optional — comma-separated; "*.example.com" matches the bare domain + subdomains.
+# The default covers the package registries and git hosts most features need
+# (pypi, npmjs, yarnpkg, github + githubusercontent, nodejs/nodesource, debian).
+SANDBOX_EGRESS_ALLOWLIST=pypi.org,files.pythonhosted.org,registry.npmjs.org,...
+```
+
+If the proxy can't be started for any reason (e.g. the daemon won't allow internal
+networks), the harness falls back to `SANDBOX_NETWORK_MODE=none` — air-gapped —
+rather than silently opening egress, with a printed warning explaining why and how
+to opt into `bridge` instead. That keeps the safest-by-default posture: a broken
+proxy never quietly becomes an open door.
 
 **Prerequisites:** a Docker daemon. On macOS/Windows that means Docker Desktop,
 [OrbStack](https://orbstack.dev) (free for commercial use, fastest startup — our
 recommendation), or [Colima](https://github.com/abiosoft/colima) (CLI-only, fully
-open source). `bash init.sh` detects whichever you have, builds the sandbox image
-from the bundled `Dockerfile` automatically, and offers a `brew install` command
-for whichever is missing.
+open source). `bash init.sh` detects whichever you have, builds both the sandbox
+image (from `Dockerfile`) and — when `SANDBOX_NETWORK_MODE=egress-proxy` — the
+egress proxy image (from `Dockerfile.proxy`) automatically, and offers a
+`brew install` command for whichever runtime is missing.
 
 **No Docker available?** The harness still runs — it falls back to `local` mode
 with a one-time warning so you always know which mode you're in. You can also set
@@ -388,14 +426,7 @@ SANDBOX_IMAGE=harness-sandbox:latest
 SANDBOX_MEM_LIMIT=1g
 SANDBOX_CPU_LIMIT=2
 SANDBOX_PIDS_LIMIT=256
-SANDBOX_NETWORK_MODE=bridge   # set to "none" for fully offline runs
 ```
-
-> **Note on network egress:** `bridge` mode gives the container the same outbound
-> internet access the host has (needed for `pip install` / `npm install`). A
-> default-deny egress allowlist (only package registries) is on the
-> [roadmap](#roadmap) as a follow-up hardening layer — for now, `SANDBOX_NETWORK_MODE=none`
-> is available if you want to fully air-gap a run (no installs will work in that mode).
 
 ---
 
@@ -493,6 +524,9 @@ Active development continues in the premium edition. See the [⭐ Premium module
 ---
 
 ## Changelog
+
+### v1.7.0
+- **Default-deny network egress for the sandbox** — closes the "Network egress policy" gap from the architecture review. New default `SANDBOX_NETWORK_MODE=egress-proxy`: sandboxed containers attach only to an internal Docker network with no route to the internet; the only way out is a small forward-proxy container (`egress_proxy.py`, built from new `Dockerfile.proxy`) that tunnels traffic on only when the destination hostname matches `SANDBOX_EGRESS_ALLOWLIST` (default covers pypi/npm/yarn/github/nodejs/debian) — everything else gets a 403, enforced at the network boundary so a tool that ignores the `*_PROXY` env vars simply has no route either way. No TLS interception — HTTPS is tunneled opaquely once the `CONNECT` hostname passes the allowlist check. `bridge` (full outbound, opt-out) and `none` (fully air-gapped) remain available via `SANDBOX_NETWORK_MODE`. If the proxy can't start, the harness falls back to `none` rather than silently opening egress, with a printed warning. `sandbox.py` gained `_ensure_proxy*` lifecycle methods (internal network + proxy container, reused across runs); `init.sh` builds `harness-egress-proxy:latest` alongside the sandbox image. See [Sandboxed execution](#sandboxed-execution)
 
 ### v1.6.0
 - **Sandboxed execution** — `run_bash` now executes inside a locked-down Docker container by default (`SANDBOX_MODE=docker`); new `sandbox.py` module (`SandboxRunner` interface, `LocalSubprocessRunner`, `DockerSandboxRunner`) preserves `run_bash`'s exact signature/return shape so the rest of the pipeline is unaffected. Closes the long-standing write-confinement bypass — `SAFE_WRITE_DIRS` is now enforced at the OS/mount-namespace boundary (read-only project mount with rw remounts per safe dir) instead of by string-matching commands. Adds a non-root user, dropped capabilities, read-only rootfs, memory/CPU/PID limits, and a wall-clock kill switch independent of the per-command timeout. Falls back to `SANDBOX_MODE=local` (today's pre-sandbox behavior) with a one-time warning when no Docker daemon is reachable. New `Dockerfile` ships the sandbox image (Python 3.11 + Node 18 + project deps); `init.sh` detects Docker Desktop/OrbStack/Colima, builds the image, and offers a `brew install` for whichever is missing. See [Sandboxed execution](#sandboxed-execution)
