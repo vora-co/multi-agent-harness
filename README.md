@@ -569,18 +569,20 @@ Active development continues in the premium edition. See the [⭐ Premium module
 
 ## ⭐ Premium modules
 
-The following capabilities are available in the **multi-agent-harness-premium** edition, built on top of this open-source core:
+The following capabilities are available in the **multi-agent-harness-premium** edition, built on top of this open-source core. All modules are implemented as plugins or alternative entry points — they never modify the base harness, so your public fork stays clean and mergeable.
 
-| Module | Description |
-|---|---|
-| **RAG for legacy code** | Indexes an existing codebase into a local vector store (ChromaDB + sentence-transformers). Automatically injects relevant existing code snippets into each spec before implementation — reduces hallucinations and duplicate logic when extending legacy systems. |
-| **Parallel feature execution** | Dependency-aware `ThreadPoolExecutor` scheduler. Features with no inter-dependencies run concurrently; features with `depends_on` wait for their level to complete. Thread-safe file locks and cost tracking included. |
-| **Agent memory across features** | Persists conventions, architecture decisions, and learned patterns across the full feature list. Agents on feature #10 know what agents on feature #1 decided. |
-| **SDLC governance** | Automatic Git branch + PR creation on feature approval, SAST (Bandit, Semgrep), DAST (OWASP ZAP), SonarQube quality gate, and full traceability chain from feature → spec → commit → PR. |
-| **Human-in-the-loop gates** | `requires_human_gate: true` on any feature pauses the pipeline until a human approves in the Prefect dashboard — designed for hybrid human+agent teams. |
-| **Pre-analysis agent** | Reads an existing codebase before the Leader runs and auto-generates `feature_list.json` for refactoring or extension work. |
+| Module | Entry point / plugin | What it does |
+|---|---|---|
+| **Parallel feature execution** | `harness_parallel.py` | Dependency-aware `ThreadPoolExecutor` scheduler. Features with no inter-dependencies run concurrently; features with `depends_on` wait for their level to complete. Thread-safe file locks and cost tracking included. |
+| **RAG for legacy code** | `plugins/rag_legacy.py` | Indexes an existing codebase into a local vector store (ChromaDB + sentence-transformers). Injects relevant existing code snippets into each spec before implementation — reduces hallucinations and duplicate logic when extending legacy systems. |
+| **Agent memory across features** | `plugins/agent_memory.py` | Distills each approved feature into typed memory entries (conventions, decisions, patterns, ADRs) and injects the most recent ones into subsequent specs — agents on feature #10 know what agents on feature #1 decided, across restarts. |
+| **SDLC governance** | `plugins/sdlc_governance.py` | Hard SAST gate (Bandit) that vetoes approvals before they are committed, plus automatic Git branch creation, conventional commit, and GitHub PR opening on every approved feature. Draft PRs on high-severity findings. |
+| **Human-in-the-loop gates** | `plugins/hitl_gates.py` | `"requires_human_gate": true` on any feature pauses the pipeline before the Spec Writer runs, blocking until a human approves interactively or via the REST API (`HITL_HTTP_MODE=true`). Decisions persist across restarts so each feature is only ever gated once. |
+| **Pluggable storage backends** | `plugins/storage_backend.py` | Abstract `StorageBackend` interface with three drivers: `json` (default, zero overhead), `sqlite` (single-file, no server), `postgres` (PostgreSQL via psycopg2). Select via `STORAGE_BACKEND` env var. Thread-safe; survives process restarts automatically. |
+| **Service API** | `api_server.py` | FastAPI REST + SSE server. Submit runs (`POST /runs`), stream live events (`GET /runs/{id}/stream`), resolve HITL gates via HTTP (`POST /gates/{id}/approve`), and fetch generated artifacts — all without a human at the terminal. CI/CD and orchestrator friendly. |
+| **Quality evals** | `eval_runner.py` + `plugins/quality_eval.py` | Fixture-based regression suite. Define golden feature descriptions with expected outcomes; run them through the harness in isolated temp directories; compare against a baseline to detect regressions from prompt or model changes. Exits `1` on any failure or regression — ready for CI gates. |
 
-Premium is distributed as a private fork. All premium modules are implemented as plugins and never modify the open-source base — your public fork stays clean and mergeable.
+Premium is distributed as a private fork.
 
 **Contact us to learn more or request access:**
 
