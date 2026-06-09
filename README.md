@@ -525,6 +525,9 @@ Active development continues in the premium edition. See the [⭐ Premium module
 
 ## Changelog
 
+### v1.10.0
+- **Harness self-quality / CI** — unit-test coverage for core harness logic with no live API calls. New `tests/test_harness_core.py` covers: `_topological_sort` (linear chains, diamond DAG, cycle detection, partial cycles, disconnected roots), `_validate_dependencies` (self-dep, missing dep, circular dep), `_read_feature_list_raw` / `_write_feature_list_raw` (roundtrip, missing file, corrupt JSON), budget enforcement (`_track_usage` sets `_BUDGET_EXCEEDED`; `run_feature_cycle` skips when exceeded; zero-budget disables enforcement), and `tools.py` (`_is_safe_path` with path-traversal blocking, `update_feature_status` for valid/invalid/unknown, `execute_tool` dispatch). Companion files: `.github/workflows/ci.yml` (GitHub Actions — pytest + ruff + mypy on push/PR to main, Python 3.9) and `pyproject.toml` (ruff config: `py39` target, E/W/F/I rules; mypy config: `ignore_missing_imports = true`). 30 new tests; full suite passes in < 1 s.
+
 ### v1.9.0
 - **Durable state / resumability** — the harness now survives mid-feature crashes without restarting from scratch. Three new helpers (`_save_checkpoint`, `_load_checkpoint`, `_clear_checkpoint`) persist a `_checkpoint` field directly into `feature_list.json` after each major step (`spec_done`, `impl_done`, `e2e_done`). On restart, `run_feature_cycle` reads the checkpoint and skips any already-completed steps, resuming from the next one; the start attempt is also restored so retry-budget accounting is correct. `recover_stale_features` preserves the checkpoint when resetting `in_progress → pending` so a crash during, say, implementation doesn't throw away a completed spec. Checkpoints are cleared on approval, on final failure, and on FATAL implementation errors. Zero configuration required; no new dependencies. 19 tests in `tests/test_resumability.py`.
 
