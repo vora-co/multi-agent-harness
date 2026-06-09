@@ -532,12 +532,93 @@ def _validate_dependencies(features: list) -> list[str]:
     return errors
 
 
-# ─── CHECKPOINTING ───────────────────────────────────────────────────────────
+# ─── CHECKPOINTING & DURABLE RESUMABILITY ────────────────────────────────────
+#
+# Every feature cycle writes a lightweight checkpoint after each completed step
+# so a crash mid-cycle can resume where it stopped rather than starting over.
+#
+# The checkpoint is stored as a "_checkpoint" field inside the feature's entry
+# in feature_list.json — same file, no extra dependencies.
+#
+# Step progression:
+#   (none)      fresh start — run all steps
+#   spec_done   spec written; next restart skips spawn_spec_writer
+#   impl_done   impl written for attempt N; next restart skips spawn_implementer
+#   e2e_done    e2e passed for attempt N; next restart skips spawn_e2e_tester
+#
+# On approval or final failure the checkpoint is cleared so the field does not
+# persist in the completed feature entry.
+#
+# The storage_backend premium plugin (if loaded) will sync the checkpoint to
+# the configured backend automatically via the before_feature hook — no extra
+# wiring needed.
+
+def _read_feature_list_raw() -> list:
+    """Read feature_list.json. Returns [] on any error."""
+    try:
+        with open("feature_list.json", "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return []
+
+
+def _write_feature_list_raw(features: list) -> None:
+    """Overwrite feature_list.json. Silently ignores write errors."""
+    try:
+        with open("feature_list.json", "w", encoding="utf-8") as f:
+            json.dump(features, f, indent=2, ensure_ascii=False)
+    except Exception as exc:
+        _log("harness", "CHECKPOINT_WRITE_ERROR", str(exc), level="warning")
+
+
+def _save_checkpoint(feature_id: int, step: str, attempt: int = 1) -> None:
+    """
+    Write a checkpoint for feature_id after completing `step`.
+    step must be one of: "spec_done", "impl_done", "e2e_done".
+    """
+    features = _read_feature_list_raw()
+    for feat in features:
+        if feat.get("id") == feature_id:
+            feat["_checkpoint"] = {
+                "step":        step,
+                "attempt":     attempt,
+                "saved_at":    datetime.datetime.now().isoformat(timespec="seconds"),
+            }
+            break
+    _write_feature_list_raw(features)
+    _log("harness", "CHECKPOINT_SAVED", f"feature={feature_id} step={step} attempt={attempt}")
+
+
+def _load_checkpoint(feature_id: int) -> Optional[dict]:
+    """
+    Return the stored checkpoint dict for feature_id, or None if absent.
+    """
+    for feat in _read_feature_list_raw():
+        if feat.get("id") == feature_id:
+            return feat.get("_checkpoint") or None
+    return None
+
+
+def _clear_checkpoint(feature_id: int) -> None:
+    """Remove the _checkpoint field from feature_id's entry."""
+    features = _read_feature_list_raw()
+    for feat in features:
+        if feat.get("id") == feature_id:
+            feat.pop("_checkpoint", None)
+            break
+    _write_feature_list_raw(features)
+    _log("harness", "CHECKPOINT_CLEARED", f"feature={feature_id}")
+
 
 def recover_stale_features() -> list[int]:
     """
-    On startup, detects features stuck in 'in_progress' from a previous crash
-    and resets them to 'pending'. Returns list of recovered IDs.
+    On startup, detect features stuck in 'in_progress' from a previous crash.
+
+    Unlike earlier versions, this does NOT discard the checkpoint — if a feature
+    was mid-cycle when the crash happened, the checkpoint records how far it got
+    and run_feature_cycle will resume from that step automatically.
+
+    Returns list of recovered feature IDs.
     """
     try:
         with open("feature_list.json", "r") as f:
@@ -550,7 +631,17 @@ def recover_stale_features() -> list[int]:
         if feat.get("status") == "in_progress":
             feat["status"] = "pending"
             feat["updated_at"] = datetime.datetime.now().isoformat()
-            feat["recovery_note"] = "Reset to pending by harness on startup (possible previous crash)"
+            checkpoint = feat.get("_checkpoint")
+            if checkpoint:
+                feat["recovery_note"] = (
+                    f"Reset to pending by harness on startup (crashed at "
+                    f"step={checkpoint['step']}, attempt={checkpoint['attempt']}) — "
+                    f"will resume from checkpoint"
+                )
+            else:
+                feat["recovery_note"] = (
+                    "Reset to pending by harness on startup (possible previous crash)"
+                )
             recovered.append(feat["id"])
 
     if recovered:
@@ -1308,39 +1399,85 @@ def run_feature_cycle(feature_id: int, description: str, e2e: bool = True) -> di
         console.print(f"  [yellow]⚠ skipping feature #{feature_id} — budget exhausted[/]")
         return {"approved": False, "attempts": 0, "final_verdict": msg}
 
-    # ── Step 1: Spec (only on first attempt) ─────────────────────────────────
-    spec_result = spawn_spec_writer(feature_id, description)
-    spec_path = spec_result.strip() if not spec_result.startswith("[ERROR") else None
+    # ── Resumability: load checkpoint from a previous (crashed) run ──────────
+    _ckpt = _load_checkpoint(feature_id)
+    if _ckpt:
+        _ckpt_step    = _ckpt.get("step", "")
+        _ckpt_attempt = int(_ckpt.get("attempt", 1))
+        console.print(
+            f"  [cyan]↺ Resuming feature #{feature_id} from checkpoint[/] "
+            f"[dim](step={_ckpt_step}, attempt={_ckpt_attempt})[/]"
+        )
+        _log("harness", "CHECKPOINT_RESUME",
+             f"feature={feature_id} step={_ckpt_step} attempt={_ckpt_attempt}")
+    else:
+        _ckpt_step    = ""
+        _ckpt_attempt = 1
+
+    # ── Step 1: Spec ─────────────────────────────────────────────────────────
+    # Skip if spec was already written in a previous run.
+    if _ckpt_step in ("spec_done", "impl_done", "e2e_done"):
+        spec_path = f"progress/spec_{feature_id}.md"
+        console.print(f"  [dim]↺ skipping spec (already done)[/]")
+    else:
+        spec_result = spawn_spec_writer(feature_id, description)
+        spec_path = spec_result.strip() if not spec_result.startswith("[ERROR") else None
+        _save_checkpoint(feature_id, "spec_done", attempt=1)
 
     rejection_reason = ""
-    for attempt in range(1, MAX_RETRIES_REVIEW + 1):
+    # Resume from the attempt that was in progress when the crash happened.
+    start_attempt = _ckpt_attempt if _ckpt_step in ("impl_done", "e2e_done") else 1
 
-        # ── Step 2: Implement ────────────────────────────────────────────────
-        impl_result = spawn_implementer(
-            feature_id, description,
-            attempt=attempt,
-            rejection_reason=rejection_reason,
-            spec_path=spec_path
+    for attempt in range(start_attempt, MAX_RETRIES_REVIEW + 1):
+
+        # ── Step 2: Implement ─────────────────────────────────────────────────
+        # Skip if impl was already done for this attempt in a previous run.
+        _skip_impl = (
+            _ckpt_step in ("impl_done", "e2e_done")
+            and _ckpt_attempt == attempt
         )
-        if "[ERROR" in impl_result.upper():
-            err_type = _classify_error(impl_result)
-            _log("harness", "IMPL_ERROR",
-                 f"feature={feature_id} type={err_type} detail={impl_result[:200]}", level="error")
-            if err_type == "FATAL":
-                return {"approved": False, "attempts": attempt, "final_verdict": impl_result}
-            rejection_reason = impl_result
-            continue
+        if _skip_impl:
+            console.print(f"  [dim]↺ skipping impl attempt {attempt} (already done)[/]")
+            impl_result = "RESUMED"
+        else:
+            impl_result = spawn_implementer(
+                feature_id, description,
+                attempt=attempt,
+                rejection_reason=rejection_reason,
+                spec_path=spec_path
+            )
+            if "[ERROR" in impl_result.upper():
+                err_type = _classify_error(impl_result)
+                _log("harness", "IMPL_ERROR",
+                     f"feature={feature_id} type={err_type} detail={impl_result[:200]}", level="error")
+                if err_type == "FATAL":
+                    _clear_checkpoint(feature_id)
+                    return {"approved": False, "attempts": attempt, "final_verdict": impl_result}
+                rejection_reason = impl_result
+                continue
+            _save_checkpoint(feature_id, "impl_done", attempt=attempt)
 
-        # ── Step 3: E2E Testing (only if the feature requires it) ────────────
+        # ── Step 3: E2E Testing ───────────────────────────────────────────────
+        # Skip if e2e was already done for this attempt in a previous run.
+        _skip_e2e = (
+            _ckpt_step == "e2e_done"
+            and _ckpt_attempt == attempt
+        )
         if not e2e:
             e2e_result = "E2E_PASSED"  # not applicable — skip silently
+        elif _skip_e2e:
+            console.print(f"  [dim]↺ skipping e2e attempt {attempt} (already done)[/]")
+            e2e_result = "E2E_PASSED"
         else:
             e2e_result = spawn_e2e_tester(feature_id)
+            if not e2e_result.strip().startswith("E2E_FAILED"):
+                _save_checkpoint(feature_id, "e2e_done", attempt=attempt)
+
         if e2e_result.strip().startswith("E2E_FAILED"):
             e2e_reason = e2e_result.replace("E2E_FAILED:", "").strip()
             _log("harness", "E2E_FAILED",
                  f"feature={feature_id} attempt={attempt} reason={e2e_reason[:100]}", level="warning")
-            # E2E failure counts as rejection — implementer fixes it
+            # E2E failure counts as rejection — implementer fixes it on next attempt
             rejection_reason = f"E2E failed: {e2e_reason}"
             if attempt < MAX_RETRIES_REVIEW:
                 console.print(Panel(
@@ -1360,6 +1497,7 @@ def run_feature_cycle(feature_id: int, description: str, e2e: bool = True) -> di
                 attempt=attempt, review_result=review_result,
             )
             if not gate_block:
+                _clear_checkpoint(feature_id)
                 _fire("after_feature_approved",
                       feature_id=feature_id, description=description, attempts=attempt)
                 return {"approved": True, "attempts": attempt, "final_verdict": review_result}
@@ -1395,6 +1533,7 @@ def run_feature_cycle(feature_id: int, description: str, e2e: bool = True) -> di
             ))
 
     final_verdict = f"REJECTED after {MAX_RETRIES_REVIEW} attempts: {rejection_reason}"
+    _clear_checkpoint(feature_id)
     _fire("after_feature_failed",
           feature_id=feature_id, description=description,
           attempts=MAX_RETRIES_REVIEW, final_verdict=final_verdict)
