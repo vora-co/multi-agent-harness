@@ -22,5 +22,14 @@ ignore = [
 [tool.mypy]
 python_version = "3.9"
 ignore_missing_imports = true
-# Don't enforce strict typing on legacy agent files
-exclude = ["agents/", "tests/"]
+# Only type-check new code; legacy files have untyped patterns throughout
+exclude = [
+    "agents/",
+    "tests/",
+    "harness\\.py",
+    "tools\\.py",
+    "sandbox\\.py",
+    "egress_proxy\\.py",
+    "verify_sandbox\\.py",
+    "plugins/",
+]
