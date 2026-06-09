@@ -21,8 +21,22 @@ AVAILABLE EVENTS
       issues: list[str] — empty if validation found nothing.
       Use for: enriching the spec with external context, posting a spec review.
 
+  before_approval_finalized(feature_id, description, attempt, review_result)
+      Fired right after the Reviewer returns an APPROVED verdict, BEFORE the
+      harness commits to it. This is the ONE event where a callback can change
+      the outcome instead of just observing it:
+        - return None / anything falsy  -> "no opinion", approval proceeds
+        - return {"block": True, "reason": "..."} -> veto the approval
+      A veto is folded into the normal rejection/retry flow — same retry loop,
+      same eventual after_feature_failed if retries run out. No new states.
+      Dispatched with _fire_gate(), not _fire() — register normally via
+      register_hook(), the harness picks the right dispatcher for you.
+      Use for: hard pre-merge gates (SAST/secret scanning, policy checks)
+      that must block a bad approval rather than just react to it afterward.
+
   after_feature_approved(feature_id, description, attempts)
-      Fired when the Reviewer approves a feature.
+      Fired when the Reviewer approves a feature (and no plugin vetoed it
+      via before_approval_finalized).
       Use for: opening a Git PR, notifying Slack, updating a project tracker.
 
   after_feature_failed(feature_id, description, attempts, final_verdict)
@@ -100,6 +114,28 @@ def on_feature_approved_pr(feature_id: int, description: str, attempts: int, **k
     pass
 
 # register_hook("after_feature_approved", on_feature_approved_pr)
+
+
+# ── Example 3b: hard-gate an approval before it's finalized ──────────────────
+
+def on_before_approval_finalized(feature_id: int, description: str,
+                                 attempt: int, review_result: str, **kwargs):
+    """
+    Called right after the Reviewer says APPROVED, before the harness commits
+    to it. Unlike the other events, what you return matters:
+      - return None (or anything falsy) to let the approval proceed
+      - return {"block": True, "reason": "..."} to veto it — the harness will
+        treat this exactly like a Reviewer rejection (retry, then eventually
+        after_feature_failed if retries run out)
+    Keep this fast — it runs synchronously and blocks the verdict.
+    """
+    # Example: run a quick policy/secret check on the changed files and veto
+    # if something looks wrong.
+    # if _looks_dangerous(feature_id):
+    #     return {"block": True, "reason": "Hardcoded credential detected in diff"}
+    return None
+
+# register_hook("before_approval_finalized", on_before_approval_finalized)
 
 
 # ── Example 4: alert on failure ───────────────────────────────────────────────

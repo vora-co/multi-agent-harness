@@ -608,7 +608,18 @@ _HOOKS: dict[str, list] = {
     # kwargs: feature_id (int), spec_path (str), issues (list[str])
     "after_spec_generated": [],
 
-    # Fired when the Reviewer approves a feature cycle.
+    # Fired right after the Reviewer returns an APPROVED verdict, BEFORE the
+    # harness commits to it. This is the one hook where callbacks can change
+    # the outcome rather than just observe it: return {"block": True,
+    # "reason": "..."} to veto the approval, or None/falsy for "no opinion".
+    # A veto is treated exactly like a normal Reviewer rejection — it feeds
+    # the existing retry loop, and after_feature_failed fires the usual way
+    # once retries are exhausted. Dispatch with _fire_gate(), not _fire().
+    # kwargs: feature_id (int), description (str), attempt (int), review_result (str)
+    "before_approval_finalized": [],
+
+    # Fired when the Reviewer approves a feature cycle (and no plugin vetoed
+    # it via before_approval_finalized).
     # kwargs: feature_id (int), description (str), attempts (int)
     "after_feature_approved": [],
 
@@ -660,6 +671,47 @@ def _fire(event: str, **kwargs) -> None:
                  f"event={event} fn={getattr(fn, '__name__', fn)} error={exc}",
                  level="error")
             console.print(f"  [red]✗ plugin error[/] [{event}] {exc}")
+
+
+def _fire_gate(event: str, **kwargs) -> dict | None:
+    """
+    Like _fire(), but for the one kind of event where a plugin can change an
+    in-flight decision instead of merely observing it (currently just
+    "before_approval_finalized").
+
+    Each registered callback receives **kwargs and may return:
+      - None / any falsy value         → no opinion, proceed as normal
+      - {"block": True, "reason": str} → veto; the harness folds this into
+        its existing rejection/retry handling for that stage, so no new
+        states or failure paths are introduced
+
+    The FIRST callback that returns a truthy "block" wins the decision —
+    every callback still runs (so each plugin's own logging/bookkeeping
+    happens regardless), but only the first veto is honored. This keeps the
+    contract simple: "any plugin can say no", with predictable attribution
+    in the logs.
+
+    Error isolation matches _fire() exactly: an exception in a callback is
+    caught, logged, and counts as "no opinion" — a buggy plugin can change
+    nothing and crash nothing.
+    """
+    decision = None
+    for fn in _HOOKS.get(event, []):
+        try:
+            result = fn(**kwargs)
+        except Exception as exc:
+            _log("harness", "HOOK_ERROR",
+                 f"event={event} fn={getattr(fn, '__name__', fn)} error={exc}",
+                 level="error")
+            console.print(f"  [red]✗ plugin error[/] [{event}] {exc}")
+            continue
+        if decision is None and isinstance(result, dict) and result.get("block"):
+            decision = {
+                "block": True,
+                "reason": result.get("reason", ""),
+                "plugin": getattr(fn, "__module__", "?"),
+            }
+    return decision
 
 
 def _load_plugins() -> None:
@@ -1132,9 +1184,33 @@ def run_feature_cycle(feature_id: int, description: str, e2e: bool = True) -> di
         # ── Step 4: Review ───────────────────────────────────────────────────
         review_result = spawn_reviewer(feature_id, e2e=e2e)
         if review_result.strip().startswith("APPROVED"):
-            _fire("after_feature_approved",
-                  feature_id=feature_id, description=description, attempts=attempt)
-            return {"approved": True, "attempts": attempt, "final_verdict": review_result}
+            gate_block = _fire_gate(
+                "before_approval_finalized",
+                feature_id=feature_id, description=description,
+                attempt=attempt, review_result=review_result,
+            )
+            if not gate_block:
+                _fire("after_feature_approved",
+                      feature_id=feature_id, description=description, attempts=attempt)
+                return {"approved": True, "attempts": attempt, "final_verdict": review_result}
+
+            # A plugin vetoed the approval. Fold it into the existing
+            # rejection/retry handling below — same loop, same eventual
+            # after_feature_failed if retries run out — so no new states
+            # or failure paths are introduced for this to work.
+            rejection_reason = gate_block.get("reason") or "Approval blocked by a governance plugin."
+            _log("harness", "VERDICT_GATE_BLOCKED",
+                 f"feature={feature_id} attempt={attempt}/{MAX_RETRIES_REVIEW} "
+                 f"plugin={gate_block.get('plugin', '?')} reason={rejection_reason[:150]}",
+                 level="warning")
+            if attempt < MAX_RETRIES_REVIEW:
+                console.print(Panel(
+                    f"[red]Approval blocked by a governance plugin — retry {attempt+1}/{MAX_RETRIES_REVIEW}[/]\n"
+                    f"[dim]{rejection_reason[:200]}[/]",
+                    title=f"[red]🚧 gate vetoed verdict — feature #{feature_id}[/]",
+                    border_style="red", padding=(0, 1)
+                ))
+            continue
 
         rejection_reason = review_result.replace("REJECTED:", "").strip()
         _log("harness", "CYCLE_RETRY",
