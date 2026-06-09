@@ -1,4 +1,5 @@
 import os, json, time, logging, datetime, subprocess, sys
+from typing import Optional
 
 # ─── AUTO-INSTALACIÓN DE DEPENDENCIAS ────────────────────────────────────────
 def _ensure_deps():
@@ -161,10 +162,183 @@ def _log(role: str, event: str, detail: str = "", level: str = "info"):
 
 console = Console()
 
-client = OpenAI(
-    api_key=os.getenv("DEEPSEEK_API_KEY"),
-    base_url="https://api.deepseek.com"
-)
+# ─── LLM PROVIDER RESILIENCE ─────────────────────────────────────────────────
+# The harness supports an ordered fallback chain of OpenAI-compatible providers.
+# On provider-level failures (auth errors, capacity overload) it automatically
+# advances to the next configured provider and retries — transparent to all agents.
+#
+# Configuration (.env):
+#
+#   LLM_FALLBACK_CHAIN   Comma-separated provider names in priority order.
+#                        Built-in names: deepseek, openai, groq
+#                        Add a "custom" entry for any other OpenAI-compatible URL.
+#                        Default: deepseek (single provider — existing behavior)
+#
+#   OPENAI_API_KEY       Required if "openai" is in the chain.
+#   OPENAI_BASE_URL      Optional override (default: https://api.openai.com/v1)
+#   GROQ_API_KEY         Required if "groq" is in the chain.
+#   GROQ_BASE_URL        Optional override (default: https://api.groq.com/openai/v1)
+#   CUSTOM_API_KEY       Required if "custom" is in the chain.
+#   CUSTOM_BASE_URL      Required if "custom" is in the chain.
+#
+#   LLM_MODEL_MAP        JSON dict mapping canonical model names (DeepSeek names)
+#                        to per-provider equivalents.
+#                        Example:
+#                          {"deepseek-v4-pro":{"openai":"gpt-4o","groq":"llama-3.3-70b-versatile"},
+#                           "deepseek-v4-flash":{"openai":"gpt-4o-mini","groq":"llama-3.1-8b-instant"}}
+#                        Models not listed fall through unchanged (useful when a
+#                        fallback provider shares the same model name).
+
+_PROVIDER_DEFAULTS = {
+    "deepseek": {
+        "key_env":  "DEEPSEEK_API_KEY",
+        "base_url": "https://api.deepseek.com",
+    },
+    "openai": {
+        "key_env":  "OPENAI_API_KEY",
+        "base_url": "https://api.openai.com/v1",
+    },
+    "groq": {
+        "key_env":  "GROQ_API_KEY",
+        "base_url": "https://api.groq.com/openai/v1",
+    },
+    "custom": {
+        "key_env":  "CUSTOM_API_KEY",
+        "base_url": "",               # must be set via CUSTOM_BASE_URL
+    },
+}
+
+# Parse model map once at startup.
+_raw_model_map = os.getenv("LLM_MODEL_MAP", "{}")
+try:
+    _MODEL_MAP: dict = json.loads(_raw_model_map)
+except Exception:
+    _MODEL_MAP = {}
+    logging.warning("LLM_MODEL_MAP is not valid JSON — ignoring, using model names as-is")
+
+
+def _resolve_model(canonical_name: str, provider_name: str) -> str:
+    """Translate a canonical (DeepSeek-style) model name for a specific provider."""
+    return _MODEL_MAP.get(canonical_name, {}).get(provider_name, canonical_name)
+
+
+class _Provider:
+    """A single LLM provider: name, OpenAI-compatible client, model resolver."""
+    __slots__ = ("name", "client")
+
+    def __init__(self, name: str, api_key: str, base_url: str) -> None:
+        self.name   = name
+        self.client = OpenAI(api_key=api_key, base_url=base_url)
+
+    def resolve_model(self, canonical: str) -> str:
+        return _resolve_model(canonical, self.name)
+
+    def __repr__(self) -> str:
+        return f"<Provider {self.name}>"
+
+
+def _build_provider_chain() -> list:
+    """
+    Build the ordered provider list from LLM_FALLBACK_CHAIN.
+    Providers whose API key env var is unset are silently skipped.
+    Always returns at least [deepseek] so the harness can start.
+    """
+    chain_env = os.getenv("LLM_FALLBACK_CHAIN", "deepseek").strip()
+    names     = [n.strip().lower() for n in chain_env.split(",") if n.strip()]
+
+    providers = []
+    for name in names:
+        defaults = _PROVIDER_DEFAULTS.get(name, {"key_env": f"{name.upper()}_API_KEY", "base_url": ""})
+        key_env  = defaults["key_env"]
+        base_url = os.getenv(f"{name.upper()}_BASE_URL", defaults["base_url"])
+        api_key  = os.getenv(key_env, "")
+
+        if not api_key:
+            logging.warning(f"[HARNESS] Provider '{name}' skipped — {key_env} not set")
+            continue
+        if not base_url:
+            logging.warning(f"[HARNESS] Provider '{name}' skipped — base URL not configured")
+            continue
+
+        providers.append(_Provider(name, api_key, base_url))
+
+    if not providers:
+        # Absolute fallback: build DeepSeek provider even if key is empty so the
+        # harness at least starts and surfaces a useful auth error on first call.
+        defaults = _PROVIDER_DEFAULTS["deepseek"]
+        providers.append(_Provider("deepseek", os.getenv(defaults["key_env"], ""), defaults["base_url"]))
+
+    return providers
+
+
+_PROVIDERS: list = _build_provider_chain()
+
+# Keep a module-level `client` alias pointing at the primary provider so any
+# code outside run_agent / the leader loop that still uses `client` directly
+# (e.g. third-party plugins written before this change) keeps working.
+client = _PROVIDERS[0].client
+
+
+def _call_api_with_fallback(
+    model:    str,
+    messages: list,
+    tools:    list,
+    role:     str,
+) -> object:
+    """
+    Call chat.completions.create with automatic provider fallback.
+
+    Retry strategy per provider:
+      TRANSIENT       → retry up to MAX_RETRIES_API times with RETRY_BACKOFF
+      PROVIDER_FAILURE → skip remaining retries, try next provider immediately
+      other fatal     → skip remaining retries, try next provider
+
+    Returns the raw API response object on success, or None if every provider
+    is exhausted (caller is responsible for handling None).
+    """
+    for p_idx, provider in enumerate(_PROVIDERS):
+        resolved = provider.resolve_model(model)
+        if p_idx > 0:
+            _log(role, "PROVIDER_SWITCH",
+                 f"switching to provider '{provider.name}' (model={resolved})", level="warning")
+
+        for attempt in range(MAX_RETRIES_API):
+            try:
+                response = provider.client.chat.completions.create(
+                    model=resolved,
+                    messages=messages,
+                    tools=tools if tools else None,
+                    tool_choice="auto" if tools else None,
+                )
+                if p_idx > 0:
+                    _log(role, "PROVIDER_FALLBACK_OK",
+                         f"succeeded on '{provider.name}' after primary failed")
+                return response
+
+            except Exception as exc:
+                err_type = _classify_error(str(exc))
+
+                if err_type == "TRANSIENT" and attempt < MAX_RETRIES_API - 1:
+                    wait = RETRY_BACKOFF[attempt]
+                    _log(role, "API_RETRY",
+                         f"provider={provider.name} attempt {attempt+1}/{MAX_RETRIES_API} "
+                         f"— wait {wait}s — {exc}", level="warning")
+                    time.sleep(wait)
+
+                elif err_type == "PROVIDER_FAILURE":
+                    _log(role, "PROVIDER_FAILURE",
+                         f"provider='{provider.name}' — {exc}", level="warning")
+                    break   # skip to next provider immediately
+
+                else:
+                    # TRANSIENT exhausted or FATAL: try next provider
+                    _log(role, "API_FATAL",
+                         f"provider='{provider.name}' — {exc}", level="error")
+                    break
+
+    _log(role, "ALL_PROVIDERS_EXHAUSTED",
+         f"all {len(_PROVIDERS)} provider(s) failed for role={role}", level="error")
+    return None
 
 # ─── COST OBSERVABILITY ──────────────────────────────────────────────────────
 _SESSION_COSTS: dict = {
@@ -441,9 +615,9 @@ def _compact_messages(messages: list, role: str) -> list:
          f"Compacting {len(middle)} intermediate messages (total={len(messages)})")
 
     try:
-        summary_response = client.chat.completions.create(
-            model=MODEL_BY_ROLE.get("compaction", MODEL),
-            messages=[
+        summary_response = _call_api_with_fallback(
+            model    = MODEL_BY_ROLE.get("compaction", MODEL),
+            messages = [
                 {"role": "system",
                  "content": "You are a technical assistant. Concisely summarize the work history of a software agent."},
                 {"role": "user",
@@ -454,10 +628,14 @@ def _compact_messages(messages: list, role: str) -> list:
                      f"{middle_text}"
                  )}
             ],
-            max_tokens=500,
+            tools    = [],
+            role     = "compaction",
         )
-        _track_usage("compaction", summary_response.usage)
-        summary_text = summary_response.choices[0].message.content or "(no summary)"
+        if summary_response is not None:
+            _track_usage("compaction", summary_response.usage)
+            summary_text = summary_response.choices[0].message.content or "(no summary)"
+        else:
+            summary_text = "(summary unavailable: all providers exhausted)"
     except Exception as e:
         summary_text = f"(summary unavailable: {e})"
 
@@ -485,13 +663,17 @@ def _safe_parse_args(raw: str, tool_name: str):
 def _classify_error(error_msg: str) -> str:
     """
     Classify an error to decide the retry strategy.
-    TRANSIENT → retryable with backoff (rate limit, network timeout)
-    LOGICAL   → requires a different approach (logic error, test failure)
-    FATAL     → stop (credentials, critical file not found)
+    TRANSIENT        → retryable with backoff on the same provider (rate limit, timeout)
+    PROVIDER_FAILURE → provider-level failure; skip to next provider (auth, overloaded)
+    LOGICAL          → requires a different approach (logic error, test failure)
+    FATAL            → stop (critical file not found, unrecoverable)
     """
     msg = error_msg.lower()
     if any(k in msg for k in ("rate limit", "timeout", "connection", "503", "502", "429")):
         return "TRANSIENT"
+    if any(k in msg for k in ("401", "403", "529", "authentication", "unauthorized",
+                               "invalid api key", "overloaded", "capacity")):
+        return "PROVIDER_FAILURE"
     if any(k in msg for k in ("max_iter", "blocked", "assertion", "error:")):
         return "LOGICAL"
     return "FATAL"
@@ -508,29 +690,14 @@ def run_agent(system_prompt: str, tools: list, task: str,
     _log(role, "START", task[:120])
 
     for i in range(max_iter):
-        # Retry on transient API errors
-        api_response = None
-        for attempt in range(MAX_RETRIES_API):
-            try:
-                api_response = client.chat.completions.create(
-                    model=MODEL_BY_ROLE.get(role, MODEL),
-                    messages=messages,
-                    tools=tools if tools else None,
-                    tool_choice="auto" if tools else None,
-                )
-                break
-            except Exception as e:
-                err_type = _classify_error(str(e))
-                if err_type == "TRANSIENT" and attempt < MAX_RETRIES_API - 1:
-                    wait = RETRY_BACKOFF[attempt]
-                    _log(role, "API_RETRY", f"attempt {attempt+1}/{MAX_RETRIES_API} — wait {wait}s — {e}", level="warning")
-                    time.sleep(wait)
-                else:
-                    _log(role, "API_FATAL", str(e), level="error")
-                    return f"[ERROR API: {e}]"
-
+        api_response = _call_api_with_fallback(
+            model    = MODEL_BY_ROLE.get(role, MODEL),
+            messages = messages,
+            tools    = tools,
+            role     = role,
+        )
         if api_response is None:
-            return "[ERROR: no response received from API]"
+            return f"[ERROR: all LLM providers exhausted for role={role}]"
 
         _track_usage(role, api_response.usage)
         msg = api_response.choices[0].message
@@ -673,7 +840,7 @@ def _fire(event: str, **kwargs) -> None:
             console.print(f"  [red]✗ plugin error[/] [{event}] {exc}")
 
 
-def _fire_gate(event: str, **kwargs) -> dict | None:
+def _fire_gate(event: str, **kwargs) -> Optional[dict]:
     """
     Like _fire(), but for the one kind of event where a plugin can change an
     in-flight decision instead of merely observing it (currently just
@@ -796,9 +963,9 @@ def _validate_spec(spec_path: str) -> str:
     tree_tests = _file_tree("tests")
 
     try:
-        response = client.chat.completions.create(
-            model=MODEL_BY_ROLE.get("spec_writer", MODEL),
-            messages=[
+        response = _call_api_with_fallback(
+            model    = MODEL_BY_ROLE.get("spec_writer", MODEL),
+            messages = [
                 {
                     "role": "system",
                     "content": (
@@ -821,8 +988,11 @@ def _validate_spec(spec_path: str) -> str:
                     )
                 }
             ],
-            max_tokens=300,
+            tools = [],
+            role  = "spec_writer",
         )
+        if response is None:
+            return ""
         _track_usage("spec_writer", response.usage)
         result = (response.choices[0].message.content or "").strip()
         return "" if result.upper() == "OK" else result
@@ -1332,29 +1502,14 @@ def run_leader(user_task: str) -> str:
     _log("leader", "START", user_task[:120])
 
     for iteration in range(MAX_ITER_LEADER):
-        # Retry on transient API errors
-        api_response = None
-        for attempt in range(MAX_RETRIES_API):
-            try:
-                api_response = client.chat.completions.create(
-                    model=MODEL_BY_ROLE.get("leader", MODEL),
-                    messages=messages,
-                    tools=LEADER_TOOLS,
-                    tool_choice="auto",
-                )
-                break
-            except Exception as e:
-                err_type = _classify_error(str(e))
-                if err_type == "TRANSIENT" and attempt < MAX_RETRIES_API - 1:
-                    wait = RETRY_BACKOFF[attempt]
-                    _log("leader", "API_RETRY", f"attempt {attempt+1} — wait {wait}s — {e}", level="warning")
-                    time.sleep(wait)
-                else:
-                    _log("leader", "API_FATAL", str(e), level="error")
-                    return f"[ERROR API leader: {e}]"
-
+        api_response = _call_api_with_fallback(
+            model    = MODEL_BY_ROLE.get("leader", MODEL),
+            messages = messages,
+            tools    = LEADER_TOOLS,
+            role     = "leader",
+        )
         if api_response is None:
-            return "[ERROR: leader received no response from API]"
+            return "[ERROR: all LLM providers exhausted for leader]"
 
         _track_usage("leader", api_response.usage)
         msg = api_response.choices[0].message
