@@ -862,6 +862,20 @@ _HOOKS: dict[str, list] = {
     # kwargs: feature_id (int), description (str), e2e (bool)
     "before_feature": [],
 
+    # Fired immediately before each agent is invoked, allowing plugins to
+    # override or augment the system_prompt and/or task string for that role.
+    # Unlike _fire(), this uses _fire_transform() which threads return values
+    # back to the caller. Each callback receives:
+    #   role (str)          — "spec_writer" | "implementer" | "reviewer" | "e2e_tester"
+    #   system_prompt (str) — the prompt that would be sent as-is
+    #   task (str)          — the user-turn task string
+    #   feature_id (int)    — current feature being processed
+    # Return a dict with any subset of keys to override:
+    #   {"system_prompt": "...", "task": "..."}
+    # Return None / {} / any falsy value to keep the originals unchanged.
+    # Callbacks run in registration order; each sees the output of the previous.
+    "before_spawn_agent": [],
+
     # Fired after spawn_spec_writer finishes and validation runs.
     # kwargs: feature_id (int), spec_path (str), issues (list[str])
     "after_spec_generated": [],
@@ -970,6 +984,40 @@ def _fire_gate(event: str, **kwargs) -> Optional[dict]:
                 "plugin": getattr(fn, "__module__", "?"),
             }
     return decision
+
+
+def _fire_transform(event: str, **kwargs) -> dict:
+    """
+    Like _fire(), but for hooks that can transform their inputs rather than
+    just observe them (currently only "before_spawn_agent").
+
+    Each registered callback receives **kwargs and may return:
+      - None / {} / any falsy value  → no change, pass inputs through unchanged
+      - {"system_prompt": "...", "task": "..."}  → override one or both fields
+
+    Callbacks run in registration order and chain: each callback receives the
+    output of the previous one, so multiple plugins can each contribute a
+    transformation without stomping on each other.
+
+    The final (possibly modified) values are returned as a dict with the same
+    keys as the input kwargs. If no callback modifies a key, its original
+    value is preserved unchanged.
+
+    Error isolation matches _fire() exactly.
+    """
+    current = dict(kwargs)
+    for fn in _HOOKS.get(event, []):
+        try:
+            result = fn(**current)
+        except Exception as exc:
+            _log("harness", "HOOK_ERROR",
+                 f"event={event} fn={getattr(fn, '__name__', fn)} error={exc}",
+                 level="error")
+            console.print(f"  [red]✗ plugin error[/] [{event}] {exc}")
+            continue
+        if result and isinstance(result, dict):
+            current.update(result)
+    return current
 
 
 def _load_plugins() -> None:
@@ -1236,7 +1284,10 @@ def spawn_implementer(feature_id: int, description: str, attempt: int = 1,
         f"Write your report to {impl_path}\n"
         f"Return only the file path when done."
     )
-    result = run_agent(impl_cfg.SYSTEM_PROMPT, impl_cfg.TOOLS, task,
+    _agent_ctx = _fire_transform("before_spawn_agent", role="implementer",
+                                 system_prompt=impl_cfg.SYSTEM_PROMPT,
+                                 task=task, feature_id=feature_id)
+    result = run_agent(_agent_ctx["system_prompt"], impl_cfg.TOOLS, _agent_ctx["task"],
                        role="implementer", color="blue", max_iter=MAX_ITER_IMPL)
     done = not result.startswith("[ERROR")
     console.print(f"  [blue]🔨 IMPLEMENTER[/] {'[green]✓ done[/]' if done else '[red]✗ error[/]'} → {result[:80]}")
@@ -1263,7 +1314,10 @@ def spawn_spec_writer(feature_id: int, description: str) -> str:
         f"Save the spec to {spec_path}\n"
         f"Return ONLY the path: {spec_path}"
     )
-    result = run_agent(spec_cfg.SYSTEM_PROMPT, spec_cfg.TOOLS, task,
+    _agent_ctx = _fire_transform("before_spawn_agent", role="spec_writer",
+                                 system_prompt=spec_cfg.SYSTEM_PROMPT,
+                                 task=task, feature_id=feature_id)
+    result = run_agent(_agent_ctx["system_prompt"], spec_cfg.TOOLS, _agent_ctx["task"],
                        role="spec_writer", color="cyan", max_iter=35)
     done = not result.startswith("[ERROR")
     console.print(f"  [cyan]📋 SPEC_WRITER[/] {'[green]✓ spec ready[/]' if done else '[red]✗ error[/]'} → {result[:80]}")
@@ -1338,7 +1392,10 @@ def spawn_reviewer(feature_id: int, e2e: bool = True) -> str:
         f"Write your verdict to progress/review_{feature_id}.md\n"
         f"Return ONLY: 'APPROVED' or 'REJECTED: <reason>'"
     )
-    result = run_agent(reviewer_cfg.SYSTEM_PROMPT, reviewer_cfg.TOOLS, task,
+    _agent_ctx = _fire_transform("before_spawn_agent", role="reviewer",
+                                 system_prompt=reviewer_cfg.SYSTEM_PROMPT,
+                                 task=task, feature_id=feature_id)
+    result = run_agent(_agent_ctx["system_prompt"], reviewer_cfg.TOOLS, _agent_ctx["task"],
                        role="reviewer", color="magenta", max_iter=max_iter)
 
     approved = result.strip().startswith("APPROVED")
@@ -1362,7 +1419,10 @@ def spawn_e2e_tester(feature_id: int) -> str:
         f"Write your report to progress/e2e_{feature_id}.md\n"
         f"Return ONLY: 'E2E_PASSED' or 'E2E_FAILED: <reason>'"
     )
-    result = run_agent(e2e_cfg.SYSTEM_PROMPT, e2e_cfg.TOOLS, task,
+    _agent_ctx = _fire_transform("before_spawn_agent", role="e2e_tester",
+                                 system_prompt=e2e_cfg.SYSTEM_PROMPT,
+                                 task=task, feature_id=feature_id)
+    result = run_agent(_agent_ctx["system_prompt"], e2e_cfg.TOOLS, _agent_ctx["task"],
                        role="e2e_tester", color="yellow")
 
     passed = result.strip().startswith("E2E_PASSED")

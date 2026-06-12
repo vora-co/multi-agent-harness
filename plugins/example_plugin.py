@@ -43,6 +43,20 @@ AVAILABLE EVENTS
       Fired when a feature exhausts all retries and is marked failed.
       Use for: alerting, escalation, writing a failure report.
 
+  before_spawn_agent(role, system_prompt, task, feature_id)
+      Fired immediately before each agent is invoked — once per agent call.
+      role: "spec_writer" | "implementer" | "reviewer" | "e2e_tester"
+      system_prompt: the prompt that would be sent as-is
+      task: the user-turn task string (may include stack-specific commands
+            like "run pytest" or "run the dev server with uvicorn")
+      feature_id: current feature being processed
+      This is a TRANSFORM hook — what you return matters:
+        - return None / {} / falsy  → no change, originals pass through
+        - return {"system_prompt": "...", "task": "..."} → override one or both
+      Callbacks chain: each sees the output of the previous.
+      Use for: injecting stack-specific context, replacing test runner commands,
+               adapting prompts for non-default technology stacks.
+
   after_session(session_costs)
       Fired once when the harness exits (including on crash).
       session_costs: dict — same structure as progress/session_costs.json.
@@ -152,7 +166,31 @@ def on_feature_failed(feature_id: int, description: str,
 # register_hook("after_feature_failed", on_feature_failed)
 
 
-# ── Example 5: send a session cost report ────────────────────────────────────
+# ── Example 5: override stack context before each agent ──────────────────────
+
+def on_before_spawn_agent(role: str, system_prompt: str, task: str,
+                          feature_id: int, **kwargs):
+    """
+    Called before every agent invocation. Return a dict to override
+    system_prompt and/or task, or return None to leave them unchanged.
+
+    Example: replace the default FastAPI+React context with a custom stack.
+    """
+    # Example: inject a custom architecture block for a .NET Core + Angular stack
+    # new_prompt = system_prompt.replace(
+    #     "Stack: FastAPI + React + Tailwind + JSON",
+    #     "Stack: .NET Core 8 (C#) + Angular 17 + PostgreSQL",
+    # )
+    # if role == "reviewer":
+    #     new_task = task.replace("python3 -m pytest", "dotnet test")
+    #     return {"system_prompt": new_prompt, "task": new_task}
+    # return {"system_prompt": new_prompt}
+    return None
+
+# register_hook("before_spawn_agent", on_before_spawn_agent)
+
+
+# ── Example 6: send a session cost report ────────────────────────────────────
 
 def on_after_session(session_costs: dict, **kwargs):
     """Called once when the harness exits. session_costs mirrors session_costs.json."""
