@@ -1,6 +1,13 @@
 import os, json, time, logging, datetime, subprocess, sys
 from typing import Optional
 
+# Load .env as early as possible — before any module (e.g. tools.py) reads
+# os.environ at import time. If this ran after `from tools import ...`,
+# per-project overrides like SAFE_WRITE_DIRS would silently fall back to
+# their defaults unless the shell had already exported the .env vars itself.
+from dotenv import load_dotenv
+load_dotenv()
+
 # ─── AUTO-INSTALACIÓN DE DEPENDENCIAS ────────────────────────────────────────
 def _ensure_deps():
     """
@@ -44,7 +51,6 @@ def _ensure_deps():
         print("✓ Playwright listo.\n")
 
 from openai import OpenAI
-from dotenv import load_dotenv
 from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
@@ -55,9 +61,20 @@ import agents.implementer as impl_cfg
 import agents.reviewer as reviewer_cfg
 import agents.e2e_tester as e2e_cfg
 import agents.spec_writer as spec_cfg
-from tools import execute_tool
+from tools import execute_tool, SAFE_WRITE_DIRS
+from stack_layout import resolve_layout
 
-load_dotenv()
+print(f"[CONFIG] SAFE_WRITE_DIRS = {SAFE_WRITE_DIRS}")
+
+# Single source of truth for stack-dependent layout — same resolver tools.py
+# uses for SAFE_WRITE_DIRS, so the two can never drift apart. Derived from
+# stack_config.json + stack_profiles.json (falls back to a hardcoded default;
+# never raises). The CODE_TREE_DIRS / SAFE_WRITE_DIRS env vars still work as a
+# highest-precedence emergency override — that logic lives inside
+# resolve_layout() itself, not here.
+_LAYOUT = resolve_layout()
+CODE_TREE_DIRS = _LAYOUT["code_tree_dirs"]
+print(f"[CONFIG] CODE_TREE_DIRS = {CODE_TREE_DIRS}")
 
 # ─── MODEL SELECTION ─────────────────────────────────────────────────────────
 # Default model used as a fallback for any role not listed in MODEL_BY_ROLE,
@@ -779,6 +796,7 @@ def run_agent(system_prompt: str, tools: list, task: str,
         {"role": "user",   "content": task}
     ]
     _log(role, "START", task[:120])
+    tool_call_errors: list = []
 
     for i in range(max_iter):
         api_response = _call_api_with_fallback(
@@ -821,6 +839,17 @@ def run_agent(system_prompt: str, tools: list, task: str,
             result = execute_tool(fn_name, fn_args)
             _log(role, "TOOL_RESULT", result[:200])
 
+            # Best-effort: track tool-call errors so that if this attempt hits
+            # max_iter without a verdict, the next retry gets concrete context
+            # instead of restarting from scratch with the same generic task.
+            try:
+                parsed_err = json.loads(result)
+                if isinstance(parsed_err, dict) and "error" in parsed_err:
+                    tool_call_errors.append(f"{fn_name}({args_preview}) -> Error: {str(parsed_err['error'])[:150]}")
+                    tool_call_errors[:] = tool_call_errors[-5:]
+            except Exception:
+                pass
+
             if VERBOSE:
                 try:
                     parsed = json.loads(result)
@@ -840,6 +869,9 @@ def run_agent(system_prompt: str, tools: list, task: str,
             })
 
     _log(role, "MAX_ITER", f"Reached iteration limit of {max_iter}", level="warning")
+    if tool_call_errors:
+        recent_errors = "\n".join(f"  - {e}" for e in tool_call_errors[-5:])
+        return f"[ERROR: max_iter {max_iter} reached]\nRecent tool-call errors:\n{recent_errors}"
     return f"[ERROR: max_iter {max_iter} reached]"
 
 
@@ -1226,6 +1258,54 @@ def _file_tree(path: str, max_files: int = 60) -> str:
         return "(not available)"
 
 
+def _load_project_architecture(cwd: str) -> str:
+    """
+    Best-effort load of a project-supplied architecture override.
+
+    If docs/architecture.md exists in the project root, its content describes
+    the REAL stack/layout of this specific project and is injected into every
+    agent's task as an authoritative section that overrides the generic
+    example architecture baked into each agent's system prompt (which is a
+    fallback for projects that haven't supplied their own docs/architecture.md,
+    and will not match every stack — e.g. SQL+ORM projects vs JSON-storage ones).
+
+    Returns "" if the file is absent, empty, or unreadable — never blocks the
+    pipeline on a missing/malformed docs file.
+    """
+    path = os.path.join(cwd, "docs", "architecture.md")
+    if not os.path.exists(path):
+        return ""
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            content = f.read().strip()
+        if not content:
+            return ""
+        return (
+            "\n## PROJECT ARCHITECTURE (authoritative — from docs/architecture.md)\n"
+            "This describes the REAL architecture of this project. It overrides any\n"
+            "generic example architecture mentioned in your system prompt.\n\n"
+            f"{content}\n"
+        )
+    except Exception:
+        return ""
+
+
+def _layout_context() -> str:
+    """
+    Authoritative test/server commands for the active stack, from the single
+    source of truth (_LAYOUT, via stack_layout.resolve_layout()). Injected into
+    every agent's task so agents/*.py prompts can stay stack-neutral instead of
+    hardcoding 'python3 -m pytest backend/tests/' or similar literal commands
+    that only match the python-fastapi+backend/app/ example shape.
+    """
+    return (
+        "\n## STACK COMMANDS (authoritative — from stack_profiles.json)\n"
+        f"Run tests with: {_LAYOUT['test_runner']}\n"
+        f"Start the server with: {_LAYOUT['server_cmd']}\n"
+        f"Project layout: {_LAYOUT['dirs']}\n"
+    )
+
+
 def spawn_implementer(feature_id: int, description: str, attempt: int = 1,
                       rejection_reason: str = "", spec_path: str = None) -> str:
     """
@@ -1260,10 +1340,13 @@ def spawn_implementer(feature_id: int, description: str, attempt: int = 1,
 
     cwd = os.getcwd()
 
-    # Pre-inject file tree to avoid exploratory reads
-    tree_src      = _file_tree("src")
-    tree_frontend = _file_tree("frontend/src") if os.path.exists("frontend/src") else "(not created yet)"
-    tree_tests    = _file_tree("tests")
+    # Pre-inject file tree to avoid exploratory reads (dirs configurable via CODE_TREE_DIRS)
+    tree_sections = "\n\n".join(
+        f"## Current file tree ({d}/):\n{_file_tree(d) if os.path.exists(d) else '(not created yet)'}"
+        for d in CODE_TREE_DIRS
+    )
+    arch_context = _load_project_architecture(cwd)
+    layout_context = _layout_context()
 
     spec_content = ""
     if spec_path and os.path.exists(spec_path):
@@ -1276,9 +1359,9 @@ def spawn_implementer(feature_id: int, description: str, attempt: int = 1,
     task = (
         f"WORKING DIRECTORY: {cwd}\n"
         f"All bash commands must be run from this directory.\n\n"
-        f"## Current file tree (src/):\n{tree_src}\n\n"
-        f"## Current file tree (frontend/src/):\n{tree_frontend}\n\n"
-        f"## Current file tree (tests/):\n{tree_tests}\n"
+        f"{tree_sections}\n"
+        f"{arch_context}"
+        f"{layout_context}"
         f"{spec_content}\n"
         f"Implement feature #{feature_id}: {description}{context}\n"
         f"Write your report to {impl_path}\n"
@@ -1308,8 +1391,12 @@ def spawn_spec_writer(feature_id: int, description: str) -> str:
 
     _phase_header("spec_writer", "Writing spec", feature_id)
     cwd = os.getcwd()
+    arch_context = _load_project_architecture(cwd)
+    layout_context = _layout_context()
     task = (
         f"WORKING DIRECTORY: {cwd}\n\n"
+        f"{arch_context}"
+        f"{layout_context}"
         f"Write the technical specification for feature #{feature_id}: {description}\n"
         f"Save the spec to {spec_path}\n"
         f"Return ONLY the path: {spec_path}"
@@ -1357,36 +1444,50 @@ def spawn_reviewer(feature_id: int, e2e: bool = True) -> str:
 
     cwd = os.getcwd()
 
-    # Pre-inject relevant file tree
-    tree_src      = _file_tree("src")
-    tree_frontend = _file_tree("frontend/src") if os.path.exists("frontend/src") else "(not present)"
-    tree_tests    = _file_tree("tests")
+    # Pre-inject relevant file tree (dirs configurable via CODE_TREE_DIRS)
+    tree_sections = "\n\n".join(
+        f"## Current file tree ({d}/):\n{_file_tree(d) if os.path.exists(d) else '(not present)'}"
+        for d in CODE_TREE_DIRS
+    )
+    arch_context = _load_project_architecture(cwd)
+    layout_context = _layout_context()
 
-    # Validation mode depends on feature type
+    # Validation mode depends on feature type. NOTE: e2e=false ("no browser/
+    # Playwright needed") is NOT the same thing as "no automated tests to run" —
+    # it previously was treated as such (a pure file-existence + syntax check),
+    # which let backend-only features (the documented use of e2e=false) get
+    # approved without ever running their test suite. LIGHTWEIGHT REVIEW MODE
+    # below always still runs the real test command; it only skips the
+    # browser/server/E2E parts that e2e=false is meant to skip.
     if not e2e:
         validation_mode = (
-            "FRONTEND REVIEW MODE (e2e=false):\n"
+            "LIGHTWEIGHT REVIEW MODE (e2e=false — skip browser/E2E, NOT skip tests):\n"
             "- Read the implementer report at progress/impl_{fid}.md\n"
             "- Verify that the files listed in the report exist on disk (use run_bash with 'ls')\n"
-            "- Check that JSX/JS code has no obvious syntax errors (use run_bash with 'node --check' if applicable)\n"
+            "- Run tests with: run_bash(\"cd <WORKING_DIR> && {test_runner}\")\n"
+            "  - If a test suite exists for this feature, it MUST pass — do not approve on syntax checks alone.\n"
+            "  - If there is genuinely no test suite to run (e.g. a pure frontend-only change with no\n"
+            "    backend tests touched), fall back to a syntax check (run_bash with 'node --check' for\n"
+            "    JS/JSX) and note in your verdict why no test run applies.\n"
             "- DO NOT attempt to start the dev server\n"
             "- DO NOT attempt to run Playwright or E2E tests\n"
             "- DO NOT run 'npm run dev' or 'npm run build'\n"
-            "- If files exist and the report indicates success, approve.\n"
-        ).format(fid=feature_id)
+            "- Approve only if the report indicates success AND the test run (or, where genuinely\n"
+            "  inapplicable, the syntax check) confirms it.\n"
+        ).format(fid=feature_id, test_runner=_LAYOUT["test_runner"])
         max_iter = 15  # lightweight review — doesn't need more
     else:
         validation_mode = (
             "Review the implementer's work for feature #{fid}.\n"
-            "Run tests with pytest and validate that they pass.\n"
-        ).format(fid=feature_id)
+            "Run tests with: run_bash(\"cd <WORKING_DIR> && {test_runner}\") and validate that they pass.\n"
+        ).format(fid=feature_id, test_runner=_LAYOUT["test_runner"])
         max_iter = MAX_ITER_REVIEWER
 
     task = (
         f"WORKING DIRECTORY: {cwd}\n\n"
-        f"## Current file tree (src/):\n{tree_src}\n\n"
-        f"## Current file tree (frontend/src/):\n{tree_frontend}\n\n"
-        f"## Current file tree (tests/):\n{tree_tests}\n\n"
+        f"{tree_sections}\n\n"
+        f"{arch_context}"
+        f"{layout_context}"
         f"{validation_mode}\n"
         f"The implementer report is at progress/impl_{feature_id}.md\n"
         f"Write your verdict to progress/review_{feature_id}.md\n"
@@ -1411,9 +1512,13 @@ def spawn_e2e_tester(feature_id: int) -> str:
     _log("e2e_tester", "SPAWN", f"feature={feature_id}")
 
     cwd = os.getcwd()
+    arch_context = _load_project_architecture(cwd)
+    layout_context = _layout_context()
     task = (
         f"WORKING DIRECTORY: {cwd}\n"
         f"All bash commands must be run from this directory.\n\n"
+        f"{arch_context}"
+        f"{layout_context}"
         f"Run E2E tests for feature #{feature_id}.\n"
         f"The implementer report is at progress/impl_{feature_id}.md\n"
         f"Write your report to progress/e2e_{feature_id}.md\n"

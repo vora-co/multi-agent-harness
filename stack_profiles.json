@@ -1,0 +1,70 @@
+{
+  "backend": {
+    "python-fastapi": {
+      "name": "Python + FastAPI",
+      "language": "Python 3.9+",
+      "dirs": "src/models/       → pure domain classes (no I/O)\nsrc/repositories/ → data access via storage.py\nsrc/storage.py    → load(entity)/save(entity, records) with atomic writes\nsrc/auth.py       → JWT + bcrypt\nsrc/api.py        → FastAPI routes with /api/v1/ prefix\nsrc/main.py       → uvicorn entrypoint\ndata/             → JSON persistence files (gitignored)",
+      "conventions": "- Python 3.9+. Always use python3, never python.\n- Type hints on public functions. Docstrings on classes.\n- Models: constructor validates invariants, raises ValueError. to_dict()/from_dict().\n- Repositories: find_all(), find_by_id(id) → None if not found, save_one(obj), delete(id) → bool.\n- API: /api/v1/ prefix, errors as {\"detail\": \"msg\"}, status codes 200/201/400/401/403/404/409.\n- Tests: tests/test_<module>.py, pytest + FastAPI TestClient, do not mock storage (use tmp_path).",
+      "test_runner": "python3 -m pytest tests/ -v --tb=short",
+      "server_cmd": "python3 -m uvicorn src.main:app --port 8000",
+      "test_framework": "pytest + FastAPI TestClient",
+      "file_ext": ".py",
+      "db_family": "asyncpg",
+      "safe_write_dirs": [
+        "src/",
+        "tests/",
+        "data/",
+        "progress/",
+        "docs/",
+        "tests/e2e/",
+        "tests/screenshots/",
+        "frontend/"
+      ],
+      "code_tree_dirs": [
+        "src",
+        "frontend/src",
+        "tests"
+      ]
+    }
+  },
+  "frontend": {
+    "react-tailwind": {
+      "name": "React 18 + Tailwind CSS",
+      "dirs": "frontend/src/components/ → reusable UI components (.jsx/.tsx)\nfrontend/src/pages/      → route-level components\nfrontend/src/hooks/      → custom React hooks\nfrontend/src/api/        → fetch/axios service modules\nfrontend/src/context/    → React Context providers",
+      "conventions": "- React 18 functional components + hooks.\n- State: useState/useReducer + Context for global state.\n- Styling: Tailwind utility classes only (no inline styles).\n- Bundler: Vite. Run with: npm run dev.",
+      "dev_cmd": "npm run dev"
+    },
+    "none": {
+      "name": "No frontend (API only)",
+      "dirs": "N/A — pure backend API project, no frontend code.",
+      "conventions": "No frontend. Focus entirely on the backend API and its tests.",
+      "dev_cmd": null
+    }
+  },
+  "database": {
+    "json": {
+      "name": "JSON files",
+      "notes": "Flat JSON files in data/ with atomic writes.\nUse storage.load(entity) / storage.save(entity, records).\nNo migrations needed."
+    }
+  },
+  "e2e_runner": {
+    "playwright": {
+      "name": "Playwright",
+      "test_dir": "tests/e2e/",
+      "run_cmd": "npx playwright test",
+      "notes": "Use page.wait_for_selector() not time.sleep().\nScreenshots via page.screenshot(path='tests/screenshots/...').\nPython bindings: pip install playwright && playwright install chromium."
+    },
+    "none": {
+      "name": "No E2E tests",
+      "test_dir": null,
+      "run_cmd": null,
+      "notes": "E2E testing disabled for this project."
+    }
+  },
+  "defaults": {
+    "backend": "python-fastapi",
+    "frontend": "react-tailwind",
+    "database": "json",
+    "e2e_runner": "playwright"
+  }
+}

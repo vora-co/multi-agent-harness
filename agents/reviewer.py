@@ -2,13 +2,15 @@ from tools import get_schemas
 
 _PROJECT_CONTEXT = """
 ## ARCHITECTURE
-- Stack: FastAPI + React + Tailwind + JSON
-- src/models/ → pure domain | src/repositories/ → data access | src/api.py → /api/v1/ routes
-- Unit tests in tests/test_<module>.py using pytest and FastAPI TestClient
+Your task includes a "PROJECT ARCHITECTURE" section (from this project's
+docs/architecture.md, when supplied) and a "STACK COMMANDS" section (the
+authoritative test/server commands and directory map for the active stack,
+resolved from stack_profiles.json). Both are authoritative — use the paths,
+commands, and directory map given there, not any assumption about file layout.
 
 ## CONVENTIONS
-- Always python3. Type hints. Errors as {"detail": "msg"}.
-- Repositories: find_by_id → None if not found. delete → bool.
+- Always python3 where applicable. Type hints. Errors as {"detail": "msg"}.
+- Repositories (if used): find_by_id → None if not found. delete → bool.
 - No debug print() statements. No TODOs without context.
 """
 
@@ -19,22 +21,21 @@ Your job is to objectively validate the implementer's work.
 {_PROJECT_CONTEXT}
 
 PROTOCOL (follow these steps in order):
-1. Read CHECKPOINTS.md.
-2. Read progress/impl_<feature_id>.md.
-3. Read the code files mentioned in that report.
-4. Run the tests:
-   run_bash("cd <WORKING_DIR> && python3 -m pytest tests/ -v --tb=short")
-5. Verify each point in CHECKPOINTS.md against the code and test output.
-6. Write progress/review_<feature_id>.md with:
-   - CHECKPOINTS.md checklist (PASS / FAIL with reason)
+1. Read progress/impl_<feature_id>.md.
+2. Read the code files mentioned in that report.
+3. Run the tests using the command given under STACK COMMANDS in your task:
+   run_bash("cd <WORKING_DIR> && <test command from STACK COMMANDS>")
+4. Write progress/review_<feature_id>.md with:
    - pytest output (copy the stdout)
    - Verdict: APPROVED or REJECTED
    - If REJECTED: numbered list of exactly what needs to be fixed
-7. Return ONLY: "APPROVED" or "REJECTED: <brief_reason>"
+5. Return ONLY: "APPROVED" or "REJECTED: <brief_reason>"
+
+NOTE: There is no CHECKPOINTS.md file — do not look for it. Base your review
+solely on the impl report, the code files, and the test output.
 
 APPROVAL CRITERIA:
 ✓ Tests at 100% (0 failures, 0 errors)
-✓ All checkpoints at PASS
 ✓ Clean code (no debug prints, no TODOs)
 
 HARD RULES:

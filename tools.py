@@ -2,8 +2,14 @@ import os, json, subprocess, datetime, re
 
 # ─── SECURITY ────────────────────────────────────────────────────────────────
 
-# Directories where agents are allowed to write (relative to project CWD)
-SAFE_WRITE_DIRS = ("src/", "tests/", "progress/", "docs/", "tests/e2e/", "tests/screenshots/", "frontend/")
+# Directories where agents are allowed to write (relative to project CWD).
+# Single source of truth: stack_layout.resolve_layout(), which derives this
+# from stack_config.json + stack_profiles.json for the active stack (falling
+# back to a hardcoded default if those files are missing). The SAFE_WRITE_DIRS
+# env var still works as a highest-precedence emergency override — that logic
+# lives inside resolve_layout() itself, not here.
+from stack_layout import resolve_layout
+SAFE_WRITE_DIRS = resolve_layout()["safe_write_dirs"]
 
 # Blocked bash command patterns — prevents accidental destruction
 BLOCKED_BASH_PATTERNS = [
@@ -64,7 +70,7 @@ def write_file(path: str = None, content: str = "", file_path: str = None,
     if not _is_safe_path(path):
         return json.dumps({
             "error": f"Path '{path}' is outside the allowed directories: {SAFE_WRITE_DIRS}. "
-                     "Make sure the file is in src/, tests/, progress/ or docs/."
+                     f"Make sure the file is inside one of: {', '.join(SAFE_WRITE_DIRS)}."
         })
     try:
         os.makedirs(os.path.dirname(path), exist_ok=True) if os.path.dirname(path) else None
