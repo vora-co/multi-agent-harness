@@ -79,8 +79,7 @@ print(f"[CONFIG] CODE_TREE_DIRS = {CODE_TREE_DIRS}")
 # ─── MODEL SELECTION ─────────────────────────────────────────────────────────
 # Default model used as a fallback for any role not listed in MODEL_BY_ROLE,
 # and for direct callers that don't pass a role (e.g. one-off API calls).
-MODEL = "deepseek-v4-pro"
-
+#
 # Per-role model overrides.
 # Assign heavier/more expensive models only where reasoning quality matters most.
 # Assign lighter/cheaper models to roles that do structured or mechanical work.
@@ -91,15 +90,19 @@ MODEL = "deepseek-v4-pro"
 #   "flash" — use when the agent follows a clear template, reads existing files,
 #             runs commands, or produces structured output (JSON, Markdown).
 #
-# To change a role's model, edit the value here — no other code needs to change.
+# To change a role's model, edit the default here — or override at runtime via
+# .env without touching code: MODEL_DEFAULT for the fallback, and MODEL_<ROLE>
+# (e.g. MODEL_LEADER, MODEL_SPEC_WRITER) for a specific role.
 # To add a new role, insert a new key; it will be picked up automatically by run_agent.
+MODEL = os.getenv("MODEL_DEFAULT", "deepseek-v4-pro")
+
 MODEL_BY_ROLE: dict[str, str] = {
-    "leader":      "deepseek-v4-pro",    # orchestration requires multi-step reasoning
-    "spec_writer": "deepseek-v4-flash",  # structured output from a clear template
-    "implementer": "deepseek-v4-pro",    # code generation benefits from the best model
-    "reviewer":    "deepseek-v4-flash",  # reads files, runs tests — no deep reasoning needed
-    "e2e_tester":  "deepseek-v4-flash",  # executes existing test scripts mechanically
-    "compaction":  "deepseek-v4-flash",  # context summarization: fast and cheap
+    "leader":      os.getenv("MODEL_LEADER",      "deepseek-v4-pro"),    # orchestration requires multi-step reasoning
+    "spec_writer": os.getenv("MODEL_SPEC_WRITER",  "deepseek-v4-flash"), # structured output from a clear template
+    "implementer": os.getenv("MODEL_IMPLEMENTER",  "deepseek-v4-pro"),   # code generation benefits from the best model
+    "reviewer":    os.getenv("MODEL_REVIEWER",     "deepseek-v4-flash"), # reads files, runs tests — no deep reasoning needed
+    "e2e_tester":  os.getenv("MODEL_E2E_TESTER",   "deepseek-v4-flash"), # executes existing test scripts mechanically
+    "compaction":  os.getenv("MODEL_COMPACTION",   "deepseek-v4-flash"), # context summarization: fast and cheap
 }
 
 VERBOSE = True
@@ -151,7 +154,14 @@ MAX_ITER_LEADER    = 30  # Max iterations for the leader loop
 MAX_ITER_AGENT     = 30  # Default — e2e_tester
 MAX_ITER_IMPL      = 50  # Implementer: read context + write code + tests
 MAX_ITER_REVIEWER  = 40  # Reviewer: read reports + run tests + mutation testing
+MAX_ITER_SPEC      = int(os.getenv("MAX_ITER_SPEC", "35"))  # Spec writer: override via .env if specs need more iterations
 RETRY_BACKOFF      = [2, 4, 8]  # seconds between API retries
+
+# ─── FEATURE DESIGN RULE ─────────────────────────────────────────────────────
+# Features should touch at most 4-5 files. Larger features should be split by
+# the Leader into smaller sequential features (using depends_on) instead of
+# being implemented as one oversized change. This keeps each implementer/
+# reviewer cycle's context small and makes failures easier to localize and retry.
 
 # Context compaction — 2025 best practices:
 # 64K token models: compact when history exceeds ~30% of context.
@@ -1405,7 +1415,7 @@ def spawn_spec_writer(feature_id: int, description: str) -> str:
                                  system_prompt=spec_cfg.SYSTEM_PROMPT,
                                  task=task, feature_id=feature_id)
     result = run_agent(_agent_ctx["system_prompt"], spec_cfg.TOOLS, _agent_ctx["task"],
-                       role="spec_writer", color="cyan", max_iter=35)
+                       role="spec_writer", color="cyan", max_iter=MAX_ITER_SPEC)
     done = not result.startswith("[ERROR")
     console.print(f"  [cyan]📋 SPEC_WRITER[/] {'[green]✓ spec ready[/]' if done else '[red]✗ error[/]'} → {result[:80]}")
 

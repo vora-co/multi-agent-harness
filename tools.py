@@ -96,13 +96,20 @@ def append_file(path: str = None, content: str = "", file_path: str = None,
     except Exception as e:
         return json.dumps({"error": str(e)})
 
-def list_files(directory: str = ".") -> str:
+def list_files(directory: str = ".", depth: int = None, limit: int = None, **kwargs) -> str:
     try:
         result = []
+        base_depth = directory.rstrip("/").count("/") + (0 if directory == "." else 1)
         for root, dirs, files in os.walk(directory):
             dirs[:] = [d for d in dirs if not d.startswith(".") and d not in ("__pycache__", "mutants", "node_modules", ".venv", "venv")]
+            if depth is not None:
+                current_depth = root.rstrip("/").count("/") + 1 - base_depth
+                if current_depth >= depth:
+                    dirs[:] = []
             for file in files:
                 result.append(os.path.join(root, file))
+                if limit is not None and len(result) >= limit:
+                    return json.dumps({"files": result, "truncated": True})
         return json.dumps({"files": result})
     except Exception as e:
         return json.dumps({"error": str(e)})
