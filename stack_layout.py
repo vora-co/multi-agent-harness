@@ -26,6 +26,18 @@ Resolution order (highest precedence first):
 
 Never raises. Any failure reading either JSON file falls back to _DEFAULT
 with a logged warning, so a malformed config can never crash the harness.
+
+PLACEHOLDER SUBSTITUTION:
+Some stack profiles (e.g. python-django, which has no fixed source-root
+convention like FastAPI's src/) use a generic "<app>" placeholder instead of
+a literal directory name inside safe_write_dirs / code_tree_dirs / dirs.
+"<app>" is resolved to a concrete app_name with this precedence:
+  1. APP_NAME env var.
+  2. stack_config.json's "app_name" key.
+  3. Hardcoded default: "app".
+The substitution always runs (even profiles without "<app>" are unaffected,
+since str.replace is a no-op when the placeholder isn't present), so adding
+"<app>" to a future profile never requires touching this resolution logic.
 """
 
 import functools
@@ -50,6 +62,23 @@ _DEFAULT: dict = {
 }
 
 
+def _substitute_placeholder(value, app_name: str):
+    """
+    Replace the literal "<app>" placeholder with app_name inside value.
+    Handles str, and recursively list/tuple (preserving the original type).
+    Any other type is returned unchanged. A value without "<app>" passes
+    through untouched — calling this on profiles that never use the
+    placeholder is always a safe no-op.
+    """
+    if isinstance(value, str):
+        return value.replace("<app>", app_name)
+    if isinstance(value, tuple):
+        return tuple(_substitute_placeholder(v, app_name) for v in value)
+    if isinstance(value, list):
+        return [_substitute_placeholder(v, app_name) for v in value]
+    return value
+
+
 @functools.lru_cache(maxsize=1)
 def resolve_layout() -> dict:
     """
@@ -57,13 +86,14 @@ def resolve_layout() -> dict:
 
     Returns a dict with keys: safe_write_dirs (tuple[str]), code_tree_dirs
     (tuple[str]), test_runner (str), server_cmd (str), dirs (str),
-    db_family (str), backend_key (str), frontend_key (str).
+    db_family (str), backend_key (str), frontend_key (str), app_name (str).
 
     Cached after first call — the stack doesn't change mid-run, and re-reading
     two JSON files on every call would be wasted I/O. Call
     resolve_layout.cache_clear() in tests that need to re-resolve.
     """
     layout = dict(_DEFAULT)
+    app_name = "app"  # last-resort default, see PLACEHOLDER SUBSTITUTION above
 
     try:
         cfg = (
@@ -86,14 +116,16 @@ def resolve_layout() -> dict:
         )
         fkey = fkey.strip().lower()
 
+        app_name = (os.getenv("APP_NAME") or cfg.get("app_name") or app_name).strip() or "app"
+
         entry = prof.get("backend", {}).get(bkey)
         if entry:
             layout.update({
-                "safe_write_dirs": tuple(entry["safe_write_dirs"]),
-                "code_tree_dirs":  tuple(entry["code_tree_dirs"]),
+                "safe_write_dirs": _substitute_placeholder(tuple(entry["safe_write_dirs"]), app_name),
+                "code_tree_dirs":  _substitute_placeholder(tuple(entry["code_tree_dirs"]), app_name),
                 "test_runner":     entry["test_runner"],
                 "server_cmd":      entry["server_cmd"],
-                "dirs":            entry["dirs"],
+                "dirs":            _substitute_placeholder(entry["dirs"], app_name),
                 "db_family":       entry.get("db_family", "none"),
                 "backend_key":     bkey,
                 "frontend_key":    fkey,
@@ -105,6 +137,8 @@ def resolve_layout() -> dict:
             )
     except Exception as exc:
         _log.warning("stack_layout: falling back to default layout (%s)", exc)
+
+    layout["app_name"] = app_name
 
     # Emergency env overrides still win — kept for ops, not the normal path.
     if os.environ.get("SAFE_WRITE_DIRS"):
