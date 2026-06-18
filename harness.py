@@ -778,6 +778,21 @@ def _safe_parse_args(raw: str, tool_name: str):
         _log("harness", "PARSE_ERROR", err, level="error")
         return None, err
 
+def _verdict_is(result: str, marker: str) -> bool:
+    """
+    Case- and punctuation-tolerant check for whether an agent's verdict
+    string starts with the expected marker (e.g. "APPROVED", "E2E_PASSED",
+    "E2E_FAILED"). LLMs are not perfectly consistent about exact verdict
+    formatting — "Approved.", "approved", "APPROVED:" should all count as
+    the marker, not be silently misread as a rejection and waste a full
+    retry. Only the marker-length prefix is compared, so trailing
+    punctuation/text after it (the actual reason, e.g. "REJECTED: ...")
+    never affects the match.
+    """
+    cleaned = result.strip()
+    return cleaned[:len(marker)].upper() == marker.upper()
+
+
 def _classify_error(error_msg: str) -> str:
     """
     Classify an error to decide the retry strategy.
@@ -1509,7 +1524,7 @@ def spawn_reviewer(feature_id: int, e2e: bool = True) -> str:
     result = run_agent(_agent_ctx["system_prompt"], reviewer_cfg.TOOLS, _agent_ctx["task"],
                        role="reviewer", color="magenta", max_iter=max_iter)
 
-    approved = result.strip().startswith("APPROVED")
+    approved = _verdict_is(result, "APPROVED")
     verdict_color = "green" if approved else "red"
     verdict_icon  = "✅" if approved else "❌"
     _log("reviewer", "VERDICT", result[:200], level="info" if approved else "warning")
@@ -1540,7 +1555,7 @@ def spawn_e2e_tester(feature_id: int) -> str:
     result = run_agent(_agent_ctx["system_prompt"], e2e_cfg.TOOLS, _agent_ctx["task"],
                        role="e2e_tester", color="yellow")
 
-    passed = result.strip().startswith("E2E_PASSED")
+    passed = _verdict_is(result, "E2E_PASSED")
     color  = "green" if passed else "red"
     _log("e2e_tester", "VERDICT", result[:200], level="info" if passed else "warning")
     console.print(Panel(
@@ -1645,10 +1660,17 @@ def run_feature_cycle(feature_id: int, description: str, e2e: bool = True) -> di
             e2e_result = "E2E_PASSED"
         else:
             e2e_result = spawn_e2e_tester(feature_id)
-            if not e2e_result.strip().startswith("E2E_FAILED"):
-                _save_checkpoint(feature_id, "e2e_done", attempt=attempt)
 
-        if e2e_result.strip().startswith("E2E_FAILED"):
+        # Allowlist, not denylist: only an explicit "E2E_PASSED" counts as a
+        # pass. Anything else — "E2E_FAILED: ...", a max_iter timeout error,
+        # malformed/empty output, etc. — is treated as a failure. Previously
+        # this only rejected strings starting with "E2E_FAILED", so a timeout
+        # or any other unexpected verdict silently fell through as an
+        # implicit pass and reached the Reviewer with no real E2E evidence.
+        e2e_passed = _verdict_is(e2e_result, "E2E_PASSED")
+        if e2e_passed:
+            _save_checkpoint(feature_id, "e2e_done", attempt=attempt)
+        else:
             e2e_reason = e2e_result.replace("E2E_FAILED:", "").strip()
             _log("harness", "E2E_FAILED",
                  f"feature={feature_id} attempt={attempt} reason={e2e_reason[:100]}", level="warning")
@@ -1665,7 +1687,7 @@ def run_feature_cycle(feature_id: int, description: str, e2e: bool = True) -> di
 
         # ── Step 4: Review ───────────────────────────────────────────────────
         review_result = spawn_reviewer(feature_id, e2e=e2e)
-        if review_result.strip().startswith("APPROVED"):
+        if _verdict_is(review_result, "APPROVED"):
             gate_block = _fire_gate(
                 "before_approval_finalized",
                 feature_id=feature_id, description=description,
