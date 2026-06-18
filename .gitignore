@@ -10,3 +10,4 @@ mutants/
 data/
 node_modules/
 frontend/dist/
+progress/harness.log
