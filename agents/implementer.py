@@ -50,6 +50,9 @@ HARD RULES:
 - Only write inside the writable directories listed in your task (see SAFE_WRITE_DIRS / your injected layout) plus progress/.
 - Inside run_bash, the project root is mounted read-only at /workspace; only the writable directories listed in your task (plus progress/) are writable there.
 - Do not modify feature_list.json.
+- There is no dedicated search/grep tool. To find where a symbol or string is used, call
+  run_bash("grep -rn 'pattern' path/") (or rg if available) — do not call a tool named
+  grep/search/find directly, it does not exist and will waste iterations.
 """
 
 TOOLS = get_schemas(

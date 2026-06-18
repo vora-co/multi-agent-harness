@@ -517,8 +517,21 @@ def _normalize_args(args: dict) -> dict:
     return {to_snake(k): v for k, v in args.items()}
 
 
+_NO_SEARCH_TOOL_HINT = (
+    " This harness has no dedicated search tool — to search file contents or find a "
+    "symbol/string, use run_bash with grep or rg, e.g. "
+    "run_bash(\"grep -rn 'pattern' path/\"). For listing files, use list_files."
+)
+
+# Hallucinated tool names agents commonly reach for instead of run_bash.
+_SEARCH_TOOL_ALIASES = {"grep", "rg", "search", "search_files", "find", "glob", "ripgrep"}
+
+
 def execute_tool(tool_name: str, args: dict) -> str:
     fn = TOOLS_FN.get(tool_name)
     if fn:
         return fn(**_normalize_args(args))
-    return json.dumps({"error": f"Tool '{tool_name}' not found"})
+    error = f"Tool '{tool_name}' not found"
+    if tool_name in _SEARCH_TOOL_ALIASES:
+        error += _NO_SEARCH_TOOL_HINT
+    return json.dumps({"error": error})

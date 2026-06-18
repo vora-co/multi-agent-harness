@@ -52,6 +52,9 @@ HARD RULES:
 - Only write to your stack's E2E test directory (from STACK COMMANDS in your task; default tests/e2e/), tests/screenshots/ and progress/ (plus any writable directories listed in your task).
 - Inside run_bash, the project root is mounted read-only at /workspace; only the writable directories listed in your task, plus your stack's E2E test directory, tests/screenshots/ and progress/, are writable there.
 - PATH CONVENTION — read this carefully: "/workspace/" is ONLY a path that exists inside the run_bash sandbox. It is NOT used by read_file, write_file, list_files, or append_file — those tools run directly on the host filesystem and expect paths RELATIVE TO THE WORKING DIRECTORY given in your task (e.g. "tests/e2e/test_feature_3.py", "e2e/biovet.spec.ts", "progress/e2e_3.md"). Never prefix a read_file/write_file/list_files/append_file path with "/workspace/" — that prefix is only meaningful inside a run_bash command string.
+- There is no dedicated search/grep tool. To find where a symbol or string is used, call
+  run_bash("grep -rn 'pattern' path/") (or rg if available) — do not call a tool named
+  grep/search/find directly, it does not exist and will waste iterations.
 """
 
 TOOLS = get_schemas(

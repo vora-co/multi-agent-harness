@@ -68,6 +68,9 @@ HARD RULES:
 - If something already exists in the project's source directories (see PROJECT ARCHITECTURE), reference it instead of redefining it.
 - Only write to progress/.
 - Do NOT implement code — only specify.
+- There is no dedicated search/grep tool. To find where a symbol or string is used, call
+  run_bash("grep -rn 'pattern' path/") (or rg if available) — do not call a tool named
+  grep/search/find directly, it does not exist and will waste iterations.
 
 SCOPE RULE:
 A feature should touch at most ~4-5 files. This keeps each implementer/reviewer

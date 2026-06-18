@@ -323,6 +323,21 @@ class TestTools:
         result = json.loads(t.execute_tool("nonexistent_tool", {}))
         assert "error" in result
 
+    def test_execute_tool_grep_hallucination_gets_search_hint(self, monkeypatch, tmp_path):
+        # Agents sometimes hallucinate a "grep" tool that doesn't exist in this
+        # harness (only run_bash can grep). The error should point them at
+        # run_bash with grep/rg instead of leaving them to retry blindly.
+        t = self._load_tools(monkeypatch, tmp_path)
+        result = json.loads(t.execute_tool("grep", {"pattern": "foo"}))
+        assert "error" in result
+        assert "run_bash" in result["error"]
+        assert "grep" in result["error"].lower()
+
+    def test_execute_tool_unrelated_unknown_tool_has_no_search_hint(self, monkeypatch, tmp_path):
+        t = self._load_tools(monkeypatch, tmp_path)
+        result = json.loads(t.execute_tool("nonexistent_tool", {}))
+        assert "run_bash" not in result["error"]
+
     def test_execute_tool_update_feature_status(self, monkeypatch, tmp_path):
         t = self._load_tools(monkeypatch, tmp_path)
         result = json.loads(
