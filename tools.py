@@ -171,15 +171,36 @@ def read_feature_list() -> str:
     except Exception as e:
         return json.dumps({"error": str(e)})
 
-def run_playwright_tests(test_path: str = "tests/e2e/", base_url: str = "http://localhost:8000",
+def run_playwright_tests(test_path: str = None, base_url: str = "http://localhost:8000",
                          headed: bool = False, timeout_ms: int = 30000) -> str:
     """
-    Run E2E tests with Playwright/pytest-playwright.
-    Installs dependencies if not available.
-    Automatically captures screenshots on failures.
+    Run E2E tests with Playwright. Branches on the configured e2e runtime
+    (stack_layout.resolve_layout()'s "e2e_runtime"): "python" runs
+    pytest-playwright (the original/default behavior), "node" runs
+    @playwright/test via npx. Falls back to the Python runner if e2e_runtime
+    is unset or unrecognized, so existing projects with no e2e_runner
+    configured keep working exactly as before.
+
+    If test_path is not given, it defaults to the resolved stack's
+    e2e_test_dir (e.g. "tests/e2e/" for Python, "e2e/" for Node) instead of
+    a hardcoded Python-only path.
+    """
+    layout = resolve_layout()
+    runtime = layout.get("e2e_runtime") or "python"
+    resolved_test_path = test_path or layout.get("e2e_test_dir") or "tests/e2e/"
+
+    if runtime == "node":
+        return _run_playwright_tests_node(resolved_test_path, base_url, headed, timeout_ms)
+    return _run_playwright_tests_python(resolved_test_path, base_url, headed, timeout_ms)
+
+
+def _run_playwright_tests_python(test_path: str, base_url: str, headed: bool, timeout_ms: int) -> str:
+    """
+    Run E2E tests with pytest-playwright. Installs dependencies if not
+    available. Automatically captures screenshots on failures.
     """
     # Check/install pytest-playwright
-    check = subprocess.run("python -m pytest --co -q tests/e2e/ 2>&1 | head -5",
+    check = subprocess.run(f"python -m pytest --co -q {test_path} 2>&1 | head -5",
                            shell=True, capture_output=True, text=True)
     if "No module named" in check.stdout or "playwright" not in check.stdout.lower():
         install = subprocess.run(
@@ -216,6 +237,61 @@ def run_playwright_tests(test_path: str = "tests/e2e/", base_url: str = "http://
             "success": result.returncode == 0,
             "screenshots": screenshots,
             "tip": "If there are screenshots, read them with read_file to see the UI state at failure."
+        })
+    except subprocess.TimeoutExpired:
+        return json.dumps({"error": "Timeout: E2E tests took more than 5 minutes."})
+    except Exception as e:
+        return json.dumps({"error": str(e)})
+
+
+def _run_playwright_tests_node(test_path: str, base_url: str, headed: bool, timeout_ms: int) -> str:
+    """
+    Run E2E tests with Node's @playwright/test via `npx playwright test`.
+    Installs @playwright/test and the Chromium browser if not already
+    available. Honors an existing project-level e2e/playwright.config.ts
+    (npx picks it up automatically when run from the project root) rather
+    than assuming a fixed config location.
+    """
+    check = subprocess.run("npx playwright --version", shell=True, capture_output=True, text=True)
+    if check.returncode != 0:
+        install = subprocess.run(
+            "npm install -D @playwright/test --silent && "
+            "npx playwright install --with-deps chromium",
+            shell=True, capture_output=True, text=True, timeout=180
+        )
+        if install.returncode != 0:
+            return json.dumps({"error": "Failed to install @playwright/test", "stderr": install.stderr[:500]})
+
+    os.makedirs("tests/screenshots", exist_ok=True)
+
+    headed_flag = "--headed" if headed else ""
+    cmd = (
+        f"PLAYWRIGHT_BASE_URL={base_url} npx playwright test {test_path} "
+        f"--reporter=line --timeout={timeout_ms} "
+        f"{headed_flag} 2>&1"
+    )
+    try:
+        result = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=300)
+        output = result.stdout + result.stderr
+
+        # @playwright/test writes failure artifacts under test-results/ by
+        # default; also check tests/screenshots/ in case the spec takes its
+        # own explicit page.screenshot() calls there.
+        screenshots = []
+        if os.path.exists("tests/screenshots"):
+            screenshots += [f for f in os.listdir("tests/screenshots") if f.endswith(".png")]
+        if os.path.exists("test-results"):
+            for root, _, files in os.walk("test-results"):
+                screenshots += [os.path.join(root, f) for f in files if f.endswith(".png")]
+
+        return json.dumps({
+            "output": output[-3000:],
+            "returncode": result.returncode,
+            "success": result.returncode == 0,
+            "screenshots": screenshots,
+            "tip": ("If there are screenshots, read them with read_file to see the UI state at failure. "
+                    "PLAYWRIGHT_BASE_URL is set as a convenience env var, but an existing "
+                    "playwright.config.ts that already sets baseURL explicitly takes precedence.")
         })
     except subprocess.TimeoutExpired:
         return json.dumps({"error": "Timeout: E2E tests took more than 5 minutes."})

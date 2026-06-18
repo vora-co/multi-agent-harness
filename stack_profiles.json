@@ -49,10 +49,20 @@
   },
   "e2e_runner": {
     "playwright": {
-      "name": "Playwright",
+      "name": "Playwright (Python / pytest-playwright)",
+      "runtime": "python",
+      "file_ext": ".py",
       "test_dir": "tests/e2e/",
+      "run_cmd": "python3 -m pytest tests/e2e/ -v --tb=short",
+      "notes": "Use page.wait_for_selector() not time.sleep().\nScreenshots via page.screenshot(path='tests/screenshots/...').\nRequires: pip install pytest-playwright playwright && playwright install chromium."
+    },
+    "playwright-node": {
+      "name": "Playwright (Node / @playwright/test)",
+      "runtime": "node",
+      "file_ext": ".spec.ts",
+      "test_dir": "e2e/",
       "run_cmd": "npx playwright test",
-      "notes": "Use page.wait_for_selector() not time.sleep().\nScreenshots via page.screenshot(path='tests/screenshots/...').\nPython bindings: pip install playwright && playwright install chromium."
+      "notes": "Use page.waitForSelector() not arbitrary sleeps.\nScreenshots via page.screenshot({ path: 'tests/screenshots/...' }) or the built-in --screenshot=only-on-failure reporter output.\nRequires: npm install -D @playwright/test && npx playwright install --with-deps chromium.\nIf the project has its own e2e/playwright.config.ts, run_cmd should include --config pointing at it instead of relying on defaults."
     },
     "none": {
       "name": "No E2E tests",

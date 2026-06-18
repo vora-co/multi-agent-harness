@@ -9,15 +9,21 @@ PROTOCOL:
 1. Read progress/impl_<feature_id>.md to understand what was implemented.
 2. Read the relevant unit test files (see the test directory in your injected STACK COMMANDS / layout) to understand covered cases —
    E2E tests should complement, NOT duplicate, unit tests.
-3. If tests/e2e/ does not exist, create it. If it exists, check what's there.
-4. Write or update tests/e2e/test_feature_<feature_id>.py with E2E scenarios that:
+3. Use the E2E test directory and file convention given under STACK COMMANDS in your task (default: tests/e2e/ with
+   .py files for Python/pytest-playwright; e.g. e2e/ with .spec.ts files for Node/@playwright/test projects). If it
+   does not exist, create it. If it exists, check what's there — including any existing project-level config file
+   (e.g. playwright.config.ts) and existing spec files, since some projects keep all E2E scenarios in one shared spec.
+4. Write or update a test file for this feature in that directory (e.g. test_feature_<feature_id>.py, or a new
+   describe/test block appended to the project's existing spec file if that's the established convention there)
+   with E2E scenarios that:
    - Cover the complete happy path of the feature (main user flow).
    - Cover at least one sad path (invalid input, visible error state).
-   - Use page.screenshot() at key points for visual evidence.
+   - Use a screenshot call at key points for visual evidence (page.screenshot(path=...) in Python,
+     page.screenshot({ path: ... }) in Node).
 5. Start the app if needed using the server command given under STACK COMMANDS in your task:
    run_bash("<server command from STACK COMMANDS> &")
-6. Run the tests: run_playwright_tests(test_path="tests/e2e/test_feature_<id>.py",
-   base_url="http://localhost:8000")
+6. Run the tests with run_playwright_tests(test_path="<path to the file or directory from step 3/4>",
+   base_url="http://localhost:8000") — you may omit test_path to fall back to the stack's default E2E directory.
 7. If tests fail:
    - Read screenshots with read_file if available.
    - Fix the test OR report if the bug is in the code (not in the test).
@@ -31,7 +37,8 @@ PROTOCOL:
 
 E2E TESTING PRINCIPLES:
 - Test behavior, not implementation. Interact as a real user would.
-- Tests must be deterministic: avoid arbitrary sleeps, use page.wait_for_selector().
+- Tests must be deterministic: avoid arbitrary sleeps, use an explicit wait-for-selector call
+  (page.wait_for_selector() in Python, page.waitForSelector() in Node).
 - Clean state between tests (Playwright fixtures or setup/teardown).
 - An E2E test that passes by chance is worse than one that fails consistently.
 
@@ -42,9 +49,9 @@ HARD RULES:
 - Do not edit application code (backend or frontend). If you find a bug, report it with evidence (screenshot).
 - Do not modify existing unit tests.
 - Do not mark E2E_PASSED if any scenario fails, even a "minor" one.
-- Only write to tests/e2e/, tests/screenshots/ and progress/ (plus any writable directories listed in your task).
-- Inside run_bash, the project root is mounted read-only at /workspace; only the writable directories listed in your task, plus tests/e2e/, tests/screenshots/ and progress/, are writable there.
-- PATH CONVENTION — read this carefully: "/workspace/" is ONLY a path that exists inside the run_bash sandbox. It is NOT used by read_file, write_file, list_files, or append_file — those tools run directly on the host filesystem and expect paths RELATIVE TO THE WORKING DIRECTORY given in your task (e.g. "tests/e2e/test_feature_3.py", "progress/e2e_3.md"). Never prefix a read_file/write_file/list_files/append_file path with "/workspace/" — that prefix is only meaningful inside a run_bash command string.
+- Only write to your stack's E2E test directory (from STACK COMMANDS in your task; default tests/e2e/), tests/screenshots/ and progress/ (plus any writable directories listed in your task).
+- Inside run_bash, the project root is mounted read-only at /workspace; only the writable directories listed in your task, plus your stack's E2E test directory, tests/screenshots/ and progress/, are writable there.
+- PATH CONVENTION — read this carefully: "/workspace/" is ONLY a path that exists inside the run_bash sandbox. It is NOT used by read_file, write_file, list_files, or append_file — those tools run directly on the host filesystem and expect paths RELATIVE TO THE WORKING DIRECTORY given in your task (e.g. "tests/e2e/test_feature_3.py", "e2e/biovet.spec.ts", "progress/e2e_3.md"). Never prefix a read_file/write_file/list_files/append_file path with "/workspace/" — that prefix is only meaningful inside a run_bash command string.
 """
 
 TOOLS = get_schemas(

@@ -338,3 +338,145 @@ class TestTools:
             t.execute_tool("update_feature_status", {"featureId": 1, "status": "in_progress"})
         )
         assert "error" not in result or result.get("success")
+
+
+# ── tools.py: run_playwright_tests (Python/Node stack branching) ─────────────
+
+class _FakeCompleted:
+    def __init__(self, returncode=0, stdout="", stderr=""):
+        self.returncode = returncode
+        self.stdout = stdout
+        self.stderr = stderr
+
+
+_MINI_E2E_PROFILES = {
+    "backend": {
+        "python-fastapi": {
+            "name": "Python + FastAPI", "language": "Python 3.9+",
+            "dirs": "src/...", "test_runner": "python3 -m pytest tests/ -v",
+            "server_cmd": "python3 -m uvicorn src.main:app --port 8000",
+            "db_family": "asyncpg",
+            "safe_write_dirs": ["src/", "tests/", "e2e/"],
+            "code_tree_dirs": ["src", "tests"],
+        },
+    },
+    "frontend": {"react-tailwind": {"name": "React", "dirs": "frontend/", "dev_cmd": "npm run dev"}},
+    "database": {"json": {"name": "JSON files", "notes": "n/a"}},
+    "e2e_runner": {
+        "playwright": {
+            "name": "Playwright (Python)", "runtime": "python", "file_ext": ".py",
+            "test_dir": "tests/e2e/", "run_cmd": "python3 -m pytest tests/e2e/ -v",
+            "notes": "python notes",
+        },
+        "playwright-node": {
+            "name": "Playwright (Node)", "runtime": "node", "file_ext": ".spec.ts",
+            "test_dir": "e2e/", "run_cmd": "npx playwright test",
+            "notes": "node notes",
+        },
+    },
+    "defaults": {
+        "backend": "python-fastapi", "frontend": "react-tailwind",
+        "database": "json", "e2e_runner": "playwright",
+    },
+}
+
+
+class TestRunPlaywrightTests:
+    def _load_tools(self, monkeypatch, tmp_path: Path, stack_config: dict = None):
+        monkeypatch.chdir(tmp_path)
+        (tmp_path / "feature_list.json").write_text(json.dumps([
+            {"id": 1, "title": "T", "status": "pending", "description": "d",
+             "e2e": False, "depends_on": []}
+        ]))
+        for k in ("STACK_BACKEND", "STACK_FRONTEND", "STACK_E2E", "APP_NAME",
+                  "SAFE_WRITE_DIRS", "CODE_TREE_DIRS"):
+            monkeypatch.delenv(k, raising=False)
+
+        if stack_config is not None:
+            (tmp_path / "stack_profiles.json").write_text(json.dumps(_MINI_E2E_PROFILES))
+            (tmp_path / "stack_config.json").write_text(json.dumps(stack_config))
+
+        for mod in ["sandbox"]:
+            monkeypatch.setitem(sys.modules, mod, MagicMock())
+
+        # Drop both tools and stack_layout so resolve_layout's lru_cache starts
+        # fresh per test — otherwise an earlier test's resolved layout (cached
+        # on the function object) would leak into this one.
+        for key in list(sys.modules.keys()):
+            if key in ("tools", "stack_layout"):
+                del sys.modules[key]
+
+        root = Path(__file__).parent.parent
+        if str(root) not in sys.path:
+            sys.path.insert(0, str(root))
+
+        return importlib.import_module("tools")
+
+    def test_default_stack_uses_python_pytest_playwright(self, monkeypatch, tmp_path):
+        t = self._load_tools(monkeypatch, tmp_path)
+        calls = []
+
+        def fake_run(cmd, **kwargs):
+            calls.append(cmd)
+            if "pytest --co" in cmd:
+                return _FakeCompleted(returncode=0, stdout="playwright fixture collected")
+            return _FakeCompleted(returncode=0, stdout="1 passed", stderr="")
+
+        monkeypatch.setattr(t.subprocess, "run", fake_run)
+        result = json.loads(t.run_playwright_tests(base_url="http://localhost:8000"))
+
+        assert result["success"] is True
+        assert any("python -m pytest tests/e2e/" in c for c in calls)
+        assert not any("npx playwright test" in c for c in calls)
+
+    def test_node_stack_uses_npx_playwright_test(self, monkeypatch, tmp_path):
+        t = self._load_tools(monkeypatch, tmp_path,
+                             stack_config={"backend": "python-fastapi", "e2e_runner": "playwright-node"})
+        calls = []
+
+        def fake_run(cmd, **kwargs):
+            calls.append(cmd)
+            if "playwright --version" in cmd:
+                return _FakeCompleted(returncode=0, stdout="Version 1.40.0")
+            return _FakeCompleted(returncode=0, stdout="1 passed", stderr="")
+
+        monkeypatch.setattr(t.subprocess, "run", fake_run)
+        result = json.loads(t.run_playwright_tests(base_url="http://localhost:8000"))
+
+        assert result["success"] is True
+        assert any("npx playwright test e2e/" in c for c in calls)
+        assert any("PLAYWRIGHT_BASE_URL=http://localhost:8000" in c for c in calls)
+        assert not any("python -m pytest" in c for c in calls)
+
+    def test_node_stack_installs_playwright_when_missing(self, monkeypatch, tmp_path):
+        t = self._load_tools(monkeypatch, tmp_path,
+                             stack_config={"backend": "python-fastapi", "e2e_runner": "playwright-node"})
+        calls = []
+
+        def fake_run(cmd, **kwargs):
+            calls.append(cmd)
+            if "playwright --version" in cmd:
+                return _FakeCompleted(returncode=1, stdout="", stderr="command not found")
+            if "npm install" in cmd:
+                return _FakeCompleted(returncode=0, stdout="installed")
+            return _FakeCompleted(returncode=0, stdout="1 passed", stderr="")
+
+        monkeypatch.setattr(t.subprocess, "run", fake_run)
+        result = json.loads(t.run_playwright_tests(base_url="http://localhost:8000"))
+
+        assert any("npm install -D @playwright/test" in c for c in calls)
+        assert result["success"] is True
+
+    def test_explicit_test_path_overrides_stack_default(self, monkeypatch, tmp_path):
+        t = self._load_tools(monkeypatch, tmp_path,
+                             stack_config={"backend": "python-fastapi", "e2e_runner": "playwright-node"})
+        calls = []
+
+        def fake_run(cmd, **kwargs):
+            calls.append(cmd)
+            return _FakeCompleted(returncode=0, stdout="1 passed", stderr="")
+
+        monkeypatch.setattr(t.subprocess, "run", fake_run)
+        t.run_playwright_tests(test_path="e2e/biovet.spec.ts", base_url="http://localhost:8000")
+
+        assert any("npx playwright test e2e/biovet.spec.ts" in c for c in calls)

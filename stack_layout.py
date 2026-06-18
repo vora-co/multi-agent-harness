@@ -27,6 +27,19 @@ Resolution order (highest precedence first):
 Never raises. Any failure reading either JSON file falls back to _DEFAULT
 with a logged warning, so a malformed config can never crash the harness.
 
+E2E RESOLUTION:
+The same pattern used for backend/frontend now also resolves the e2e runner,
+so agents that need to know "is this Python or Node E2E, and where do the
+test files live" (the E2E_TESTER, mainly) don't have to guess from a
+hardcoded tests/e2e/*.py assumption. Resolution order:
+  1. STACK_E2E env var.
+  2. stack_config.json's "e2e_runner" key.
+  3. stack_profiles.json's "defaults.e2e_runner".
+  4. Hardcoded fallback: "playwright" (Python/pytest-playwright).
+Looked up in stack_profiles.json's "e2e_runner" map, exposed on the returned
+layout dict as e2e_runtime ("python"/"node"/None), e2e_test_dir, e2e_file_ext,
+e2e_run_cmd, e2e_notes, and e2e_key (the resolved profile key itself).
+
 PLACEHOLDER SUBSTITUTION:
 Some stack profiles (e.g. python-django, which has no fixed source-root
 convention like FastAPI's src/) use a generic "<app>" placeholder instead of
@@ -59,6 +72,12 @@ _DEFAULT: dict = {
     "db_family":      "asyncpg",
     "backend_key":    "python-fastapi",
     "frontend_key":   "react-tailwind",
+    "e2e_runtime":    "python",
+    "e2e_test_dir":   "tests/e2e/",
+    "e2e_file_ext":   ".py",
+    "e2e_run_cmd":    "python3 -m pytest tests/e2e/ -v --tb=short",
+    "e2e_notes":      "",
+    "e2e_key":        "playwright",
 }
 
 
@@ -86,7 +105,10 @@ def resolve_layout() -> dict:
 
     Returns a dict with keys: safe_write_dirs (tuple[str]), code_tree_dirs
     (tuple[str]), test_runner (str), server_cmd (str), dirs (str),
-    db_family (str), backend_key (str), frontend_key (str), app_name (str).
+    db_family (str), backend_key (str), frontend_key (str), app_name (str),
+    e2e_runtime (str | None), e2e_test_dir (str | None),
+    e2e_file_ext (str | None), e2e_run_cmd (str | None), e2e_notes (str),
+    e2e_key (str). See "E2E RESOLUTION" above for how the e2e_* keys resolve.
 
     Cached after first call — the stack doesn't change mid-run, and re-reading
     two JSON files on every call would be wasted I/O. Call
@@ -116,6 +138,11 @@ def resolve_layout() -> dict:
         )
         fkey = fkey.strip().lower()
 
+        ekey = os.getenv("STACK_E2E") or cfg.get(
+            "e2e_runner", backend_defaults.get("e2e_runner", "playwright")
+        )
+        ekey = ekey.strip().lower()
+
         app_name = (os.getenv("APP_NAME") or cfg.get("app_name") or app_name).strip() or "app"
 
         entry = prof.get("backend", {}).get(bkey)
@@ -134,6 +161,22 @@ def resolve_layout() -> dict:
             _log.warning(
                 "stack_layout: backend %r not found in stack_profiles.json — "
                 "falling back to default layout", bkey,
+            )
+
+        e2e_entry = prof.get("e2e_runner", {}).get(ekey)
+        if e2e_entry:
+            layout.update({
+                "e2e_runtime":  e2e_entry.get("runtime"),
+                "e2e_test_dir": e2e_entry.get("test_dir"),
+                "e2e_file_ext": e2e_entry.get("file_ext"),
+                "e2e_run_cmd":  e2e_entry.get("run_cmd"),
+                "e2e_notes":    e2e_entry.get("notes", ""),
+                "e2e_key":      ekey,
+            })
+        else:
+            _log.warning(
+                "stack_layout: e2e_runner %r not found in stack_profiles.json — "
+                "falling back to default e2e layout", ekey,
             )
     except Exception as exc:
         _log.warning("stack_layout: falling back to default layout (%s)", exc)
