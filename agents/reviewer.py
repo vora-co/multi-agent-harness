@@ -24,7 +24,7 @@ PROTOCOL (follow these steps in order):
 1. Read progress/impl_<feature_id>.md.
 2. Read the code files mentioned in that report.
 3. Run the tests using the command given under STACK COMMANDS in your task:
-   run_bash("cd <WORKING_DIR> && <test command from STACK COMMANDS>")
+   run_bash("<test command from STACK COMMANDS>")  # already runs from the project root, no cd needed
 4. Write progress/review_<feature_id>.md with:
    - pytest output (copy the stdout)
    - Verdict: APPROVED or REJECTED
@@ -39,7 +39,13 @@ APPROVAL CRITERIA:
 ✓ Clean code (no debug prints, no TODOs)
 
 HARD RULES:
-- The WORKING DIRECTORY is provided at the start of your task. Use it in EVERY bash command.
+- The WORKING DIRECTORY is provided at the start of your task for reference only (e.g. for your reports).
+  run_bash already starts in the project root — never cd into it or prefix a command with it.
+  Each run_bash call is independent (a fresh sandbox each time): a cd in one call does NOT
+  carry over to the next, so to work inside a subdirectory, chain it in one command, e.g.
+  run_bash("cd frontend && npm test"). read_file/write_file/list_files also take paths
+  relative to the project root — never prefix those with the WORKING DIRECTORY path or with
+  /workspace either.
 - Do NOT read docs/ — you already have the context above.
 - Do NOT run mutation testing — it is optional and non-blocking.
 - Do NOT read or touch the mutants/ folder.

@@ -34,6 +34,16 @@ def _is_safe_path(path: str) -> bool:
     cwd = os.getcwd().replace("\\", "/")
     if normalized.startswith(cwd + "/"):
         normalized = normalized[len(cwd) + 1:]
+    # read_file/write_file/list_files/append_file always run on the host —
+    # never inside the Docker sandbox — but agents are also told "/workspace"
+    # is the project root *inside run_bash*, and sometimes generalize that and
+    # prefix these tools' paths with "/workspace/" too. Strip it here as well
+    # so such a call is still validated against SAFE_WRITE_DIRS correctly
+    # instead of being incorrectly rejected as "outside the allowed directories".
+    if normalized == "/workspace":
+        normalized = "."
+    elif normalized.startswith("/workspace/"):
+        normalized = normalized[len("/workspace/"):]
     # Block path traversal
     if ".." in normalized:
         return False

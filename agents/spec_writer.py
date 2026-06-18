@@ -63,7 +63,12 @@ Design decisions, constraints, or specific warnings for this feature.
 3. Return ONLY the path: progress/spec_<feature_id>.md
 
 HARD RULES:
-- The WORKING DIRECTORY is provided at the start of your task. Use it in bash commands.
+- The WORKING DIRECTORY is provided at the start of your task for reference only. run_bash
+  already starts in the project root — never cd into it or prefix a command with it. Each
+  run_bash call is independent (a fresh sandbox each time): a cd in one call does NOT carry
+  over to the next, so to work inside a subdirectory, chain it in one command, e.g.
+  run_bash("cd backend && ls"). read_file/list_files also take paths relative to the project
+  root — never prefix those with the WORKING DIRECTORY path or with /workspace either.
 - Be precise: method names, types, HTTP status codes, exact error messages.
 - If something already exists in the project's source directories (see PROJECT ARCHITECTURE), reference it instead of redefining it.
 - Only write to progress/.

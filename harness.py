@@ -991,7 +991,40 @@ def run_agent(system_prompt: str, tools: list, task: str,
     _log(role, "START", task[:120])
     tool_call_errors: list = []
 
+    # Generic, role-agnostic budget-checkpoint enforcement. Previously this
+    # was only advisory prompt text in agents/e2e_tester.py's "BUDGET
+    # CHECKPOINT" section — easy for the model to under-attend to as a run
+    # grows, since it's static text set once at the start of the conversation.
+    # This injects a live, recency-weighted reminder straight into `messages`
+    # at fixed points in the iteration budget, for every role, with no
+    # role-specific detection needed (it doesn't try to guess whether a test
+    # file was written — it just tells the agent how much budget is left and
+    # to act on partial progress rather than keep exploring).
+    _budget_warn_iters = {int(max_iter * 0.6), int(max_iter * 0.85)} - {max_iter - 1}
+
     for i in range(max_iter):
+        if i in _budget_warn_iters:
+            messages.append({
+                "role": "user",
+                "content": (
+                    f"⚠️ BUDGET CHECKPOINT: you have used {i}/{max_iter} iterations. "
+                    "If you haven't produced your required output yet (spec/impl/test "
+                    "file and progress report), stop exploring now and write it with "
+                    "what you already have — a concrete partial result beats running "
+                    "out of iterations with nothing written."
+                )
+            })
+        if i == max_iter - 1:
+            messages.append({
+                "role": "user",
+                "content": (
+                    "⚠️ FINAL ITERATION: this is your last tool call before the harness "
+                    "cuts you off. Write your progress report and return your verdict "
+                    "NOW with whatever you have, even if incomplete — do not start any "
+                    "new exploration."
+                )
+            })
+
         api_response = _call_api_with_fallback(
             model    = MODEL_BY_ROLE.get(role, MODEL),
             messages = messages,
@@ -1510,6 +1543,37 @@ def _layout_context() -> str:
     )
 
 
+def _workdir_banner(cwd: str) -> str:
+    """
+    Single source of truth for the WORKING DIRECTORY text injected into every
+    agent's task. Replaces 4 slightly-drifted copies that all told agents to
+    `cd <WORKING_DIR>` or "use it in EVERY bash command" — which is wrong
+    under the default SANDBOX_MODE=docker, where run_bash's project root is
+    bind-mounted at /workspace and working_dir is already set there; the host
+    absolute path given below doesn't exist inside the container at all. Under
+    SANDBOX_MODE=local it "worked" only because cd-ing into the cwd you're
+    already in is a no-op — never because the instruction was actually correct.
+
+    The fix that's true in BOTH modes: run_bash already starts in the project
+    root, so agents never need to cd or prefix a command with this path —
+    just run relative commands directly. Also flags that run_bash is stateless
+    across calls (a fresh container in Docker mode, a fresh subprocess in
+    local mode) — a cd in one call has zero effect on the next one, which was
+    silently causing "wrong directory" confusion and burned retries.
+    """
+    return (
+        f"WORKING DIRECTORY: {cwd}\n"
+        "This is informational only (e.g. for your reports) — do NOT cd into it and do NOT "
+        "prefix commands or paths with it. run_bash already starts in the project root in "
+        "every mode; just run relative commands directly, e.g. run_bash(\"pytest tests/ -v\"). "
+        "Each run_bash call is independent — a cd in one call does NOT carry over to the next "
+        "one, so to work inside a subdirectory, chain it in a single command: "
+        "run_bash(\"cd frontend && npm test\"). read_file/write_file/list_files/append_file also "
+        "take paths relative to this directory — never prefix those with it or with /workspace "
+        "either.\n\n"
+    )
+
+
 def spawn_implementer(feature_id: int, description: str, attempt: int = 1,
                       rejection_reason: str = "", spec_path: str = None) -> str:
     """
@@ -1561,8 +1625,7 @@ def spawn_implementer(feature_id: int, description: str, attempt: int = 1,
             spec_content = f"\nRead the technical specification at {spec_path} BEFORE writing code.\n"
 
     task = (
-        f"WORKING DIRECTORY: {cwd}\n"
-        f"All bash commands must be run from this directory.\n\n"
+        f"{_workdir_banner(cwd)}"
         f"{tree_sections}\n"
         f"{arch_context}"
         f"{layout_context}"
@@ -1599,7 +1662,7 @@ def spawn_spec_writer(feature_id: int, description: str) -> str:
     arch_context = _load_project_architecture(cwd)
     layout_context = _layout_context()
     task = (
-        f"WORKING DIRECTORY: {cwd}\n\n"
+        f"{_workdir_banner(cwd)}"
         f"{arch_context}"
         f"{layout_context}"
         f"Write the technical specification for feature #{feature_id}: {description}\n"
@@ -1670,7 +1733,7 @@ def spawn_reviewer(feature_id: int, e2e: bool = True, attempt: int = 1) -> str:
             "LIGHTWEIGHT REVIEW MODE (e2e=false — skip browser/E2E, NOT skip tests):\n"
             "- Read the implementer report at progress/impl_{fid}.md\n"
             "- Verify that the files listed in the report exist on disk (use run_bash with 'ls')\n"
-            "- Run tests with: run_bash(\"cd <WORKING_DIR> && {test_runner}\")\n"
+            "- Run tests with: run_bash(\"{test_runner}\")  # already runs from the project root, no cd needed\n"
             "  - If a test suite exists for this feature, it MUST pass — do not approve on syntax checks alone.\n"
             "  - If there is genuinely no test suite to run (e.g. a pure frontend-only change with no\n"
             "    backend tests touched), fall back to a syntax check (run_bash with 'node --check' for\n"
@@ -1685,12 +1748,12 @@ def spawn_reviewer(feature_id: int, e2e: bool = True, attempt: int = 1) -> str:
     else:
         validation_mode = (
             "Review the implementer's work for feature #{fid}.\n"
-            "Run tests with: run_bash(\"cd <WORKING_DIR> && {test_runner}\") and validate that they pass.\n"
+            "Run tests with: run_bash(\"{test_runner}\") (already runs from the project root, no cd needed) and validate that they pass.\n"
         ).format(fid=feature_id, test_runner=_LAYOUT["test_runner"])
         max_iter = MAX_ITER_REVIEWER
 
     task = (
-        f"WORKING DIRECTORY: {cwd}\n\n"
+        f"{_workdir_banner(cwd)}"
         f"{tree_sections}\n\n"
         f"{arch_context}"
         f"{layout_context}"
@@ -1722,8 +1785,7 @@ def spawn_e2e_tester(feature_id: int, attempt: int = 1) -> str:
     arch_context = _load_project_architecture(cwd)
     layout_context = _layout_context()
     task = (
-        f"WORKING DIRECTORY: {cwd}\n"
-        f"All bash commands must be run from this directory.\n\n"
+        f"{_workdir_banner(cwd)}"
         f"{arch_context}"
         f"{layout_context}"
         f"Run E2E tests for feature #{feature_id}.\n"
