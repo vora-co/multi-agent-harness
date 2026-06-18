@@ -1,4 +1,4 @@
-import os, json, time, logging, datetime, subprocess, sys
+import os, re, json, time, logging, datetime, subprocess, sys
 from typing import Optional
 
 # Load .env as early as possible — before any module (e.g. tools.py) reads
@@ -102,7 +102,7 @@ MODEL_BY_ROLE: dict[str, str] = {
     "implementer": os.getenv("MODEL_IMPLEMENTER",  "deepseek-v4-pro"),   # code generation benefits from the best model
     "reviewer":    os.getenv("MODEL_REVIEWER",     "deepseek-v4-flash"), # reads files, runs tests — no deep reasoning needed
     "e2e_tester":  os.getenv("MODEL_E2E_TESTER",   "deepseek-v4-flash"), # executes existing test scripts mechanically
-    "compaction":  os.getenv("MODEL_COMPACTION",   "deepseek-v4-flash"), # context summarization: fast and cheap
+    "compaction":  os.getenv("MODEL_COMPACTION",   "deepseek-v4-flash"), # unused since deterministic compaction (no LLM call) — kept for plugins that may still want a cheap model for this role
 }
 
 VERBOSE = True
@@ -637,6 +637,100 @@ def _clear_checkpoint(feature_id: int) -> None:
     _log("harness", "CHECKPOINT_CLEARED", f"feature={feature_id}")
 
 
+# ─── MID-RUN RESUMABILITY (messages snapshot) ────────────────────────────────
+#
+# _save_checkpoint above only marks whole steps done (spec_done/impl_done/
+# e2e_done) — coarse, feature-level granularity. If the process crashes
+# *during* a single run_agent() loop (e.g. mid e2e_tester attempt), that
+# entire attempt's tool-call history was lost and the next run restarted the
+# role from scratch with only a generic task string. These helpers persist
+# the live `messages` list to disk after every iteration, keyed by
+# checkpoint_key (built by each spawn_* as f"{role}_{feature_id}_{attempt}"),
+# so run_agent can resume an in-progress conversation instead of redoing it.
+# The file is deleted on any clean return (verdict reached or max_iter
+# exhausted) — it should only ever be found on disk after a genuine crash.
+
+def _message_state_path(checkpoint_key: str) -> str:
+    # No "." in the allowed set (deliberately) — checkpoint_key is built
+    # internally as f"{role}_{feature_id}_{attempt}" and never needs one;
+    # excluding it means a stray ".." can never survive sanitization either.
+    safe_key = re.sub(r"[^A-Za-z0-9_-]", "_", checkpoint_key)
+    return os.path.join("progress", f"_state_{safe_key}.json")
+
+
+def _serialize_message(m) -> dict:
+    """Convert a message (dict or pydantic ChatCompletionMessage) into a plain
+    JSON-safe dict, preserving tool_calls shape so it can be replayed back to
+    the API on resume."""
+    if isinstance(m, dict):
+        return m
+
+    out = {"role": _msg_field(m, "role", "assistant"), "content": _msg_field(m, "content", "") or ""}
+    tool_calls = getattr(m, "tool_calls", None)
+    if tool_calls:
+        out["tool_calls"] = [
+            {
+                "id": tc.id,
+                "type": "function",
+                "function": {"name": tc.function.name, "arguments": tc.function.arguments},
+            }
+            for tc in tool_calls
+        ]
+        if not out["content"]:
+            out["content"] = None
+    return out
+
+
+def _save_message_state(checkpoint_key: str, messages: list) -> None:
+    """Best-effort: persist the in-progress conversation. Never raises — a
+    failure here must not interrupt the agent loop it's trying to protect."""
+    if not checkpoint_key:
+        return
+    try:
+        path = _message_state_path(checkpoint_key)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        serialized = [_serialize_message(m) for m in messages]
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump({
+                "checkpoint_key": checkpoint_key,
+                "saved_at": datetime.datetime.now().isoformat(timespec="seconds"),
+                "messages": serialized,
+            }, f, ensure_ascii=False)
+    except Exception as exc:
+        _log("harness", "MESSAGE_STATE_SAVE_ERROR", f"key={checkpoint_key} err={exc}", level="warning")
+
+
+def _load_message_state(checkpoint_key: str) -> Optional[list]:
+    """Return the persisted messages list for checkpoint_key, or None if
+    absent/corrupt. Corrupt state is treated as absent (fresh start) rather
+    than raising — resumability must never block a retry."""
+    if not checkpoint_key:
+        return None
+    path = _message_state_path(checkpoint_key)
+    if not os.path.exists(path):
+        return None
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        messages = data.get("messages")
+        return messages if isinstance(messages, list) and messages else None
+    except Exception as exc:
+        _log("harness", "MESSAGE_STATE_LOAD_ERROR", f"key={checkpoint_key} err={exc}", level="warning")
+        return None
+
+
+def _clear_message_state(checkpoint_key: str) -> None:
+    """Remove the persisted snapshot — called on any clean run_agent return."""
+    if not checkpoint_key:
+        return
+    try:
+        path = _message_state_path(checkpoint_key)
+        if os.path.exists(path):
+            os.remove(path)
+    except Exception as exc:
+        _log("harness", "MESSAGE_STATE_CLEAR_ERROR", f"key={checkpoint_key} err={exc}", level="warning")
+
+
 def recover_stale_features() -> list[int]:
     """
     On startup, detect features stuck in 'in_progress' from a previous crash.
@@ -693,10 +787,93 @@ def _msg_field(m, field, default=""):
         return m.get(field, default)
     return getattr(m, field, default)
 
+def _msg_tool_calls(m) -> list:
+    """Uniformly read tool_calls off a message that can be dict or pydantic."""
+    if isinstance(m, dict):
+        return m.get("tool_calls") or []
+    return getattr(m, "tool_calls", None) or []
+
+
+def _tool_call_name_args(tc):
+    """Uniformly read (name, arguments) off a tool_call that can be dict or pydantic."""
+    if isinstance(tc, dict):
+        fn = tc.get("function", {}) or {}
+        return fn.get("name", "?"), fn.get("arguments", "")
+    return tc.function.name, tc.function.arguments
+
+
+def _build_deterministic_digest(middle: list) -> str:
+    """
+    Build a digest of the middle message block by extracting facts directly
+    from the messages — no LLM call, nothing paraphrased away.
+
+    This replaces the old "ask a model to summarize in 400 words" approach,
+    which was the root cause of the 2026-06-18 incident on feature 26: a
+    free-text summary has no guarantee it mentions "X is already confirmed",
+    so after every compaction the agent re-explored ground it had already
+    covered, burning iterations until max_iter was hit without ever reaching
+    a verdict. A deterministic list of tool calls/errors/decisions can't lose
+    that information the way a lossy rewrite can.
+    """
+    decisions: list = []
+    calls: list = []
+    errors: list = []
+
+    for m in middle:
+        role = (_msg_field(m, "role", "") or "").lower()
+
+        if role == "assistant":
+            content = _msg_field(m, "content", "") or ""
+            if isinstance(content, str) and content.strip():
+                decisions.append(content.strip()[:200])
+            for tc in _msg_tool_calls(m):
+                name, args = _tool_call_name_args(tc)
+                calls.append(f"{name}({str(args)[:120]})")
+
+        elif role == "tool":
+            content = _msg_field(m, "content", "") or ""
+            if isinstance(content, list):
+                content = json.dumps(content, ensure_ascii=False)
+            content = str(content)
+            flagged = False
+            try:
+                parsed = json.loads(content)
+                if isinstance(parsed, dict) and "error" in parsed:
+                    errors.append(str(parsed["error"])[:200])
+                    flagged = True
+            except Exception:
+                pass
+            if not flagged and ("traceback" in content.lower() or "exception" in content.lower()):
+                errors.append(content[:200])
+
+    lines = ["## Previous context summary (deterministic — extracted directly from messages, not LLM-rewritten)"]
+    lines.append(f"- {len(calls)} tool call(s) already executed in this block, {len(errors)} returned an error.")
+
+    if calls:
+        lines.append("### Tool calls already made (do NOT repeat these unless something changed):")
+        tail_calls = calls[-30:]
+        if len(calls) > len(tail_calls):
+            lines.append(f"  - ... {len(calls) - len(tail_calls)} earlier call(s) omitted (oldest-first) ...")
+        for c in tail_calls:
+            lines.append(f"  - {c}")
+
+    if errors:
+        lines.append("### Errors encountered (already known — don't rediscover, fix or work around):")
+        for e in errors[-10:]:
+            lines.append(f"  - {e}")
+
+    if decisions:
+        lines.append("### Notes / decisions already made:")
+        for d in decisions[-10:]:
+            lines.append(f"  - {d}")
+
+    return "\n".join(lines)
+
+
 def _compact_messages(messages: list, role: str) -> list:
     """
-    When history exceeds COMPACT_THRESHOLD messages, summarize the middle block
-    into a single entry to avoid exceeding the context window.
+    When history exceeds COMPACT_THRESHOLD messages, replace the middle block
+    with a deterministic digest to avoid exceeding the context window.
     Always preserves: system (0), initial task (1), and last COMPACT_KEEP_TAIL messages.
     """
     if len(messages) <= COMPACT_THRESHOLD:
@@ -720,46 +897,20 @@ def _compact_messages(messages: list, role: str) -> list:
     if not middle:
         return messages
 
-    # Build text of the middle block to summarize.
-    middle_text = ""
-    for m in middle:
-        role_label = (_msg_field(m, "role", "?") or "?").upper()
-        content    = _msg_field(m, "content") or ""
-        if isinstance(content, list):
-            content = json.dumps(content, ensure_ascii=False)
-        middle_text += f"[{role_label}]: {str(content)[:300]}\n"
-
     _log(role, "COMPACTING",
          f"Compacting {len(middle)} intermediate messages (total={len(messages)})")
 
     try:
-        summary_response = _call_api_with_fallback(
-            model    = MODEL_BY_ROLE.get("compaction", MODEL),
-            messages = [
-                {"role": "system",
-                 "content": "You are a technical assistant. Concisely summarize the work history of a software agent."},
-                {"role": "user",
-                 "content": (
-                     "Summarize this history in at most 400 words. Preserve: "
-                     "design decisions made, tools executed and their key results, "
-                     "errors encountered and how they were resolved, current state of work.\n\n"
-                     f"{middle_text}"
-                 )}
-            ],
-            tools    = [],
-            role     = "compaction",
-        )
-        if summary_response is not None:
-            _track_usage("compaction", summary_response.usage)
-            summary_text = summary_response.choices[0].message.content or "(no summary)"
-        else:
-            summary_text = "(summary unavailable: all providers exhausted)"
+        summary_text = _build_deterministic_digest(middle)
     except Exception as e:
-        summary_text = f"(summary unavailable: {e})"
+        # Best-effort, never block the pipeline — fall back to a minimal note
+        # rather than crash the agent loop over a digest-formatting bug.
+        summary_text = f"(digest unavailable: {e})"
+        _log(role, "DIGEST_ERROR", str(e), level="warning")
 
     compact_msg = {
         "role": "system",
-        "content": f"## Previous context summary\n{summary_text}"
+        "content": summary_text
     }
 
     compacted = [system_msg, initial_task, compact_msg] + list(tail)
@@ -815,11 +966,28 @@ def _classify_error(error_msg: str) -> str:
 
 def run_agent(system_prompt: str, tools: list, task: str,
               role: str = "agent", color: str = "white",
-              max_iter: int = MAX_ITER_AGENT) -> str:
-    messages = [
-        {"role": "system", "content": system_prompt},
-        {"role": "user",   "content": task}
-    ]
+              max_iter: int = MAX_ITER_AGENT,
+              checkpoint_key: Optional[str] = None) -> str:
+    # Mid-run resumability: if a previous run with this exact checkpoint_key
+    # crashed before reaching a verdict, its message history was snapshotted
+    # to disk — resume from it instead of rebuilding system/user from scratch
+    # and re-paying for every tool call that already happened. checkpoint_key
+    # is None for any caller that hasn't opted in (back-compat: behaves
+    # exactly as before).
+    resumed = _load_message_state(checkpoint_key) if checkpoint_key else None
+    if resumed:
+        messages = resumed
+        _log(role, "RESUME",
+             f"key={checkpoint_key} resumed {len(messages)} messages from a previous crashed run")
+        console.print(
+            f"  [dim]↺ {role}: resuming mid-run from a saved snapshot "
+            f"({len(messages)} messages, no redo)[/]"
+        )
+    else:
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user",   "content": task}
+        ]
     _log(role, "START", task[:120])
     tool_call_errors: list = []
 
@@ -831,6 +999,9 @@ def run_agent(system_prompt: str, tools: list, task: str,
             role     = role,
         )
         if api_response is None:
+            # Provider-level failure, not a normal completion — leave any
+            # saved snapshot in place so a retry with the same checkpoint_key
+            # resumes from here instead of starting the attempt over.
             return f"[ERROR: all LLM providers exhausted for role={role}]"
 
         _track_usage(role, api_response.usage)
@@ -838,6 +1009,7 @@ def run_agent(system_prompt: str, tools: list, task: str,
 
         if not msg.tool_calls:
             _log(role, "DONE", (msg.content or "")[:120])
+            _clear_message_state(checkpoint_key)
             return msg.content or ""
 
         messages.append(msg)
@@ -893,7 +1065,14 @@ def run_agent(system_prompt: str, tools: list, task: str,
                 "content": result
             })
 
+        # Snapshot after this iteration's tool calls are recorded — a crash
+        # past this point loses at most the current iteration, not the whole
+        # attempt. Best-effort and cheap (local disk write, no LLM call).
+        if checkpoint_key:
+            _save_message_state(checkpoint_key, messages)
+
     _log(role, "MAX_ITER", f"Reached iteration limit of {max_iter}", level="warning")
+    _clear_message_state(checkpoint_key)
     if tool_call_errors:
         recent_errors = "\n".join(f"  - {e}" for e in tool_call_errors[-5:])
         return f"[ERROR: max_iter {max_iter} reached]\nRecent tool-call errors:\n{recent_errors}"
@@ -1396,7 +1575,8 @@ def spawn_implementer(feature_id: int, description: str, attempt: int = 1,
                                  system_prompt=impl_cfg.SYSTEM_PROMPT,
                                  task=task, feature_id=feature_id)
     result = run_agent(_agent_ctx["system_prompt"], impl_cfg.TOOLS, _agent_ctx["task"],
-                       role="implementer", color="blue", max_iter=MAX_ITER_IMPL)
+                       role="implementer", color="blue", max_iter=MAX_ITER_IMPL,
+                       checkpoint_key=f"implementer_{feature_id}_{attempt}")
     done = not result.startswith("[ERROR")
     console.print(f"  [blue]🔨 IMPLEMENTER[/] {'[green]✓ done[/]' if done else '[red]✗ error[/]'} → {result[:80]}")
     return result
@@ -1430,7 +1610,8 @@ def spawn_spec_writer(feature_id: int, description: str) -> str:
                                  system_prompt=spec_cfg.SYSTEM_PROMPT,
                                  task=task, feature_id=feature_id)
     result = run_agent(_agent_ctx["system_prompt"], spec_cfg.TOOLS, _agent_ctx["task"],
-                       role="spec_writer", color="cyan", max_iter=MAX_ITER_SPEC)
+                       role="spec_writer", color="cyan", max_iter=MAX_ITER_SPEC,
+                       checkpoint_key=f"spec_writer_{feature_id}_1")
     done = not result.startswith("[ERROR")
     console.print(f"  [cyan]📋 SPEC_WRITER[/] {'[green]✓ spec ready[/]' if done else '[red]✗ error[/]'} → {result[:80]}")
 
@@ -1463,9 +1644,9 @@ def spawn_spec_writer(feature_id: int, description: str) -> str:
     return result
 
 
-def spawn_reviewer(feature_id: int, e2e: bool = True) -> str:
+def spawn_reviewer(feature_id: int, e2e: bool = True, attempt: int = 1) -> str:
     _phase_header("reviewer", "Reviewing", feature_id)
-    _log("reviewer", "SPAWN", f"feature={feature_id} e2e={e2e}")
+    _log("reviewer", "SPAWN", f"feature={feature_id} e2e={e2e} attempt={attempt}")
 
     cwd = os.getcwd()
 
@@ -1522,7 +1703,8 @@ def spawn_reviewer(feature_id: int, e2e: bool = True) -> str:
                                  system_prompt=reviewer_cfg.SYSTEM_PROMPT,
                                  task=task, feature_id=feature_id)
     result = run_agent(_agent_ctx["system_prompt"], reviewer_cfg.TOOLS, _agent_ctx["task"],
-                       role="reviewer", color="magenta", max_iter=max_iter)
+                       role="reviewer", color="magenta", max_iter=max_iter,
+                       checkpoint_key=f"reviewer_{feature_id}_{attempt}")
 
     approved = _verdict_is(result, "APPROVED")
     verdict_color = "green" if approved else "red"
@@ -1532,9 +1714,9 @@ def spawn_reviewer(feature_id: int, e2e: bool = True) -> str:
     return result
 
 
-def spawn_e2e_tester(feature_id: int) -> str:
+def spawn_e2e_tester(feature_id: int, attempt: int = 1) -> str:
     _phase_header("e2e_tester", "Tests E2E", feature_id)
-    _log("e2e_tester", "SPAWN", f"feature={feature_id}")
+    _log("e2e_tester", "SPAWN", f"feature={feature_id} attempt={attempt}")
 
     cwd = os.getcwd()
     arch_context = _load_project_architecture(cwd)
@@ -1553,7 +1735,8 @@ def spawn_e2e_tester(feature_id: int) -> str:
                                  system_prompt=e2e_cfg.SYSTEM_PROMPT,
                                  task=task, feature_id=feature_id)
     result = run_agent(_agent_ctx["system_prompt"], e2e_cfg.TOOLS, _agent_ctx["task"],
-                       role="e2e_tester", color="yellow")
+                       role="e2e_tester", color="yellow",
+                       checkpoint_key=f"e2e_tester_{feature_id}_{attempt}")
 
     passed = _verdict_is(result, "E2E_PASSED")
     color  = "green" if passed else "red"
@@ -1659,7 +1842,7 @@ def run_feature_cycle(feature_id: int, description: str, e2e: bool = True) -> di
             console.print(f"  [dim]↺ skipping e2e attempt {attempt} (already done)[/]")
             e2e_result = "E2E_PASSED"
         else:
-            e2e_result = spawn_e2e_tester(feature_id)
+            e2e_result = spawn_e2e_tester(feature_id, attempt=attempt)
 
         # Allowlist, not denylist: only an explicit "E2E_PASSED" counts as a
         # pass. Anything else — "E2E_FAILED: ...", a max_iter timeout error,
@@ -1686,7 +1869,7 @@ def run_feature_cycle(feature_id: int, description: str, e2e: bool = True) -> di
             continue
 
         # ── Step 4: Review ───────────────────────────────────────────────────
-        review_result = spawn_reviewer(feature_id, e2e=e2e)
+        review_result = spawn_reviewer(feature_id, e2e=e2e, attempt=attempt)
         if _verdict_is(review_result, "APPROVED"):
             gate_block = _fire_gate(
                 "before_approval_finalized",

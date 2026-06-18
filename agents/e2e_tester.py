@@ -55,6 +55,22 @@ HARD RULES:
 - There is no dedicated search/grep tool. To find where a symbol or string is used, call
   run_bash("grep -rn 'pattern' path/") (or rg if available) — do not call a tool named
   grep/search/find directly, it does not exist and will waste iterations.
+
+BUDGET CHECKPOINT — read this before exploring further:
+- You have a limited number of tool calls. If you reach roughly 10 tool calls without
+  having written or updated your test file yet, STOP exploring and write it now with
+  whatever you have already confirmed (spec, impl report, file tree) — do not keep
+  re-reading files "to be sure".
+- If you reach roughly 20 tool calls and still have not run the test suite at least once,
+  run it now even if you suspect the test file is incomplete — a real (possibly failing)
+  result is more useful than more exploration, and you can still iterate on a failure.
+- Write progress/e2e_<feature_id>.md incrementally as you go (scenarios planned, what you
+  ran, what passed/failed) rather than only at the very end — if you run out of iterations,
+  partial evidence on disk is far better than none, and a future retry can pick up from it
+  instead of starting over.
+- If you genuinely cannot reach a clean PASS within your iteration budget, prefer returning
+  "E2E_FAILED: <specific reason + what you verified>" over silently exhausting iterations —
+  a concrete, evidenced failure is actionable; a budget timeout with no report is not.
 """
 
 TOOLS = get_schemas(
