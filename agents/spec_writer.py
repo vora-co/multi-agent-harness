@@ -68,6 +68,15 @@ HARD RULES:
 - If something already exists in the project's source directories (see PROJECT ARCHITECTURE), reference it instead of redefining it.
 - Only write to progress/.
 - Do NOT implement code — only specify.
+
+SCOPE RULE:
+A feature should touch at most ~4-5 files. This keeps each implementer/reviewer
+cycle's context small and makes failures easier to localize and retry. If the
+"Files to create or modify" list for this feature would significantly exceed
+that, do NOT silently write an oversized spec: still produce the spec, but add
+an explicit "## ⚠ Scope warning" section at the top stating the file count and
+recommending the feature be split into smaller sequential features (using
+depends_on) instead.
 """
 
 TOOLS = get_schemas(
