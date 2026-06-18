@@ -518,20 +518,131 @@ def _normalize_args(args: dict) -> dict:
 
 
 _NO_SEARCH_TOOL_HINT = (
-    " This harness has no dedicated search tool — to search file contents or find a "
-    "symbol/string, use run_bash with grep or rg, e.g. "
-    "run_bash(\"grep -rn 'pattern' path/\"). For listing files, use list_files."
+    " This harness has no dedicated search tool — provide a 'pattern' argument and it "
+    "will be auto-translated into a real search, or use run_bash with grep/rg yourself, "
+    "e.g. run_bash(\"grep -rn 'pattern' path/\"). For listing files, use list_files."
 )
 
 # Hallucinated tool names agents commonly reach for instead of run_bash.
 _SEARCH_TOOL_ALIASES = {"grep", "rg", "search", "search_files", "find", "glob", "ripgrep"}
+
+# Filename-search aliases (look for matching paths) vs content-search aliases
+# (look for matching lines inside files).
+_FILENAME_SEARCH_ALIASES = {"find", "glob"}
+
+# Skip these directories and extensions when walking the tree for a search —
+# same exclusion list as list_files() plus common binary/asset extensions
+# that are never useful to grep and just waste time reading.
+_SEARCH_EXCLUDE_DIRS = {"__pycache__", "mutants", "node_modules", ".venv", "venv"}
+_SEARCH_BINARY_EXTS = {
+    ".png", ".jpg", ".jpeg", ".gif", ".ico", ".webp", ".pdf", ".zip", ".tar",
+    ".gz", ".woff", ".woff2", ".ttf", ".eot", ".mp4", ".mp3", ".db", ".sqlite",
+    ".lock", ".pyc",
+}
+_SEARCH_MAX_MATCHES = 100
+_SEARCH_MAX_FILES_SCANNED = 3000
+
+
+def _search_alias(tool_name: str, args: dict) -> str:
+    """
+    Best-effort fix for a recurring failure mode: agents hallucinate a
+    "grep"/"search"/"find" tool instead of using run_bash (despite the HARD
+    RULES telling them not to — see commit 66f1ad8). Returning a plain "tool
+    not found" error burns iterations, because the agent just retries the
+    same intent under a slightly different name until max_iter is exhausted
+    without ever writing or running its actual test (this is exactly what
+    happened on feature 26's e2e_tester run: 30 iterations consumed almost
+    entirely by repeated grep-name variants, "[ERROR: max_iter 30 reached]").
+
+    So instead of only hinting, translate the call's *intent* into a real,
+    pure-Python recursive search (no subprocess/sandbox needed) and return
+    real results. The agent's underlying need — find where a symbol/string
+    is defined or used — gets satisfied even though the literal tool name
+    it guessed doesn't exist. Falls back to the old hint-only error if no
+    usable pattern argument is present, so it's never a hard dependency.
+    """
+    pattern = args.get("pattern") or args.get("query") or args.get("name") or args.get("text")
+    path = args.get("path") or args.get("directory") or args.get("dir") or "."
+    if not pattern:
+        return json.dumps({"error": f"Tool '{tool_name}' not found.{_NO_SEARCH_TOOL_HINT}"})
+
+    try:
+        regex = re.compile(pattern)
+    except re.error:
+        regex = re.compile(re.escape(pattern))
+
+    is_filename_search = tool_name in _FILENAME_SEARCH_ALIASES
+    matches: list = []
+    files_scanned = 0
+    truncated = False
+
+    if os.path.isfile(path):
+        candidates = [path]
+    else:
+        candidates = None  # signal: walk the tree below
+        base = path if os.path.isdir(path) else "."
+
+    def _scan(fpath: str) -> bool:
+        """Returns True if the match cap was hit (caller should stop)."""
+        if is_filename_search:
+            if regex.search(os.path.basename(fpath)):
+                matches.append(fpath)
+            return len(matches) >= _SEARCH_MAX_MATCHES
+        if os.path.splitext(fpath)[1].lower() in _SEARCH_BINARY_EXTS:
+            return False
+        try:
+            with open(fpath, "r", encoding="utf-8", errors="ignore") as f:
+                for lineno, line in enumerate(f, start=1):
+                    if regex.search(line):
+                        matches.append(f"{fpath}:{lineno}: {line.strip()[:200]}")
+                        if len(matches) >= _SEARCH_MAX_MATCHES:
+                            return True
+        except (OSError, IsADirectoryError):
+            pass
+        return False
+
+    if candidates is not None:
+        for fpath in candidates:
+            if _scan(fpath):
+                truncated = True
+    else:
+        for root, dirs, files in os.walk(base):
+            dirs[:] = [d for d in dirs if not d.startswith(".") and d not in _SEARCH_EXCLUDE_DIRS]
+            stop = False
+            for fname in files:
+                files_scanned += 1
+                if _scan(os.path.join(root, fname)):
+                    stop = True
+                    truncated = True
+                    break
+                if files_scanned >= _SEARCH_MAX_FILES_SCANNED:
+                    stop = True
+                    truncated = True
+                    break
+            if stop:
+                break
+
+    return json.dumps({
+        "matches": matches,
+        "truncated": truncated,
+        "note": (
+            f"Tool '{tool_name}' doesn't exist in this harness — auto-translated to a real "
+            f"{'filename' if is_filename_search else 'content'} search for pattern "
+            f"'{pattern}' under '{path}'."
+        ),
+    })
 
 
 def execute_tool(tool_name: str, args: dict) -> str:
     fn = TOOLS_FN.get(tool_name)
     if fn:
         return fn(**_normalize_args(args))
-    error = f"Tool '{tool_name}' not found"
     if tool_name in _SEARCH_TOOL_ALIASES:
-        error += _NO_SEARCH_TOOL_HINT
-    return json.dumps({"error": error})
+        try:
+            return _search_alias(tool_name, _normalize_args(args))
+        except Exception as e:
+            return json.dumps({
+                "error": f"Tool '{tool_name}' not found.{_NO_SEARCH_TOOL_HINT}",
+                "alias_error": str(e),
+            })
+    return json.dumps({"error": f"Tool '{tool_name}' not found"})

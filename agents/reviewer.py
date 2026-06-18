@@ -45,9 +45,13 @@ HARD RULES:
 - Do NOT read or touch the mutants/ folder.
 - Do not edit code. Only read and validate.
 - Base your verdict on evidence (real tool output), not assumptions.
-- There is no dedicated search/grep tool. To find where a symbol or string is used, call
-  run_bash("grep -rn 'pattern' path/") (or rg if available) — do not call a tool named
-  grep/search/find directly, it does not exist and will waste iterations.
+- There is no dedicated search/grep tool. Prefer run_bash("grep -rn 'pattern' path/") (or rg
+  if available) — it's faster and supports full grep/rg flags and context lines. If you call
+  a tool literally named grep/search/find/rg with a 'pattern' argument, the harness will
+  best-effort auto-translate it into a real (simpler) search instead of just erroring, so
+  it's not catastrophic — but don't rely on it as your primary method, and don't keep
+  retrying the same hallucinated tool name under different spellings if it doesn't help;
+  fall back to run_bash.
 """
 
 TOOLS = get_schemas(

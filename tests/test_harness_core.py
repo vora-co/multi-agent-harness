@@ -323,12 +323,45 @@ class TestTools:
         result = json.loads(t.execute_tool("nonexistent_tool", {}))
         assert "error" in result
 
-    def test_execute_tool_grep_hallucination_gets_search_hint(self, monkeypatch, tmp_path):
+    def test_execute_tool_grep_hallucination_with_pattern_runs_real_search(self, monkeypatch, tmp_path):
         # Agents sometimes hallucinate a "grep" tool that doesn't exist in this
-        # harness (only run_bash can grep). The error should point them at
-        # run_bash with grep/rg instead of leaving them to retry blindly.
+        # harness. Root-cause fix (2026-06-18, feature 26 incident): instead of
+        # just erroring and letting the agent burn iterations retrying the same
+        # intent under a different name, translate the call into a real
+        # pure-Python search and return actual matches.
         t = self._load_tools(monkeypatch, tmp_path)
-        result = json.loads(t.execute_tool("grep", {"pattern": "foo"}))
+        (tmp_path / "src").mkdir()
+        (tmp_path / "src" / "api.ts").write_text("export function uploadPetPhoto() {}\n")
+        result = json.loads(t.execute_tool("grep", {"pattern": "uploadPetPhoto", "path": "src"}))
+        assert "error" not in result
+        assert any("uploadPetPhoto" in m for m in result["matches"])
+        assert "auto-translated" in result["note"]
+
+    def test_execute_tool_grep_on_a_file_path_searches_just_that_file(self, monkeypatch, tmp_path):
+        # The actual failing call from the incident passed a file path (not a
+        # directory) as "path" — make sure that's handled directly rather than
+        # silently falling back to a whole-tree walk.
+        t = self._load_tools(monkeypatch, tmp_path)
+        (tmp_path / "api.ts").write_text("export function uploadPetPhoto() {}\n")
+        result = json.loads(t.execute_tool("grep", {"pattern": "uploadPetPhoto", "path": "api.ts"}))
+        assert "error" not in result
+        assert len(result["matches"]) == 1
+        assert "api.ts" in result["matches"][0]
+
+    def test_execute_tool_find_alias_searches_filenames_not_contents(self, monkeypatch, tmp_path):
+        t = self._load_tools(monkeypatch, tmp_path)
+        (tmp_path / "test_feature_26.py").write_text("# irrelevant content\n")
+        (tmp_path / "other.py").write_text("# also irrelevant\n")
+        result = json.loads(t.execute_tool("find", {"pattern": "feature_26", "path": "."}))
+        assert "error" not in result
+        assert any("test_feature_26.py" in m for m in result["matches"])
+        assert not any("other.py" in m and "test_feature_26.py" not in m for m in result["matches"])
+
+    def test_execute_tool_grep_hallucination_without_pattern_falls_back_to_hint(self, monkeypatch, tmp_path):
+        # No pattern arg means there's nothing to translate — fall back to the
+        # old hint-only error rather than guessing.
+        t = self._load_tools(monkeypatch, tmp_path)
+        result = json.loads(t.execute_tool("grep", {}))
         assert "error" in result
         assert "run_bash" in result["error"]
         assert "grep" in result["error"].lower()
