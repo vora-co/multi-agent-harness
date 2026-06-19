@@ -1306,6 +1306,17 @@ def _load_plugins() -> None:
 
     If plugins/ is absent or empty, this function is a no-op.
     """
+    import sys
+    # Critical fix (2026-06-19): harness.py runs as __main__, so plugins doing
+    # `from harness import register_hook` don't find "harness" in sys.modules
+    # and Python re-executes this whole file as a SECOND module object with
+    # its own empty _HOOKS dict. Every register_hook() call then lands on that
+    # phantom copy instead of the one this running process reads from in
+    # _fire/_fire_gate/_fire_transform -- so every plugin hook silently never
+    # fires. Aliasing "harness" to this already-running module before any
+    # plugin loads fixes it.
+    sys.modules.setdefault("harness", sys.modules["__main__"])
+
     import importlib.util
 
     plugin_dir = "plugins"
