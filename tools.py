@@ -258,9 +258,12 @@ def _run_playwright_tests_node(test_path: str, base_url: str, headed: bool, time
     """
     Run E2E tests with Node's @playwright/test via `npx playwright test`.
     Installs @playwright/test and the Chromium browser if not already
-    available. Honors an existing project-level e2e/playwright.config.ts
-    (npx picks it up automatically when run from the project root) rather
-    than assuming a fixed config location.
+    available. Resolves the project's own playwright.config.ts/.js from the
+    resolved e2e_test_dir and passes it explicitly via --config — relying on
+    npx auto-discovery breaks when the repo has more than one
+    playwright.config/spec tree (e.g. e2e/ and frontend/), since Playwright
+    can load specs from both in the same process and raise "Requiring
+    @playwright/test second time".
     """
     check = subprocess.run("npx playwright --version", shell=True, capture_output=True, text=True)
     if check.returncode != 0:
@@ -274,10 +277,19 @@ def _run_playwright_tests_node(test_path: str, base_url: str, headed: bool, time
 
     os.makedirs("tests/screenshots", exist_ok=True)
 
+    layout = resolve_layout()
+    e2e_test_dir = layout.get("e2e_test_dir") or ""
+    config_flag = ""
+    for ext in (".ts", ".js"):
+        candidate = os.path.join(e2e_test_dir, f"playwright.config{ext}")
+        if os.path.exists(candidate):
+            config_flag = f"--config {candidate} "
+            break
+
     headed_flag = "--headed" if headed else ""
     cmd = (
         f"PLAYWRIGHT_BASE_URL={base_url} npx playwright test {test_path} "
-        f"--reporter=line --timeout={timeout_ms} "
+        f"{config_flag}--reporter=line --timeout={timeout_ms} "
         f"{headed_flag} 2>&1"
     )
     try:
