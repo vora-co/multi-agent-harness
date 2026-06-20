@@ -6,7 +6,9 @@ from typing import Optional
 # per-project overrides like SAFE_WRITE_DIRS would silently fall back to
 # their defaults unless the shell had already exported the .env vars itself.
 from dotenv import load_dotenv
-load_dotenv()
+load_dotenv(override=True)  # .env is the source of truth (documented workflow exports it into the
+                            # shell too); without override=True a stale shell-exported var from an
+                            # earlier session silently wins over an edited .env value.
 
 # ─── AUTO-INSTALACIÓN DE DEPENDENCIAS ────────────────────────────────────────
 def _ensure_deps():
@@ -151,7 +153,7 @@ MAX_RETRIES_API    = 3   # Retries on transient API errors (rate limit, timeout)
 MAX_RETRIES_IMPL   = 3   # How many times the implementer can retry a feature
 MAX_RETRIES_REVIEW = 2   # How many times the impl→review cycle repeats before marking "failed"
 MAX_ITER_LEADER    = 30  # Max iterations for the leader loop
-MAX_ITER_AGENT     = 30  # Default — e2e_tester
+MAX_ITER_AGENT     = int(os.getenv("MAX_ITER_AGENT", "30"))  # Default — e2e_tester: override via .env if E2E setup + fix cycles need more iterations
 MAX_ITER_IMPL      = 50  # Implementer: read context + write code + tests
 MAX_ITER_REVIEWER  = 40  # Reviewer: read reports + run tests + mutation testing
 MAX_ITER_SPEC      = int(os.getenv("MAX_ITER_SPEC", "35"))  # Spec writer: override via .env if specs need more iterations

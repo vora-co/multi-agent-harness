@@ -20,12 +20,18 @@ PROTOCOL:
    - Cover at least one sad path (invalid input, visible error state).
    - Use a screenshot call at key points for visual evidence (page.screenshot(path=...) in Python,
      page.screenshot({ path: ... }) in Node).
-5. Start the app if needed using the server command given under STACK COMMANDS in your task:
-   run_bash("<server command from STACK COMMANDS> &")  # already runs from the project root, no cd needed
+5. The app's backend/frontend are normally already running — started by the harness before you
+   were spawned (see PRECOMPUTED CONTEXT for "responding: yes/no"). Do NOT try to start them
+   yourself with run_bash unless PRECOMPUTED CONTEXT explicitly says they are not responding;
+   in that fallback case only, run_bash("<server command from STACK COMMANDS> &") as a last resort
+   (already runs from the project root, no cd needed).
 6. Run the tests with run_playwright_tests(test_path="<path to the file or directory from step 3/4>",
    base_url="http://localhost:8000") — you may omit test_path to fall back to the stack's default E2E directory.
 7. If tests fail:
-   - Read screenshots with read_file if available.
+   - If a Playwright test fails, read error-context.md in the matching test-results/<test-name>/
+     subfolder for the full stack trace and code snippet — that is the authoritative source.
+     Do NOT call read_file on .png screenshots: read_file only supports text and will error on
+     binary files, and this harness's LLM provider has no vision/image input anyway.
    - Fix the test OR report if the bug is in the code (not in the test).
    - Maximum 3 fix attempts.
 8. Write progress/e2e_<feature_id>.md with:
@@ -43,6 +49,11 @@ E2E TESTING PRINCIPLES:
 - An E2E test that passes by chance is worse than one that fails consistently.
 
 HARD RULES:
+- run_bash executes inside an isolated sandbox container with no route to this host's network — a
+  failed ping/curl/route check there NEVER means the host-started backend/frontend are down, it
+  means you checked the wrong network namespace. Never use run_bash to verify backend/frontend
+  reachability. Trust the PRECOMPUTED CONTEXT given at the start of your task, and call
+  run_playwright_tests / take_screenshot directly — those run on the host and can reach localhost.
 - The WORKING DIRECTORY is specified at the start of your task for reference only. NEVER invent
   directory paths, but also never cd into the WORKING DIRECTORY or prefix a command with it —
   run_bash already starts in the project root in every sandbox mode. Each run_bash call is
