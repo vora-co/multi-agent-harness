@@ -1,4 +1,4 @@
-import os, json, subprocess, datetime, re
+import os, json, subprocess, datetime, re, sys
 
 # ─── SECURITY ────────────────────────────────────────────────────────────────
 
@@ -339,8 +339,13 @@ def take_screenshot(url: str, output_path: str = "tests/screenshots/manual.png")
         f"print('screenshot saved to {output_path}')"
     )
     try:
+        # Use sys.executable rather than a hardcoded "python"/"python3" — the
+        # name of the interpreter binary varies by machine (some only have
+        # python3, some only python, some neither on PATH), but sys.executable
+        # is always the exact interpreter already running this process, in
+        # the right venv, with playwright already installed.
         result = subprocess.run(
-            f'python -c "{script}"', shell=True, capture_output=True, text=True, timeout=30
+            f'"{sys.executable}" -c "{script}"', shell=True, capture_output=True, text=True, timeout=30
         )
         if result.returncode == 0:
             return json.dumps({"status": "ok", "path": output_path})
