@@ -246,7 +246,7 @@ def _run_playwright_tests_python(test_path: str, base_url: str, headed: bool, ti
             "returncode": result.returncode,
             "success": result.returncode == 0,
             "screenshots": screenshots,
-            "tip": "If there are screenshots, read them with read_file to see the UI state at failure."
+            "tip": "If the test failed, read error-context.md in the same test-results subfolder for the full stack trace and code context."
         })
     except subprocess.TimeoutExpired:
         return json.dumps({"error": "Timeout: E2E tests took more than 5 minutes."})
@@ -311,9 +311,10 @@ def _run_playwright_tests_node(test_path: str, base_url: str, headed: bool, time
             "returncode": result.returncode,
             "success": result.returncode == 0,
             "screenshots": screenshots,
-            "tip": ("If there are screenshots, read them with read_file to see the UI state at failure. "
-                    "PLAYWRIGHT_BASE_URL is set as a convenience env var, but an existing "
-                    "playwright.config.ts that already sets baseURL explicitly takes precedence.")
+            "tip": ("If the test failed, read error-context.md in the same test-results subfolder for "
+                    "the full stack trace and code context. PLAYWRIGHT_BASE_URL is set as a convenience "
+                    "env var, but an existing playwright.config.ts that already sets baseURL explicitly "
+                    "takes precedence.")
         })
     except subprocess.TimeoutExpired:
         return json.dumps({"error": "Timeout: E2E tests took more than 5 minutes."})
