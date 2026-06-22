@@ -680,6 +680,17 @@ def _serialize_message(m) -> dict:
         ]
         if not out["content"]:
             out["content"] = None
+    # Some providers' "thinking"/extended-reasoning modes (e.g. DeepSeek's
+    # deepseek-reasoner) return a reasoning_content field on the assistant
+    # message alongside content, and require it to be echoed back verbatim
+    # on the next turn or the API rejects the request with 400 ("The
+    # reasoning_content in the thinking mode must be passed back to the
+    # API"). _msg_field's getattr fallback makes this a no-op for any
+    # message/provider that doesn't set the field, so this stays generic
+    # rather than tied to one provider.
+    reasoning_content = _msg_field(m, "reasoning_content", None)
+    if reasoning_content:
+        out["reasoning_content"] = reasoning_content
     return out
 
 
