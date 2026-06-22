@@ -38,6 +38,12 @@ Exact list of paths. For each file:
 # For classes: __init__ with all parameters and their types
 # For functions: name, typed parameters, return type, behavior description
 # Include: what exceptions are raised and under what conditions
+# For ANY endpoint that returns a list: explicitly state its exact response
+# shape — plain array ([...]) or paginated wrapper (e.g. {{data, total, page,
+# page_size}}) — and the matching frontend client function's return type for
+# that same route. This is required, not optional: a backend/frontend shape
+# mismatch here compiles fine and crashes only at runtime (e.g. "x.map is not
+# a function"), so it cannot be caught by type-checking alone.
 ```
 
 ### <file_2.py>
@@ -71,6 +77,10 @@ HARD RULES:
   root — never prefix those with the WORKING DIRECTORY path or with /workspace either.
 - Be precise: method names, types, HTTP status codes, exact error messages.
 - If something already exists in the project's source directories (see PROJECT ARCHITECTURE), reference it instead of redefining it.
+- For ANY endpoint that returns a list (new or modified by this feature), you MUST state its
+  exact response shape (plain array vs paginated wrapper like {{data, total, page, page_size}})
+  and the frontend client function's matching return type — never leave this implicit, even if
+  it seems obvious from context.
 - Only write to progress/.
 - Do NOT implement code — only specify.
 - There is no dedicated search/grep tool. Prefer run_bash("grep -rn 'pattern' path/") (or rg

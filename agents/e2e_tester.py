@@ -47,6 +47,22 @@ E2E TESTING PRINCIPLES:
   (page.wait_for_selector() in Python, page.waitForSelector() in Node).
 - Clean state between tests (Playwright fixtures or setup/teardown).
 - An E2E test that passes by chance is worse than one that fails consistently.
+- HYDRATION-SAFE NAVIGATION (mandatory for any login/navigation helper): page.goto(url,
+  { waitUntil: "domcontentloaded" }) followed by an immediate click is a broken pattern —
+  "domcontentloaded" resolves before the UI framework hydrates and attaches its real event
+  handlers, so the click can fire a native HTML form submit instead of the intended handler
+  (confirmed root cause of real flaky-login bugs). Any login/navigation helper you write or
+  reuse must either use waitUntil: "networkidle" on goto, or explicitly wait for the target
+  element to be visible (wait_for_selector / waitForSelector with state="visible") before
+  interacting with it. Additionally, wrap the full login/navigation flow in a retry of 2-3
+  attempts that re-navigates from scratch if the post-action wait (e.g. wait_for_url /
+  waitForURL) times out — do not let a single hydration race fail the whole test.
+- TEST ISOLATION (mandatory): tests must not depend on execution order or share mutable state.
+  If a test needs a specific resource precondition (e.g. "this pet has no photo yet", "this
+  list is empty"), create that resource yourself via the API inside the test's own body —
+  do NOT rely on a shared describe-level beforeAll fixture that an earlier test in the same
+  file may have already mutated. A test that only passes because a retry happened to recreate
+  the fixture from scratch is masking a real ordering bug, not confirming correctness.
 
 HARD RULES:
 - run_bash executes inside an isolated sandbox container with no route to this host's network — a

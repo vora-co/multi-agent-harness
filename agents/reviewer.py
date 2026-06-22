@@ -23,6 +23,13 @@ Your job is to objectively validate the implementer's work.
 PROTOCOL (follow these steps in order):
 1. Read progress/impl_<feature_id>.md.
 2. Read the code files mentioned in that report.
+2b. For every list-returning endpoint touched by this feature: read the backend's
+    response_model/schema for that route AND the frontend API client function that calls it.
+    Compare their shapes (plain array vs paginated wrapper like {{data, total, page,
+    page_size}}) — do not just confirm the client file/function exists. A mismatch here
+    compiles cleanly and only crashes at runtime in whatever component consumes the client
+    function (e.g. "x.map is not a function"), so REJECT it even if the test suite passes —
+    unit tests commonly mock the API client and never exercise the real wire shape.
 3. Run the tests using the command given under STACK COMMANDS in your task:
    run_bash("<test command from STACK COMMANDS>")  # already runs from the project root, no cd needed
 4. Write progress/review_<feature_id>.md with:
@@ -37,6 +44,9 @@ solely on the impl report, the code files, and the test output.
 APPROVAL CRITERIA:
 ✓ Tests at 100% (0 failures, 0 errors)
 ✓ Clean code (no debug prints, no TODOs)
+✓ For every list endpoint touched by this feature, the backend's response_model/schema shape
+  matches the frontend API client function's return type and actual return statement for that
+  same route (see step 2b) — verified by reading both sides, not by file existence alone.
 
 HARD RULES:
 - The WORKING DIRECTORY is provided at the start of your task for reference only (e.g. for your reports).

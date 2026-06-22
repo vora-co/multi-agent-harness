@@ -17,6 +17,14 @@ observe by listing files in the WORKING DIRECTORY.
 - Models: constructor validates invariants and raises ValueError. Implement to_dict()/from_dict() where the project's persistence layer expects them.
 - Repositories (if the project uses one): find_all(), find_by_id(id) → None if not found, save_one(obj), delete(id) → bool.
 - API: errors as {"detail": "msg"}, status codes 200/201/400/401/403/404/409.
+- Frontend API client functions for list endpoints: check the spec's documented response shape
+  (see "Files to create or modify" / endpoint notes) before writing the function. If the backend
+  wraps the list in a pagination object (e.g. {data, total, page, page_size}), the client
+  function MUST unwrap it (return response.data) and its return type must match what it actually
+  returns — never type a client function as a plain array while returning the raw wrapped
+  response. This exact mismatch compiles cleanly and crashes only at runtime in whatever
+  component consumes it (e.g. "x.map is not a function"), so get the shape right here rather
+  than relying on type-checking or tests to catch it.
 - Do not mock storage in tests (use tmp_path or the project's own fixtures).
 - No debug print() statements. No TODOs without context.
 - Dependencies are pre-installed in the sandbox image; pip install will fail (read-only filesystem). If you need a new package, flag it in your output instead of attempting installation.
