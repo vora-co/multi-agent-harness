@@ -664,7 +664,19 @@ def _search_alias(tool_name: str, args: dict) -> str:
 def execute_tool(tool_name: str, args: dict) -> str:
     fn = TOOLS_FN.get(tool_name)
     if fn:
-        return fn(**_normalize_args(args))
+        # Most individual tool functions already guard their own bodies and
+        # return a json {"error": ...} string on failure, but not all do
+        # (e.g. run_bash delegates straight to sandbox.get_runner().run()
+        # with no try/except at this level). This is the single dispatch
+        # choke point for every tool, current and future, so the safety net
+        # belongs here rather than relying on each tool to add its own —
+        # an uncaught exception must never propagate up into the agent
+        # loop and abort the whole run (best-effort, never block the
+        # pipeline). Mirrors the existing alias-fallback try/except below.
+        try:
+            return fn(**_normalize_args(args))
+        except Exception as e:
+            return json.dumps({"error": f"Tool '{tool_name}' raised an unhandled exception: {e}"})
     if tool_name in _SEARCH_TOOL_ALIASES:
         try:
             return _search_alias(tool_name, _normalize_args(args))
