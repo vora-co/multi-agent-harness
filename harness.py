@@ -308,6 +308,58 @@ _PROVIDERS: list = _build_provider_chain()
 client = _PROVIDERS[0].client
 
 
+# Provider-specific extra message fields that must never cross into a
+# different provider's request. Currently just DeepSeek's thinking-mode
+# reasoning_content (see _serialize_message's comment) — it's required on
+# DeepSeek turns but meaningless (and unvalidated) elsewhere, so on fallback
+# to any other provider it gets stripped rather than forwarded as-is.
+_PROVIDER_ONLY_MSG_FIELDS = {
+    "deepseek": {"reasoning_content"},
+}
+
+
+def _sanitize_messages_for_provider(messages: list, provider_name: str) -> list:
+    """
+    Return a copy of `messages` with any field that's exclusive to a
+    *different* provider than `provider_name` stripped out. Cheap no-op
+    (returns the same list unchanged) when nothing needs stripping, which
+    is the common single-provider case.
+
+    Messages can be plain dicts (user/tool turns, or assistant turns
+    reloaded from a crash checkpoint) or raw ChatCompletionMessage pydantic
+    objects (assistant turns appended live in the same run) — both are
+    handled via _msg_field's generic accessor.
+    """
+    strip_fields = set()
+    for owner, fields in _PROVIDER_ONLY_MSG_FIELDS.items():
+        if owner != provider_name:
+            strip_fields |= fields
+    if not strip_fields:
+        return messages
+
+    needs_copy = any(
+        any(_msg_field(m, f, None) for f in strip_fields) for m in messages
+    )
+    if not needs_copy:
+        return messages
+
+    sanitized = []
+    for m in messages:
+        if any(_msg_field(m, f, None) for f in strip_fields):
+            # _serialize_message returns the SAME dict reference when m is
+            # already a dict (cheap no-op path used elsewhere) — copy first
+            # so popping fields here never mutates the caller's stored
+            # history, which still needs the field if a later call falls
+            # back to the owning provider again.
+            d = dict(_serialize_message(m))
+            for f in strip_fields:
+                d.pop(f, None)
+            sanitized.append(d)
+        else:
+            sanitized.append(m)
+    return sanitized
+
+
 def _call_api_with_fallback(
     model:    str,
     messages: list,
@@ -324,6 +376,12 @@ def _call_api_with_fallback(
 
     Returns the raw API response object on success, or None if every provider
     is exhausted (caller is responsible for handling None).
+
+    Before each call, messages are sanitized for the target provider via
+    _sanitize_messages_for_provider — see _PROVIDER_ONLY_MSG_FIELDS. This
+    only affects the wire payload; the caller's own `messages` list (and
+    any checkpoint saved from it) is left untouched, so a later fallback
+    back to the original provider still has the field available.
     """
     for p_idx, provider in enumerate(_PROVIDERS):
         resolved = provider.resolve_model(model)
@@ -331,11 +389,13 @@ def _call_api_with_fallback(
             _log(role, "PROVIDER_SWITCH",
                  f"switching to provider '{provider.name}' (model={resolved})", level="warning")
 
+        outgoing_messages = _sanitize_messages_for_provider(messages, provider.name)
+
         for attempt in range(MAX_RETRIES_API):
             try:
                 response = provider.client.chat.completions.create(
                     model=resolved,
-                    messages=messages,
+                    messages=outgoing_messages,
                     tools=tools if tools else None,
                     tool_choice="auto" if tools else None,
                 )
@@ -2150,7 +2210,27 @@ def run_leader(user_task: str) -> str:
             _log("leader", "TOOL_CALL", f"{fn_name}({json.dumps(fn_args, ensure_ascii=False)[:100]})")
 
             if fn_name == "run_feature_cycle":
-                cycle_result = run_feature_cycle(**fn_args)
+                # run_feature_cycle orchestrates 4 sub-agents (spec/impl/e2e/
+                # review) plus checkpoint I/O — by far the largest surface
+                # area of any single call in the leader loop. Unlike the
+                # generic execute_tool() path (guarded at its own dispatch
+                # choke point), this is a special-cased direct call, so an
+                # uncaught exception here would propagate straight out of
+                # run_leader and kill the entire session — every other
+                # pending feature included, not just this one. Guard it the
+                # same way: report the failure as this feature's result
+                # (same return shape run_feature_cycle already uses) so the
+                # leader can react and move on instead of the run dying.
+                try:
+                    cycle_result = run_feature_cycle(**fn_args)
+                except Exception as e:
+                    _log("harness", "FEATURE_CYCLE_CRASH",
+                         f"feature={fn_args.get('feature_id')}: {e}", level="error")
+                    cycle_result = {
+                        "approved": False,
+                        "attempts": 0,
+                        "final_verdict": f"[ERROR] run_feature_cycle raised an unhandled exception: {e}",
+                    }
                 result = json.dumps(cycle_result, ensure_ascii=False)
             else:
                 result = execute_tool(fn_name, fn_args)
