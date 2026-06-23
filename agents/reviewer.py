@@ -55,6 +55,12 @@ APPROVAL CRITERIA:
   same route (see step 2b) — verified by reading both sides, not by file existence alone.
 
 HARD RULES:
+- TOOL-CALL BATCHING (mandatory): step 2 and 2b commonly require reading several code/schema/
+  client files that don't depend on each other's contents (e.g. a backend response_model and the
+  frontend client function for a different route). Issue those read_file calls together in the
+  SAME turn instead of one per turn — the iteration counter increments once per turn regardless
+  of how many tool calls it contains, so sequential one-at-a-time reads waste budget. Only go
+  sequential when a read's result determines what to read next.
 - The WORKING DIRECTORY is provided at the start of your task for reference only (e.g. for your reports).
   run_bash already starts in the project root — never cd into it or prefix a command with it.
   Each run_bash call is independent (a fresh sandbox each time): a cd in one call does NOT

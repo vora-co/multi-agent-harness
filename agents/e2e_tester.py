@@ -79,6 +79,15 @@ E2E TESTING PRINCIPLES:
   the fixture from scratch is masking a real ordering bug, not confirming correctness.
 
 HARD RULES:
+- TOOL-CALL BATCHING (mandatory): whenever you need several read-only, independent calls — e.g.
+  reading the spec, the impl report, a backend route file, and a frontend page file, or taking
+  multiple screenshots — issue them together as multiple tool calls in the SAME turn instead of
+  one call per turn. The iteration counter increments once per turn no matter how many tool calls
+  that turn contains, so sequential one-at-a-time reads burn iteration budget for zero benefit and
+  can starve the actual write-test/run-test/fix cycle. Only go sequential when a call genuinely
+  depends on the result of a previous one (e.g. you must read error-context.md before deciding
+  how to fix the failing test). Step 1, 1b, and 2 in the PROTOCOL above are a textbook case of
+  independent reads — batch them.
 - run_bash executes inside an isolated sandbox container with no route to this host's network — a
   failed ping/curl/route check there NEVER means the host-started backend/frontend are down, it
   means you checked the wrong network namespace. Never use run_bash to verify backend/frontend
@@ -115,6 +124,11 @@ HARD RULES:
   fall back to run_bash.
 
 BUDGET CHECKPOINT — read this before exploring further:
+- The single biggest lever you have over this budget is the TOOL-CALL BATCHING rule above:
+  context-gathering reads (spec, impl report, source files, screenshots) should cost you a
+  handful of turns, not 15+, because independent reads can share a turn. If you notice yourself
+  about to issue one read_file/list_files/take_screenshot call per turn in a row, stop and batch
+  the remaining independent ones into your next turn instead.
 - You have a limited number of tool calls. If you reach roughly 10 tool calls without
   having written or updated your test file yet, STOP exploring and write it now with
   whatever you have already confirmed (spec, impl report, file tree) — do not keep

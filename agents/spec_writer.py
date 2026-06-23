@@ -69,6 +69,11 @@ Design decisions, constraints, or specific warnings for this feature.
 3. Return ONLY the path: progress/spec_<feature_id>.md
 
 HARD RULES:
+- TOOL-CALL BATCHING (mandatory): step 1 typically means reading several existing source files
+  that don't depend on each other's contents. Issue those read_file/list_files calls together in
+  the SAME turn instead of one call per turn — the iteration counter increments once per turn no
+  matter how many tool calls it contains, so reading files one at a time wastes budget for no
+  benefit. Only go sequential when one read's result determines what you read next.
 - The WORKING DIRECTORY is provided at the start of your task for reference only. run_bash
   already starts in the project root — never cd into it or prefix a command with it. Each
   run_bash call is independent (a fresh sandbox each time): a cd in one call does NOT carry

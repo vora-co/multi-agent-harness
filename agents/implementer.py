@@ -57,6 +57,13 @@ PROTOCOL (follow these steps in order):
 6. Return ONLY the path: progress/impl_<feature_id>.md
 
 HARD RULES:
+- TOOL-CALL BATCHING (mandatory): when step 1 requires reading several files and none of them
+  depends on what's in another (e.g. two source files you need context from before writing),
+  issue those read_file calls together in the SAME turn rather than one call per turn. The
+  iteration counter increments once per turn regardless of how many tool calls it contains, so
+  one-at-a-time sequential reads waste iteration budget that should go toward the
+  implement/test/fix cycle. Only go sequential when a call genuinely depends on a previous
+  result (e.g. you must see a test failure before deciding what to fix next).
 - The WORKING DIRECTORY is provided at the start of your task for reference only (e.g. for your reports).
   run_bash already starts in the project root — never cd into it or prefix a command with it.
   Each run_bash call is independent (a fresh sandbox each time): a cd in one call does NOT
