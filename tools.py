@@ -554,6 +554,16 @@ _NO_SEARCH_TOOL_HINT = (
 # Hallucinated tool names agents commonly reach for instead of run_bash.
 _SEARCH_TOOL_ALIASES = {"grep", "rg", "search", "search_files", "find", "glob", "ripgrep"}
 
+_NO_EDIT_TOOL_HINT = (
+    " This harness has no dedicated edit tool — provide 'old_string' and 'new_string' "
+    "(or 'content' for a full overwrite) and it will be auto-translated into a real "
+    "read_file + write_file, or use read_file + write_file yourself with the full content."
+)
+
+# Hallucinated edit-tool names agents commonly reach for (Cursor/Claude Code
+# style) instead of read_file + write_file.
+_EDIT_TOOL_ALIASES = {"edit_file", "str_replace_editor", "str_replace"}
+
 # Filename-search aliases (look for matching paths) vs content-search aliases
 # (look for matching lines inside files).
 _FILENAME_SEARCH_ALIASES = {"find", "glob"}
@@ -661,6 +671,80 @@ def _search_alias(tool_name: str, args: dict) -> str:
     })
 
 
+def _edit_alias(tool_name: str, args: dict) -> str:
+    """
+    Best-effort fix for the same failure mode _search_alias addresses, but for
+    edit-style tools. Agents (especially ones trained on Cursor/Claude Code
+    tool conventions) reach for an `edit_file`/`str_replace_editor`/`str_replace`
+    tool that doesn't exist in this harness — which only exposes read_file/
+    write_file/append_file. Returning a bare "tool not found" burns iterations,
+    because the agent retries name variants instead of switching strategy
+    (observed: 25 occurrences of this in a single implementer run, exhausting
+    MAX_ITER_IMPL without writing anything). So translate the call's intent
+    into a real read_file + write_file pair and return real results.
+
+    Falls back to the old hint-only error if the args don't carry enough to
+    act on (no path, or no old_string/new_string/content), so it's never a
+    hard dependency — same spirit as _search_alias's pattern-less fallback.
+    """
+    path = args.get("path") or args.get("file_path") or args.get("file") or args.get("filename")
+    old_string = args.get("old_string") or args.get("old_str") or args.get("old_text")
+    new_string = args.get("new_string") or args.get("new_str") or args.get("new_text")
+    full_content = args.get("content")
+
+    if not path:
+        return json.dumps({"error": f"Tool '{tool_name}' not found.{_NO_EDIT_TOOL_HINT}"})
+
+    # Full-overwrite intent (content given, no old/new pair) — delegate
+    # straight to write_file rather than erroring.
+    if full_content is not None and old_string is None and new_string is None:
+        return write_file(path=path, content=full_content)
+
+    if old_string is None or new_string is None:
+        return json.dumps({
+            "error": f"Tool '{tool_name}' not found.{_NO_EDIT_TOOL_HINT}",
+            "hint": "Missing 'old_string'/'new_string' (or 'content'). Use read_file to "
+                    "get the current content, then write_file with the full updated content.",
+        })
+
+    read_result = json.loads(read_file(path=path))
+    if "error" in read_result:
+        return json.dumps({
+            "error": f"Tool '{tool_name}' not found.{_NO_EDIT_TOOL_HINT} "
+                     f"Also failed to read '{path}': {read_result['error']}",
+        })
+
+    current_content = read_result["content"]
+    occurrences = current_content.count(old_string)
+    if occurrences == 0:
+        return json.dumps({
+            "error": f"Tool '{tool_name}' not found.{_NO_EDIT_TOOL_HINT} "
+                     f"'old_string' was not found in '{path}' — use read_file to confirm the "
+                     f"exact current content before retrying.",
+        })
+    if occurrences > 1:
+        return json.dumps({
+            "error": f"Tool '{tool_name}' not found.{_NO_EDIT_TOOL_HINT} "
+                     f"'old_string' appears {occurrences} times in '{path}', which is ambiguous — "
+                     f"include more surrounding context in 'old_string' to make it unique, or use "
+                     f"read_file + write_file with the full content.",
+        })
+
+    updated_content = current_content.replace(old_string, new_string, 1)
+    write_result = json.loads(write_file(path=path, content=updated_content))
+    if "error" in write_result:
+        return json.dumps({"error": write_result["error"]})
+
+    return json.dumps({
+        "status": "ok",
+        "path": path,
+        "note": (
+            f"Tool '{tool_name}' doesn't exist in this harness — auto-translated to a real "
+            f"read_file + write_file replacement."
+        ),
+    })
+
+
 def execute_tool(tool_name: str, args: dict) -> str:
     fn = TOOLS_FN.get(tool_name)
     if fn:
@@ -683,6 +767,14 @@ def execute_tool(tool_name: str, args: dict) -> str:
         except Exception as e:
             return json.dumps({
                 "error": f"Tool '{tool_name}' not found.{_NO_SEARCH_TOOL_HINT}",
+                "alias_error": str(e),
+            })
+    if tool_name in _EDIT_TOOL_ALIASES:
+        try:
+            return _edit_alias(tool_name, _normalize_args(args))
+        except Exception as e:
+            return json.dumps({
+                "error": f"Tool '{tool_name}' not found.{_NO_EDIT_TOOL_HINT}",
                 "alias_error": str(e),
             })
     return json.dumps({"error": f"Tool '{tool_name}' not found"})

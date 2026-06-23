@@ -154,8 +154,8 @@ MAX_RETRIES_IMPL   = 3   # How many times the implementer can retry a feature
 MAX_RETRIES_REVIEW = 2   # How many times the impl→review cycle repeats before marking "failed"
 MAX_ITER_LEADER    = 30  # Max iterations for the leader loop
 MAX_ITER_AGENT     = int(os.getenv("MAX_ITER_AGENT", "30"))  # Default — e2e_tester: override via .env if E2E setup + fix cycles need more iterations
-MAX_ITER_IMPL      = 50  # Implementer: read context + write code + tests
-MAX_ITER_REVIEWER  = 40  # Reviewer: read reports + run tests + mutation testing
+MAX_ITER_IMPL      = int(os.getenv("MAX_ITER_IMPL", "50"))  # Implementer: read context + write code + tests — override via .env
+MAX_ITER_REVIEWER  = int(os.getenv("MAX_ITER_REVIEWER", "40"))  # Reviewer: read reports + run tests + mutation testing — override via .env
 MAX_ITER_SPEC      = int(os.getenv("MAX_ITER_SPEC", "35"))  # Spec writer: override via .env if specs need more iterations
 RETRY_BACKOFF      = [2, 4, 8]  # seconds between API retries
 
@@ -1828,7 +1828,7 @@ def spawn_reviewer(feature_id: int, e2e: bool = True, attempt: int = 1) -> str:
             "- Approve only if the report indicates success AND the test run (or, where genuinely\n"
             "  inapplicable, the syntax check) confirms it.\n"
         ).format(fid=feature_id, test_runner=_LAYOUT["test_runner"])
-        max_iter = 15  # lightweight review — doesn't need more
+        max_iter = int(os.getenv("MAX_ITER_REVIEWER_LITE", "15"))  # lightweight review — doesn't need more, override via .env
     else:
         validation_mode = (
             "Review the implementer's work for feature #{fid}.\n"
