@@ -209,13 +209,20 @@ def _run_playwright_tests_python(test_path: str, base_url: str, headed: bool, ti
     Run E2E tests with pytest-playwright. Installs dependencies if not
     available. Automatically captures screenshots on failures.
     """
+    # Use sys.executable rather than a hardcoded "python"/"pip" — the name of
+    # the interpreter/pip binary varies by machine (some only have python3,
+    # some only python, some neither on PATH), but sys.executable is always
+    # the exact interpreter already running this process, in the right venv.
+    # Same fix already applied to take_screenshot() below.
+    py = f'"{sys.executable}"'
+
     # Check/install pytest-playwright
-    check = subprocess.run(f"python -m pytest --co -q {test_path} 2>&1 | head -5",
+    check = subprocess.run(f"{py} -m pytest --co -q {test_path} 2>&1 | head -5",
                            shell=True, capture_output=True, text=True)
     if "No module named" in check.stdout or "playwright" not in check.stdout.lower():
         install = subprocess.run(
-            "pip install pytest-playwright playwright --quiet --break-system-packages && "
-            "playwright install chromium --with-deps",
+            f"{py} -m pip install pytest-playwright playwright --quiet --break-system-packages && "
+            f"{py} -m playwright install chromium --with-deps",
             shell=True, capture_output=True, text=True, timeout=120
         )
         if install.returncode != 0:
@@ -225,7 +232,7 @@ def _run_playwright_tests_python(test_path: str, base_url: str, headed: bool, ti
 
     headed_flag = "--headed" if headed else ""
     cmd = (
-        f"python -m pytest {test_path} -v --tb=short "
+        f"{py} -m pytest {test_path} -v --tb=short "
         f"--base-url={base_url} "
         f"--screenshot=only-on-failure "
         f"--output=tests/screenshots "
