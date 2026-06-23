@@ -76,6 +76,10 @@ HARD RULES:
   run_bash("cd backend && ls"). read_file/list_files also take paths relative to the project
   root — never prefix those with the WORKING DIRECTORY path or with /workspace either.
 - Be precise: method names, types, HTTP status codes, exact error messages.
+- Type signatures you write must be Python 3.9-compatible: use `Optional[X]`/`Union[X, Y]`
+  (`typing`) and `List[str]`/`Dict[str, int]` — never PEP 604 `X | None`/`X | Y` or bare
+  `list[str]`/`dict[str, int]`, which crash at runtime on Python 3.9. The implementer copies
+  signatures from this spec, so this syntax choice propagates directly into generated code.
 - If something already exists in the project's source directories (see PROJECT ARCHITECTURE), reference it instead of redefining it.
 - For ANY endpoint that returns a list (new or modified by this feature), you MUST state its
   exact response shape (plain array vs paginated wrapper like {{data, total, page, page_size}})

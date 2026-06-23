@@ -12,6 +12,8 @@ commands, and directory map given there, not any assumption about file layout.
 - Always python3 where applicable. Type hints. Errors as {"detail": "msg"}.
 - Repositories (if used): find_by_id → None if not found. delete → bool.
 - No debug print() statements. No TODOs without context.
+- Type hints must be Python 3.9-compatible: `Optional[X]`/`Union[X, Y]`/`List[str]`/`Dict[str, int]`
+  from `typing`, never PEP 604 `X | None`/`X | Y` or bare `list[str]`/`dict[str, int]`.
 """
 
 SYSTEM_PROMPT = f"""You are the REVIEWER agent of this repository.
@@ -44,6 +46,10 @@ solely on the impl report, the code files, and the test output.
 APPROVAL CRITERIA:
 ✓ Tests at 100% (0 failures, 0 errors)
 ✓ Clean code (no debug prints, no TODOs)
+✓ No PEP 604 union syntax (`X | None`, `X | Y`) or bare builtin generics (`list[str]`,
+  `dict[str, int]`) in any touched .py file — must use `typing.Optional`/`Union`/`List`/`Dict`
+  for Python 3.9 compatibility. REJECT if found, even if tests pass (this only crashes on a
+  3.9 interpreter, which the sandbox running these tests may not be).
 ✓ For every list endpoint touched by this feature, the backend's response_model/schema shape
   matches the frontend API client function's return type and actual return statement for that
   same route (see step 2b) — verified by reading both sides, not by file existence alone.

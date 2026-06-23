@@ -7,6 +7,10 @@ using Playwright to simulate real interactions with the app.
 
 PROTOCOL:
 1. Read progress/impl_<feature_id>.md to understand what was implemented.
+1b. Read progress/spec_<feature_id>.md (the feature's own spec) to confirm: (a) whether automated
+   tests were even requested for this feature, and (b) the exact endpoints, roles, and fields the
+   spec and implementation actually call for. This is your grounding source alongside step 1 —
+   do not skip it.
 2. Read the relevant unit test files (see the test directory in your injected STACK COMMANDS / layout) to understand covered cases —
    E2E tests should complement, NOT duplicate, unit tests.
 3. Use the E2E test directory and file convention given under STACK COMMANDS in your task (default: tests/e2e/ with
@@ -20,6 +24,16 @@ PROTOCOL:
    - Cover at least one sad path (invalid input, visible error state).
    - Use a screenshot call at key points for visual evidence (page.screenshot(path=...) in Python,
      page.screenshot({ path: ... }) in Node).
+   - GROUNDING RULE (mandatory): before writing any HTTP call, endpoint path, or user role into the
+     test, verify it actually exists — by reading the real backend route files (see your injected
+     PROJECT ARCHITECTURE / STACK COMMANDS for the API directory, e.g. backend/app/api/) and/or the
+     feature's own progress/spec_<feature_id>.md (step 1b). Do NOT invent a plausible-sounding
+     contract from general conventions (e.g. assuming a generic POST /api/v1/auth/register
+     self-registration endpoint, or a generic customer-facing role like "cliente") just because it
+     sounds idiomatic — if it isn't in the actual route files or the spec, it doesn't exist for this
+     project. If the spec for this feature doesn't call for automated tests at all, either skip
+     generating one, or generate tests strictly from the spec's own manual test-case descriptions —
+     never invent new endpoints/roles/fields beyond what the spec and implementation actually contain.
 5. The app's backend/frontend are normally already running — started by the harness before you
    were spawned (see PRECOMPUTED CONTEXT for "responding: yes/no"). Do NOT try to start them
    yourself with run_bash unless PRECOMPUTED CONTEXT explicitly says they are not responding;
@@ -76,6 +90,10 @@ HARD RULES:
   independent (a fresh sandbox each time): a cd in one call does NOT carry over to the next, so
   to work inside a subdirectory, chain it in one command, e.g. run_bash("cd frontend && npm test").
 - Always use python3, never python.
+- Python 3.9-COMPATIBLE type hints only in any .py test file you write: NEVER use PEP 604
+  union syntax (`X | None`, `X | Y`) or bare builtin generics (`list[str]`, `dict[str, int]`)
+  — these crash at import/collection time on a Python 3.9 interpreter. Use `Optional[X]`/
+  `Union[X, Y]`/`List[str]`/`Dict[str, int]` from `typing` instead.
 - Do not read anything inside mutants/ — those are temporary mutmut files.
 - Do not edit application code (backend or frontend). If you find a bug, report it with evidence (screenshot).
 - Do not modify existing unit tests.

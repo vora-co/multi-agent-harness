@@ -14,6 +14,12 @@ observe by listing files in the WORKING DIRECTORY.
 ## CONVENTIONS
 - Python 3.9+ where applicable. Always use python3, never python.
 - Type hints on public functions. Docstrings on classes.
+- Python 3.9-COMPATIBLE type hints only: NEVER use PEP 604 union syntax (`X | None`, `X | Y`)
+  or bare builtin generics (`list[str]`, `dict[str, int]`) as annotations — these only evaluate
+  at runtime on Python 3.10+, and some downstream projects target a 3.9 dev venv, where this
+  syntax crashes at import/collection time with `TypeError: unsupported operand type(s) for |`.
+  Always `from typing import Optional, Union, List, Dict` and use `Optional[X]`/`Union[X, Y]`
+  and `List[str]`/`Dict[str, int]` instead. This applies to every generated .py file, including tests.
 - Models: constructor validates invariants and raises ValueError. Implement to_dict()/from_dict() where the project's persistence layer expects them.
 - Repositories (if the project uses one): find_all(), find_by_id(id) → None if not found, save_one(obj), delete(id) → bool.
 - API: errors as {"detail": "msg"}, status codes 200/201/400/401/403/404/409.
