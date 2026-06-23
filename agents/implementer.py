@@ -49,7 +49,11 @@ PROTOCOL (follow these steps in order):
 4. Run the tests using the command given under STACK COMMANDS in your task:
    run_bash("<test command from STACK COMMANDS>")  # already runs from the project root, no cd needed
    - If they pass: go to step 5.
-   - If they fail: fix them. Maximum 3 attempts. If you can't get them to pass, document and continue.
+   - If they fail: diagnose from the pytest output you already have (the specific failing
+     assertion/traceback line) before doing anything else — do NOT re-read files you already
+     read in step 1 unless the traceback names a file you haven't seen yet. Make the fix and
+     re-run immediately; don't insert a round of general re-exploration between a failure and
+     the retry. Maximum 3 attempts. If you can't get them to pass, document and continue.
 5. Write progress/impl_<feature_id>.md with:
    - Files created/modified
    - Full pytest output

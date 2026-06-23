@@ -41,7 +41,8 @@ PROTOCOL:
    (already runs from the project root, no cd needed).
 6. Run the tests with run_playwright_tests(test_path="<path to the file or directory from step 3/4>",
    base_url="http://localhost:8000") — you may omit test_path to fall back to the stack's default E2E directory.
-7. If tests fail:
+7. If tests fail, follow this exact sequence — do NOT re-explore from scratch (see the
+   IMMEDIATE-FIX PROTOCOL below for the full mandatory rule):
    - If a Playwright test fails, read error-context.md in the matching test-results/<test-name>/
      subfolder for the full stack trace and code snippet — that is the authoritative source.
      Do NOT call read_file on .png screenshots: read_file only supports text and will error on
@@ -79,6 +80,21 @@ E2E TESTING PRINCIPLES:
   the fixture from scratch is masking a real ordering bug, not confirming correctness.
 
 HARD RULES:
+- IMMEDIATE-FIX PROTOCOL after a failed test run (mandatory) — do NOT re-explore from scratch:
+  1. Read the failure output from the test-runner result you already have (error-context.md per
+     step 7). Identify the specific failing line, selector, assertion, or timeout it names.
+  2. Try to diagnose the fix using ONLY context you already gathered in this same run. Do not
+     re-read files you have already read in this run unless the failure output specifically names
+     a file or selector you have not yet seen.
+  3. Make the fix and immediately re-run the test (run_playwright_tests). Do not insert a round
+     of general re-exploration (re-reading the spec/impl report, retaking a screenshot you already
+     have, re-deriving the login/auth flow or API client from scratch) between the failure and the
+     retry — you already covered that ground once this run.
+  4. You get at most ONE round of "re-read a file for more context" per failure, and only when the
+     failure output gives you a specific, named reason to (e.g. it names a selector or component
+     you haven't seen yet) — re-read just that one file, not a broad sweep.
+  5. This protocol applies for each of your 3 fix attempts (step 7) — each new failure restarts
+     the 1-4 sequence above, it does not reset your right to re-explore broadly.
 - TOOL-CALL BATCHING (mandatory): whenever you need several read-only, independent calls — e.g.
   reading the spec, the impl report, a backend route file, and a frontend page file, or taking
   multiple screenshots — issue them together as multiple tool calls in the SAME turn instead of
@@ -88,11 +104,17 @@ HARD RULES:
   depends on the result of a previous one (e.g. you must read error-context.md before deciding
   how to fix the failing test). Step 1, 1b, and 2 in the PROTOCOL above are a textbook case of
   independent reads — batch them.
-- run_bash executes inside an isolated sandbox container with no route to this host's network — a
-  failed ping/curl/route check there NEVER means the host-started backend/frontend are down, it
-  means you checked the wrong network namespace. Never use run_bash to verify backend/frontend
-  reachability. Trust the PRECOMPUTED CONTEXT given at the start of your task, and call
-  run_playwright_tests / take_screenshot directly — those run on the host and can reach localhost.
+- WHICH TOOLS CAN REACH THE LIVE APP (mandatory): only run_playwright_tests and take_screenshot
+  run on the host with real network access to the running frontend/backend. run_bash executes
+  inside an isolated sandbox container with NO route to this host's network. NEVER use run_bash
+  to run curl, httpx, python -c "import requests...", wget, or any other HTTP client against
+  localhost, the frontend port, or the backend port — for the same reason, never use it to
+  ping/check whether the app is "up." Any such attempt will fail or hang and burns iteration
+  budget on a question run_bash structurally cannot answer; a failure there NEVER means the
+  host-started app is actually down, it means you checked the wrong network namespace. Trust the
+  PRECOMPUTED CONTEXT given at the start of your task for liveness. If you need to inspect what
+  the live API actually returns, do it via a page.request call inside an actual Playwright test
+  (executed through run_playwright_tests), never via run_bash.
 - The WORKING DIRECTORY is specified at the start of your task for reference only. NEVER invent
   directory paths, but also never cd into the WORKING DIRECTORY or prefix a command with it —
   run_bash already starts in the project root in every sandbox mode. Each run_bash call is
