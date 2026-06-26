@@ -73,6 +73,12 @@ HARD RULES:
 - Do NOT read or touch the mutants/ folder.
 - Do not edit code. Only read and validate.
 - Base your verdict on evidence (real tool output), not assumptions.
+- FILE PATH VERIFICATION (mandatory): never infer a file's exact name, extension, or casing from
+  convention or memory. Before reading a file you have not already confirmed exists in this run,
+  use list_files on its parent directory (or reuse a listing you already have from this same run)
+  to get the real filename. If read_file ever errors, do NOT retry with a guessed variant — read
+  the "hint" field in the error (it lists the real files in that directory) and use the exact name
+  from there. Never guess the same path twice.
 - There is no dedicated search/grep tool. Prefer run_bash("grep -rn 'pattern' path/") (or rg
   if available) — it's faster and supports full grep/rg flags and context lines. If you call
   a tool literally named grep/search/find/rg with a 'pattern' argument, the harness will

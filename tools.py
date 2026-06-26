@@ -69,6 +69,17 @@ def read_file(path: str = None, limit: int = None, offset: int = 0,
         if limit:
             lines = lines[:limit]
         return json.dumps({"content": "".join(lines), "path": path})
+    except FileNotFoundError as e:
+        parent = os.path.dirname(path) or "."
+        try:
+            siblings = sorted(os.listdir(parent))
+        except Exception:
+            siblings = []
+        return json.dumps({
+            "error": str(e),
+            "hint": f"'{path}' does not exist. Files actually in '{parent}': {siblings}. "
+                    f"Do not guess another extension/spelling — pick the exact name from this list."
+        })
     except Exception as e:
         return json.dumps({"error": str(e)})
 

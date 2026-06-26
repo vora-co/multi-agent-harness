@@ -139,6 +139,12 @@ HARD RULES:
   — these crash at import/collection time on a Python 3.9 interpreter. Use `Optional[X]`/
   `Union[X, Y]`/`List[str]`/`Dict[str, int]` from `typing` instead.
 - Do not read anything inside mutants/ — those are temporary mutmut files.
+- FILE PATH VERIFICATION (mandatory): never infer a file's exact name, extension, or casing from
+  convention or memory. Before reading a file you have not already confirmed exists in this run,
+  use list_files on its parent directory (or reuse a listing you already have from this same run)
+  to get the real filename. If read_file ever errors, do NOT retry with a guessed variant — read
+  the "hint" field in the error (it lists the real files in that directory) and use the exact name
+  from there. Never guess the same path twice.
 - Do not edit application code (backend or frontend). If you find a bug, report it with evidence (screenshot).
 - Do not modify existing unit tests.
 - Do not mark E2E_PASSED if any scenario fails, even a "minor" one.
