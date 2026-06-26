@@ -72,6 +72,19 @@ E2E TESTING PRINCIPLES:
   interacting with it. Additionally, wrap the full login/navigation flow in a retry of 2-3
   attempts that re-navigates from scratch if the post-action wait (e.g. wait_for_url /
   waitForURL) times out — do not let a single hydration race fail the whole test.
+- FORM FILL AFTER NAVIGATION (mandatory, applies to every form fill in every test, not just
+  login): when a test navigates to a page it is about to fill a form on, use
+  page.goto(url, wait_until="networkidle") — never wait_until="domcontentloaded", which resolves
+  before client-side hydration finishes on "use client" components with controlled inputs
+  (value={state} + onChange). Under Docker, where the app under test compiles routes on first hit
+  and hydrates slower than a bare-metal dev server, .fill() can set the DOM value before hydration
+  completes, and hydration then resets the input back to React's internal (empty) state — silently
+  wiping the typed value before the submit click fires, which surfaces as the browser's native
+  "Please fill out this field" tooltip and looks like a wrong selector/value, not a timing race.
+  After every .fill() call on any controlled input, before clicking submit, verify the value
+  actually stuck: expect(locator).to_have_value(expected_value, timeout=5000). This auto-retries
+  and acts as a real wait for hydration to settle — a fixed wait_for_timeout() sleep or a blind
+  retry loop that re-runs fill-then-click without ever checking the actual condition does not.
 - TEST ISOLATION (mandatory): tests must not depend on execution order or share mutable state.
   If a test needs a specific resource precondition (e.g. "this pet has no photo yet", "this
   list is empty"), create that resource yourself via the API inside the test's own body —

@@ -31,6 +31,34 @@ observe by listing files in the WORKING DIRECTORY.
   response. This exact mismatch compiles cleanly and crashes only at runtime in whatever
   component consumes it (e.g. "x.map is not a function"), so get the shape right here rather
   than relying on type-checking or tests to catch it.
+- REACT/NEXT.JS HOOK PLACEMENT (mandatory, applies to every .tsx/.jsx component you write or edit):
+  every useState, useEffect, useCallback, useMemo, useContext, useRef, or any other hook call MUST
+  appear at the very top of the function component, before any other statement that could change
+  which lines execute on a re-render. NEVER place a conditional `if (...) return ...;` (or
+  `if (...) { return; }`) between two hook calls — if the component needs to render nothing under
+  some condition (modal closed, wrong role, data not loaded, etc.), call ALL hooks first, then put
+  every early-return guard after the last hook call. This holds even when the guard "logically
+  belongs" right after the data it checks (e.g. checking user.role right after useAuth()) — logical
+  proximity to the data is not a valid reason to place a guard before later hooks. Violating this
+  passes any lint that only checks for hooks inside loops/conditionals, but React still throws
+  "Rendered more hooks than during the previous render" the instant the guard's condition flips,
+  which Next.js renders as a full-page dev error overlay instead of the component. Before finishing
+  any component that has both hooks and an early-return guard, re-read it top-to-bottom and verify
+  every line above the first early-return is only a hook call, a prop destructure, or a plain const
+  derived from props/hooks with no side effects — never a guard.
+- RAW SQL INSERT COLUMN COMPLETENESS (mandatory, applies to every raw SQL `INSERT INTO "<table>"
+  (...)` statement you write or edit): before writing or finishing the statement, find that table's
+  CREATE TABLE definition in the migration files and read its FULL column list — not just the
+  columns implied by the request/response schema you're working from. For every column that is
+  NOT NULL with no DEFAULT, your INSERT's column list and params dict MUST include a value for it
+  — taken from the request body, derived from the authenticated session (e.g. tenant_id), or
+  generated server-side (e.g. uuid.uuid4() for a surrogate ID column that never appears in any
+  request schema). If another endpoint in the same codebase already inserts into the same table,
+  read that endpoint's INSERT first and match its full column list — never write a narrower INSERT
+  than an existing, working one for the same table. A generic try/except around the INSERT does
+  NOT excuse an incomplete column list: a caught database error surfaced as a generic "conflict" or
+  "creation failed" response is a sign the INSERT itself is wrong, not a sign the error handling is
+  doing its job.
 - Do not mock storage in tests (use tmp_path or the project's own fixtures).
 - No debug print() statements. No TODOs without context.
 - Dependencies are pre-installed in the sandbox image; pip install will fail (read-only filesystem). If you need a new package, flag it in your output instead of attempting installation.
