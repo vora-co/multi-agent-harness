@@ -59,6 +59,24 @@ observe by listing files in the WORKING DIRECTORY.
   NOT excuse an incomplete column list: a caught database error surfaced as a generic "conflict" or
   "creation failed" response is a sign the INSERT itself is wrong, not a sign the error handling is
   doing its job.
+- RAW SQL COLUMN EXISTENCE + RETURNING SAFETY (mandatory, applies to every raw SQL `SELECT`,
+  `UPDATE ... SET`, or `RETURNING` clause you write or edit, and to every Pydantic
+  request/response model that maps 1:1 onto a database table): before trusting a field name —
+  whether you are writing it yourself or reusing an existing Pydantic model / SQL statement
+  from an earlier feature — grep the migration files for that table's actual CREATE TABLE /
+  ALTER TABLE definition and confirm every field you reference is a real column. An existing
+  model or query "looking established" (already in the codebase, referenced by a previous
+  feature) is NOT evidence it's correct: a phantom field can ship silently if the feature that
+  introduced it had `e2e: false` and its unit tests mock the DB session — the mismatch then
+  resurfaces, unrelated-looking, in a LATER feature that reuses the same file and finally gets
+  real E2E coverage.
+  Separately: never combine `RETURNING *` (or `SELECT *`) with positional tuple/row indexing
+  (`row[0]`, `row[1]`, ...). `RETURNING *` returns columns in the table's physical definition
+  order, not the order of your SET clause or INSERT column list, so positional access silently
+  breaks the moment those orders diverge — feeding the wrong Python type into a Pydantic
+  response field (e.g. a UUID into a `str`), which FastAPI surfaces as an opaque 500 with no
+  detail. Always use an explicit column list in RETURNING/SELECT that matches your positional
+  access exactly, e.g. `RETURNING col_a, col_b, col_c`.
 - Do not mock storage in tests (use tmp_path or the project's own fixtures).
 - No debug print() statements. No TODOs without context.
 - Dependencies are pre-installed in the sandbox image; pip install will fail (read-only filesystem). If you need a new package, flag it in your output instead of attempting installation.
