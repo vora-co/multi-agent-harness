@@ -171,9 +171,50 @@ RETRY_BACKOFF      = [2, 4, 8]  # seconds between API retries
 COMPACT_THRESHOLD  = 24  # accumulated messages before compacting
 COMPACT_KEEP_TAIL  = 8   # recent messages to preserve intact after compacting
 
-# DeepSeek pricing (USD per million tokens, cache miss):
-_PRICE_INPUT  = 0.27 / 1_000_000
-_PRICE_OUTPUT = 1.10 / 1_000_000
+# ─── PER-MODEL PRICING ───────────────────────────────────────────────────────
+# USD per token (not per million), keyed by the model name that actually
+# generated a given response — i.e. api_response.model, which reflects any
+# LLM_MODEL_MAP provider translation (e.g. "gpt-4o" after a fallback to
+# openai), not necessarily the canonical MODEL_BY_ROLE name that was
+# requested. MODEL_BY_ROLE lets each role run a different model, and
+# LLM_FALLBACK_CHAIN lets a single role land on different providers across a
+# session, so a single global price is only an approximation once more than
+# one model is actually in play. Any model not listed here falls back to
+# deepseek-v4-pro pricing — see _price_for_model, which also logs a one-time
+# warning per unlisted model per session.
+MODEL_PRICING: dict[str, dict[str, float]] = {
+    "deepseek-v4-pro":         {"input_price": 0.27  / 1_000_000, "output_price": 1.10  / 1_000_000},
+    "deepseek-v4-flash":       {"input_price": 0.07  / 1_000_000, "output_price": 0.28  / 1_000_000},
+    "gpt-4o":                  {"input_price": 2.50  / 1_000_000, "output_price": 10.00 / 1_000_000},
+    "gpt-4o-mini":             {"input_price": 0.15  / 1_000_000, "output_price": 0.60  / 1_000_000},
+    "llama-3.3-70b-versatile": {"input_price": 0.59  / 1_000_000, "output_price": 0.79  / 1_000_000},
+    "llama-3.1-8b-instant":    {"input_price": 0.05  / 1_000_000, "output_price": 0.08  / 1_000_000},
+}
+
+_DEFAULT_PRICING_MODEL = "deepseek-v4-pro"  # fallback pricing for any model not in MODEL_PRICING
+
+# Models already warned about this session — log the fallback once per model,
+# not on every call, to avoid spamming progress/harness.log in a long run.
+_UNKNOWN_PRICING_MODELS_WARNED: set = set()
+
+
+def _price_for_model(model_name: str) -> dict[str, float]:
+    """
+    Look up {input_price, output_price} (USD/token) for a model.
+    Falls back to MODEL_PRICING[_DEFAULT_PRICING_MODEL] for any model not
+    listed, logging a one-time-per-session warning so silent cost drift in
+    mixed-model/mixed-provider runs is noticeable instead of just wrong.
+    """
+    pricing = MODEL_PRICING.get(model_name)
+    if pricing is not None:
+        return pricing
+    if model_name not in _UNKNOWN_PRICING_MODELS_WARNED:
+        _UNKNOWN_PRICING_MODELS_WARNED.add(model_name)
+        _log("harness", "UNKNOWN_MODEL_PRICING",
+             f"no pricing entry for model='{model_name}' — using "
+             f"'{_DEFAULT_PRICING_MODEL}' pricing as a fallback; reported cost "
+             f"for this model is approximate", level="warning")
+    return MODEL_PRICING[_DEFAULT_PRICING_MODEL]
 
 # ─── STRUCTURED LOGGING ──────────────────────────────────────────────────────
 logging.basicConfig(
@@ -431,12 +472,12 @@ def _call_api_with_fallback(
 
 # ─── COST OBSERVABILITY ──────────────────────────────────────────────────────
 _SESSION_COSTS: dict = {
-    "leader":       {"prompt_tokens": 0, "completion_tokens": 0, "calls": 0},
-    "spec_writer":  {"prompt_tokens": 0, "completion_tokens": 0, "calls": 0},
-    "implementer":  {"prompt_tokens": 0, "completion_tokens": 0, "calls": 0},
-    "reviewer":     {"prompt_tokens": 0, "completion_tokens": 0, "calls": 0},
-    "e2e_tester":   {"prompt_tokens": 0, "completion_tokens": 0, "calls": 0},
-    "compaction":   {"prompt_tokens": 0, "completion_tokens": 0, "calls": 0},
+    "leader":       {"prompt_tokens": 0, "completion_tokens": 0, "calls": 0, "cost_usd": 0.0},
+    "spec_writer":  {"prompt_tokens": 0, "completion_tokens": 0, "calls": 0, "cost_usd": 0.0},
+    "implementer":  {"prompt_tokens": 0, "completion_tokens": 0, "calls": 0, "cost_usd": 0.0},
+    "reviewer":     {"prompt_tokens": 0, "completion_tokens": 0, "calls": 0, "cost_usd": 0.0},
+    "e2e_tester":   {"prompt_tokens": 0, "completion_tokens": 0, "calls": 0, "cost_usd": 0.0},
+    "compaction":   {"prompt_tokens": 0, "completion_tokens": 0, "calls": 0, "cost_usd": 0.0},
 }
 
 # ─── CONSOLE UTILITIES ───────────────────────────────────────────────────────
@@ -479,20 +520,37 @@ def _agent_result(result_preview: str, success: bool = True):
     console.print(f"         [{color}]{icon}[/] [dim]{result_preview[:120]}[/]")
 _SESSION_START = datetime.datetime.now()
 
-def _track_usage(role: str, usage) -> None:
-    """Accumulate tokens from each API call by role. Triggers budget enforcement if enabled."""
+def _track_usage(role: str, usage, model: str = None) -> None:
+    """
+    Accumulate tokens and cost from each API call by role.
+
+    `model` should be the model that actually generated this response (e.g.
+    api_response.model) so cost reflects per-model pricing in mixed-model
+    (MODEL_BY_ROLE) / mixed-provider (LLM_FALLBACK_CHAIN) runs instead of a
+    single global price. Defaults to the role's configured MODEL_BY_ROLE
+    entry when the caller doesn't have a more specific value.
+
+    Triggers budget enforcement if enabled.
+    """
     global _BUDGET_EXCEEDED
     if usage is None:
         return
+    if model is None:
+        model = MODEL_BY_ROLE.get(role, MODEL)
+
+    prompt_tokens     = getattr(usage, "prompt_tokens", 0)
+    completion_tokens = getattr(usage, "completion_tokens", 0)
+    pricing       = _price_for_model(model)
+    call_cost_usd = prompt_tokens * pricing["input_price"] + completion_tokens * pricing["output_price"]
+
     bucket = _SESSION_COSTS.get(role, _SESSION_COSTS["leader"])
-    bucket["prompt_tokens"]     += getattr(usage, "prompt_tokens", 0)
-    bucket["completion_tokens"] += getattr(usage, "completion_tokens", 0)
+    bucket["prompt_tokens"]     += prompt_tokens
+    bucket["completion_tokens"] += completion_tokens
     bucket["calls"]             += 1
+    bucket["cost_usd"]          += call_cost_usd
 
     if COST_BUDGET_USD > 0 and not _BUDGET_EXCEEDED:
-        total_prompt     = sum(v["prompt_tokens"]     for v in _SESSION_COSTS.values())
-        total_completion = sum(v["completion_tokens"] for v in _SESSION_COSTS.values())
-        current_usd      = total_prompt * _PRICE_INPUT + total_completion * _PRICE_OUTPUT
+        current_usd = _session_total_cost_usd()
         if current_usd >= COST_BUDGET_USD:
             _BUDGET_EXCEEDED = True
             _log("harness", "BUDGET_EXCEEDED",
@@ -505,11 +563,15 @@ def _track_usage(role: str, usage) -> None:
                 padding=(0, 1)
             ))
 
+def _session_total_cost_usd() -> float:
+    """Sum of accumulated per-call cost (already priced per-model) across all roles."""
+    return sum(v["cost_usd"] for v in _SESSION_COSTS.values())
+
 def _write_session_costs() -> None:
     """Write session cost summary to progress/session_costs.json."""
     total_prompt     = sum(v["prompt_tokens"]     for v in _SESSION_COSTS.values())
     total_completion = sum(v["completion_tokens"] for v in _SESSION_COSTS.values())
-    total_cost_usd   = total_prompt * _PRICE_INPUT + total_completion * _PRICE_OUTPUT
+    total_cost_usd   = _session_total_cost_usd()
 
     summary = {
         "session_start":      _SESSION_START.isoformat(),
@@ -1110,7 +1172,7 @@ def run_agent(system_prompt: str, tools: list, task: str,
             # resumes from here instead of starting the attempt over.
             return f"[ERROR: all LLM providers exhausted for role={role}]"
 
-        _track_usage(role, api_response.usage)
+        _track_usage(role, api_response.usage, getattr(api_response, "model", None))
         msg = api_response.choices[0].message
 
         if not msg.tool_calls:
@@ -1485,7 +1547,7 @@ def _validate_spec(spec_path: str) -> str:
         )
         if response is None:
             return ""
-        _track_usage("spec_writer", response.usage)
+        _track_usage("spec_writer", response.usage, getattr(response, "model", None))
         result = (response.choices[0].message.content or "").strip()
         return "" if result.upper() == "OK" else result
     except Exception:
@@ -2176,7 +2238,7 @@ def run_leader(user_task: str) -> str:
         if api_response is None:
             return "[ERROR: all LLM providers exhausted for leader]"
 
-        _track_usage("leader", api_response.usage)
+        _track_usage("leader", api_response.usage, getattr(api_response, "model", None))
         msg = api_response.choices[0].message
 
         if not msg.tool_calls:
@@ -2362,9 +2424,7 @@ def main():
                 _write_session_costs()
                 continue
             elif user_input == "/budget":
-                total_prompt     = sum(v["prompt_tokens"]     for v in _SESSION_COSTS.values())
-                total_completion = sum(v["completion_tokens"] for v in _SESSION_COSTS.values())
-                current_usd      = total_prompt * _PRICE_INPUT + total_completion * _PRICE_OUTPUT
+                current_usd = _session_total_cost_usd()
                 if COST_BUDGET_USD > 0:
                     pct = min(current_usd / COST_BUDGET_USD * 100, 100)
                     bar = "█" * int(pct / 5) + "░" * (20 - int(pct / 5))

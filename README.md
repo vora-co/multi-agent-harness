@@ -276,7 +276,7 @@ Each agent uses the model assigned to its role in `MODEL_BY_ROLE`. The defaults 
 
 To change a role's model, edit the value in `MODEL_BY_ROLE` in `harness.py`. No other code needs to change. To add a new custom role, insert a new key — `run_agent` picks it up automatically.
 
-> **Cost note:** The pricing constants `_PRICE_INPUT` / `_PRICE_OUTPUT` in `harness.py` are set for DeepSeek v4-pro. If you mix models with different per-token prices, update those constants or the USD estimate will be approximate. Token counts per role in `progress/session_costs.json` are always exact regardless.
+> **Cost note:** cost is priced per model, not with a single global rate — see [Costs](#costs) below for how `MODEL_PRICING` works and what to do if you add a model that isn't listed there.
 
 ---
 
@@ -524,9 +524,20 @@ Agents don't pass results through chat — they write to files in `progress/`. T
 
 ## Costs
 
-Token usage is tracked per agent. Run `/costs` in the REPL or check `progress/session_costs.json` after a session.
+Token usage and cost are tracked per agent. Run `/costs` in the REPL or check `progress/session_costs.json` after a session.
 
 Typical cost per feature: **~$0.05–0.15 USD** with DeepSeek v4-pro depending on complexity.
+
+### Per-model pricing
+
+Cost is computed with `MODEL_PRICING`, a dict in `harness.py` mapping each model name to `{input_price, output_price}` (USD per token). `_track_usage` prices every API call using the model that actually generated that specific response — not a single global rate — so cost stays accurate when:
+
+- **Roles use different models**, via `MODEL_BY_ROLE` (e.g. `leader`/`implementer` on `deepseek-v4-pro`, `spec_writer`/`reviewer`/`e2e_tester` on the cheaper `deepseek-v4-flash`).
+- **A call falls back to a different provider mid-session**, via `LLM_FALLBACK_CHAIN` + `LLM_MODEL_MAP` (e.g. a DeepSeek outage routes a call to `gpt-4o`) — the API response's own `model` field is what gets priced, reflecting the model that was actually billed, not the one originally requested.
+
+Any model not listed in `MODEL_PRICING` falls back to `deepseek-v4-pro` pricing (`_DEFAULT_PRICING_MODEL`), with a warning logged to `progress/harness.log` the first time that happens in a session — once per unknown model, not on every call. If you add a model to `MODEL_BY_ROLE`, `LLM_MODEL_MAP`, or `LLM_FALLBACK_CHAIN` that isn't already in `MODEL_PRICING`, add a pricing entry for it so cost reporting stays exact instead of approximate.
+
+Per-role breakdown in `progress/session_costs.json` (`by_role.<role>.cost_usd`) and the totals are both computed this way — token counts were always exact, and cost now is too, even in mixed-model/mixed-provider runs.
 
 ---
 
@@ -538,6 +549,9 @@ Active development continues in the premium edition. See the [⭐ Premium module
 ---
 
 ## Changelog
+
+### v1.17.0
+- **Per-model cost pricing, replacing the single global `_PRICE_INPUT`/`_PRICE_OUTPUT` constants.** Those two constants were calibrated for `deepseek-v4-pro` only, but `MODEL_BY_ROLE` already lets each role run a different model and `LLM_FALLBACK_CHAIN` already lets any role's calls land on a different provider mid-session — so reported cost in a mixed-model/mixed-provider run was silently approximate, with no indication anything was off. Replaced the two constants with `MODEL_PRICING`, a `model_name -> {input_price, output_price}` dict in `harness.py`, plus `_price_for_model()`, which falls back to `deepseek-v4-pro` pricing for any unlisted model and logs a warning the first time that happens per model per session (not on every call, to avoid log spam). `_track_usage` now takes the model that actually generated each response (`api_response.model`, which reflects any `LLM_MODEL_MAP` provider translation) and prices that specific call with it, instead of applying one rate to every token in the session; `_SESSION_COSTS` buckets now accumulate `cost_usd` directly per role rather than being recomputed from raw token totals at read time. See the updated [Costs](#costs) section. New tests in `tests/test_harness_core.py::TestPerModelPricing` cover a known model's own pricing being used, an unknown model falling back with a one-time warning, and a mixed run (three different models across three roles) reporting the correct per-role and total cost.
 
 ### v1.16.0
 - **CI gate enforcing the premium fork's golden rule.** Until now, "premium never hand-edits `harness.py`, `tools.py`, `stack_layout.py`, or `agents/*.py`" was documentation only (see [Open-core fork setup](#open-core-fork-setup)) — nothing stopped a direct edit from slipping in. Added `.github/workflows/fork-boundary-check.yml`, which runs on every push and PR, fetches the public repo as an `upstream` remote, and diffs the guarded files between `HEAD` and `git merge-base HEAD upstream/main` (not `upstream/main`'s current tip). Diffing against the merge-base instead of the tip is the part that needed care: right after a real `git merge upstream/main`, the guarded files are byte-identical to upstream at that point, but if upstream gains commits afterward that this fork hasn't merged yet, comparing against upstream's current tip would misreport that ordinary lag as a violation. The merge-base comparison isolates actual hand-edits since the last legitimate sync from simply being behind. See the new [SDLC governance](#sdlc-governance) section for setup (`UPSTREAM_REPO_URL` repository variable) and how to fix a failing run.

@@ -258,6 +258,110 @@ class TestBudgetEnforcement:
         assert h._BUDGET_EXCEEDED is False
 
 
+# ── Per-model pricing ──────────────────────────────────────────────────────────
+
+class TestPerModelPricing:
+    """
+    MODEL_BY_ROLE allows mixing models, and LLM_FALLBACK_CHAIN allows mixing
+    providers — _track_usage must price each call with the model that
+    actually generated it, not a single global price.
+    """
+
+    def _make_usage(self, prompt_tokens=0, completion_tokens=0):
+        from types import SimpleNamespace
+        return SimpleNamespace(prompt_tokens=prompt_tokens, completion_tokens=completion_tokens)
+
+    def _reset_costs(self, h):
+        for v in h._SESSION_COSTS.values():
+            v["prompt_tokens"] = v["completion_tokens"] = v["calls"] = 0
+            v["cost_usd"] = 0.0
+
+    def test_known_model_uses_its_own_pricing(self, monkeypatch, tmp_path):
+        h = _load_harness(monkeypatch, tmp_path)
+        self._reset_costs(h)
+
+        h._track_usage("spec_writer", self._make_usage(1_000_000, 1_000_000), model="deepseek-v4-flash")
+
+        flash = h.MODEL_PRICING["deepseek-v4-flash"]
+        expected = flash["input_price"] * 1_000_000 + flash["output_price"] * 1_000_000
+        assert h._SESSION_COSTS["spec_writer"]["cost_usd"] == pytest.approx(expected)
+
+        # Sanity: flash and pro pricing differ, so this proves the model-specific
+        # lookup actually ran rather than always pricing as deepseek-v4-pro.
+        pro = h.MODEL_PRICING["deepseek-v4-pro"]
+        pro_cost = pro["input_price"] * 1_000_000 + pro["output_price"] * 1_000_000
+        assert expected != pro_cost
+
+    def test_unknown_model_falls_back_to_default_pricing_and_warns_once(self, monkeypatch, tmp_path):
+        h = _load_harness(monkeypatch, tmp_path)
+        self._reset_costs(h)
+        h._UNKNOWN_PRICING_MODELS_WARNED.clear()
+
+        log_calls = []
+        monkeypatch.setattr(h, "_log", lambda *a, **kw: log_calls.append((a, kw)))
+
+        h._track_usage("implementer", self._make_usage(1_000_000, 1_000_000), model="some-future-model")
+
+        default_pricing = h.MODEL_PRICING[h._DEFAULT_PRICING_MODEL]
+        expected = default_pricing["input_price"] * 1_000_000 + default_pricing["output_price"] * 1_000_000
+        assert h._SESSION_COSTS["implementer"]["cost_usd"] == pytest.approx(expected)
+
+        # Warned exactly once, with the unknown model name in the message.
+        assert len(log_calls) == 1
+        assert log_calls[0][1].get("level") == "warning"
+        assert "some-future-model" in log_calls[0][0][2]
+
+        # A second call for the same unknown model must not log again.
+        h._track_usage("implementer", self._make_usage(10, 10), model="some-future-model")
+        assert len(log_calls) == 1
+
+    def test_mixed_run_tracks_correct_cost_per_role(self, monkeypatch, tmp_path):
+        h = _load_harness(monkeypatch, tmp_path)
+        self._reset_costs(h)
+
+        # Simulate a mixed-model, mixed-provider run: leader on deepseek-v4-pro,
+        # spec_writer on deepseek-v4-flash, implementer falling back to an
+        # OpenAI model via LLM_MODEL_MAP.
+        h._track_usage("leader",      self._make_usage(2_000_000, 1_000_000), model="deepseek-v4-pro")
+        h._track_usage("spec_writer", self._make_usage(2_000_000, 1_000_000), model="deepseek-v4-flash")
+        h._track_usage("implementer", self._make_usage(2_000_000, 1_000_000), model="gpt-4o")
+
+        pro   = h.MODEL_PRICING["deepseek-v4-pro"]
+        flash = h.MODEL_PRICING["deepseek-v4-flash"]
+        gpt4o = h.MODEL_PRICING["gpt-4o"]
+
+        assert h._SESSION_COSTS["leader"]["cost_usd"] == pytest.approx(
+            2_000_000 * pro["input_price"] + 1_000_000 * pro["output_price"])
+        assert h._SESSION_COSTS["spec_writer"]["cost_usd"] == pytest.approx(
+            2_000_000 * flash["input_price"] + 1_000_000 * flash["output_price"])
+        assert h._SESSION_COSTS["implementer"]["cost_usd"] == pytest.approx(
+            2_000_000 * gpt4o["input_price"] + 1_000_000 * gpt4o["output_price"])
+
+        total_expected = (
+            h._SESSION_COSTS["leader"]["cost_usd"]
+            + h._SESSION_COSTS["spec_writer"]["cost_usd"]
+            + h._SESSION_COSTS["implementer"]["cost_usd"]
+        )
+        assert h._session_total_cost_usd() == pytest.approx(total_expected)
+
+        # The three models have meaningfully different blended prices — a
+        # single global price applied across roles would not reproduce this.
+        assert h._SESSION_COSTS["leader"]["cost_usd"] != h._SESSION_COSTS["implementer"]["cost_usd"]
+
+    def test_track_usage_defaults_model_from_role_when_not_given(self, monkeypatch, tmp_path):
+        # Existing callers that don't pass `model` (e.g. older plugin code)
+        # must keep working, falling back to the role's MODEL_BY_ROLE entry.
+        h = _load_harness(monkeypatch, tmp_path)
+        self._reset_costs(h)
+
+        h._track_usage("reviewer", self._make_usage(1_000_000, 1_000_000))
+
+        role_model = h.MODEL_BY_ROLE.get("reviewer", h.MODEL)
+        pricing = h.MODEL_PRICING.get(role_model, h.MODEL_PRICING[h._DEFAULT_PRICING_MODEL])
+        expected = pricing["input_price"] * 1_000_000 + pricing["output_price"] * 1_000_000
+        assert h._SESSION_COSTS["reviewer"]["cost_usd"] == pytest.approx(expected)
+
+
 # ── tools.py ─────────────────────────────────────────────────────────────────
 
 class TestTools:
