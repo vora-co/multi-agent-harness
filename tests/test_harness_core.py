@@ -16,7 +16,9 @@ Run with:
 
 import importlib
 import json
+import logging
 import sys
+import uuid
 from pathlib import Path
 from unittest.mock import MagicMock
 
@@ -200,6 +202,107 @@ class TestFeatureListIO:
         assert (tmp_path / "feature_list.json").exists()
 
 
+# ── FeatureSchema validation ────────────────────────────────────────────────────
+
+class TestFeatureSchema:
+    def _feat(self, **overrides):
+        base = {
+            "id": 1,
+            "title": "Some feature",
+            "description": "Do the thing.",
+            "status": "pending",
+            "e2e": False,
+            "depends_on": [],
+            "created_at": "2026-01-01T00:00:00",
+        }
+        base.update(overrides)
+        return base
+
+    def test_valid_feature_has_no_errors(self, monkeypatch, tmp_path):
+        h = _load_harness(monkeypatch, tmp_path)
+        errors = h._validate_feature_schema([self._feat()])
+        assert errors == []
+
+    def test_minimal_feature_omitting_optional_fields_is_valid(self, monkeypatch, tmp_path):
+        # e2e / depends_on / created_at are optional with defaults — see
+        # README "Feature fields" and agents/leader.py ("[e2e] If not
+        # present, use false").
+        h = _load_harness(monkeypatch, tmp_path)
+        minimal = {"id": 1, "title": "T", "description": "D", "status": "pending"}
+        errors = h._validate_feature_schema([minimal])
+        assert errors == []
+
+    def test_misspelled_field_is_rejected(self, monkeypatch, tmp_path):
+        # The whole point of this schema: "depnds_on" must no longer be
+        # silently ignored the way a bare dict.get("depends_on", []) would.
+        h = _load_harness(monkeypatch, tmp_path)
+        feat = self._feat()
+        feat["depnds_on"] = [2]
+        del feat["depends_on"]
+
+        errors = h._validate_feature_schema([feat])
+
+        assert len(errors) == 1
+        assert "depnds_on" in errors[0]
+        assert "Feature #1" in errors[0]
+
+    def test_missing_required_field_is_rejected(self, monkeypatch, tmp_path):
+        h = _load_harness(monkeypatch, tmp_path)
+        feat = self._feat()
+        del feat["title"]
+
+        errors = h._validate_feature_schema([feat])
+
+        assert len(errors) == 1
+        assert "title" in errors[0]
+
+    def test_invalid_status_value_is_rejected(self, monkeypatch, tmp_path):
+        h = _load_harness(monkeypatch, tmp_path)
+        errors = h._validate_feature_schema([self._feat(status="bogus")])
+
+        assert len(errors) == 1
+        assert "status" in errors[0]
+
+    def test_harness_written_fields_are_accepted(self, monkeypatch, tmp_path):
+        # updated_at / recovery_note (recover_stale_features, tools.update_feature_status)
+        # and _checkpoint (_save_checkpoint) are written by the harness itself,
+        # not by feature authors — they must validate cleanly.
+        h = _load_harness(monkeypatch, tmp_path)
+        feat = self._feat(
+            updated_at="2026-01-02T00:00:00",
+            recovery_note="Reset to pending by harness on startup (possible previous crash)",
+        )
+        feat["_checkpoint"] = {"step": "impl_done", "attempt": 2, "saved_at": "2026-01-02T00:00:00"}
+
+        errors = h._validate_feature_schema([feat])
+        assert errors == []
+
+    def test_premium_requires_human_gate_field_is_accepted(self, monkeypatch, tmp_path):
+        # Premium "Human-in-the-loop gates" module sets this field — the
+        # public core must not reject it even though it never reads it.
+        h = _load_harness(monkeypatch, tmp_path)
+        errors = h._validate_feature_schema([self._feat(requires_human_gate=True)])
+        assert errors == []
+
+    def test_multiple_features_report_errors_for_each(self, monkeypatch, tmp_path):
+        h = _load_harness(monkeypatch, tmp_path)
+        features = [
+            self._feat(id=1),
+            self._feat(id=2, status="not_a_real_status"),
+            {**self._feat(id=3), "unexpected_field": "oops"},
+        ]
+        errors = h._validate_feature_schema(features)
+        assert len(errors) == 2
+        assert any("#2" in e for e in errors)
+        assert any("#3" in e for e in errors)
+
+    def test_non_dict_entry_does_not_crash(self, monkeypatch, tmp_path):
+        h = _load_harness(monkeypatch, tmp_path)
+        errors = h._validate_feature_schema(["not a feature dict"])
+        assert len(errors) == 1
+        assert "index 0" in errors[0]
+
+
 # ── Budget enforcement ────────────────────────────────────────────────────────
 
 class TestBudgetEnforcement:
@@ -360,6 +463,108 @@ class TestPerModelPricing:
         pricing = h.MODEL_PRICING.get(role_model, h.MODEL_PRICING[h._DEFAULT_PRICING_MODEL])
         expected = pricing["input_price"] * 1_000_000 + pricing["output_price"] * 1_000_000
         assert h._SESSION_COSTS["reviewer"]["cost_usd"] == pytest.approx(expected)
+
+
+# ── Structured JSON logging ─────────────────────────────────────────────────────
+#
+# The formatter is tested directly (not by capturing real stdout through the
+# root logger) because harness.py is reloaded fresh by _load_harness() in
+# every test in this file, but logging.basicConfig()/addHandler() are only
+# effective on the *first* successful call in the pytest process — exactly
+# like the pre-existing progress/harness.log FileHandler. Testing the
+# formatter directly against the freshly-imported module's own _SESSION_ID /
+# _CURRENT_FEATURE_ID sidesteps that process-global quirk entirely.
+
+class TestStructuredLogging:
+    def _record(self, msg="[HARNESS] TEST_EVENT | detail here", level=logging.INFO):
+        return logging.LogRecord(
+            name="harness", level=level, pathname=__file__,
+            lineno=1, msg=msg, args=(), exc_info=None,
+        )
+
+    def test_formatter_output_is_valid_single_line_json(self, monkeypatch, tmp_path):
+        h = _load_harness(monkeypatch, tmp_path)
+        line = h._JsonLogFormatter().format(self._record())
+
+        assert "\n" not in line
+        parsed = json.loads(line)  # must not raise
+        assert set(parsed.keys()) == {"timestamp", "level", "session_id", "feature_id", "message"}
+        assert parsed["level"] == "INFO"
+        assert parsed["message"] == "[HARNESS] TEST_EVENT | detail here"
+
+    def test_session_id_present_and_is_a_valid_uuid(self, monkeypatch, tmp_path):
+        h = _load_harness(monkeypatch, tmp_path)
+        formatter = h._JsonLogFormatter()
+
+        parsed_a = json.loads(formatter.format(self._record()))
+        parsed_b = json.loads(formatter.format(self._record(msg="second event")))
+
+        uuid.UUID(parsed_a["session_id"])  # raises ValueError if malformed
+        assert parsed_a["session_id"] == parsed_b["session_id"] == h._SESSION_ID
+
+    def test_feature_id_is_null_outside_a_feature_cycle(self, monkeypatch, tmp_path):
+        h = _load_harness(monkeypatch, tmp_path)
+        assert h._CURRENT_FEATURE_ID.get() is None
+        parsed = json.loads(h._JsonLogFormatter().format(self._record()))
+        assert parsed["feature_id"] is None
+
+    def test_feature_id_set_during_run_feature_cycle_and_reset_after(self, monkeypatch, tmp_path):
+        h = _load_harness(monkeypatch, tmp_path)
+        seen = {}
+
+        def fake_impl(feature_id, description, e2e=True):
+            seen["feature_id_during_cycle"] = h._CURRENT_FEATURE_ID.get()
+            return {"approved": True, "attempts": 1, "final_verdict": "ok"}
+
+        monkeypatch.setattr(h, "_run_feature_cycle_impl", fake_impl)
+
+        result = h.run_feature_cycle(7, "desc", e2e=False)
+
+        assert seen["feature_id_during_cycle"] == 7
+        assert result["approved"] is True
+        assert h._CURRENT_FEATURE_ID.get() is None  # reset once the cycle returns
+
+    def test_feature_id_reset_even_if_cycle_raises(self, monkeypatch, tmp_path):
+        h = _load_harness(monkeypatch, tmp_path)
+
+        def boom(feature_id, description, e2e=True):
+            raise RuntimeError("boom")
+
+        monkeypatch.setattr(h, "_run_feature_cycle_impl", boom)
+
+        with pytest.raises(RuntimeError):
+            h.run_feature_cycle(5, "desc", e2e=False)
+
+        assert h._CURRENT_FEATURE_ID.get() is None
+
+    def test_plain_text_file_handler_is_preserved(self, monkeypatch, tmp_path):
+        # progress/harness.log must stay intact — any plugin/tool that tails
+        # it, or that just calls logging.getLogger().info(...) expecting a
+        # configured root logger, must keep working unchanged.
+        h = _load_harness(monkeypatch, tmp_path)
+        assert any(
+            isinstance(handler, h.logging.FileHandler)
+            for handler in h.logging.getLogger().handlers
+        )
+
+    def test_exactly_one_json_stdout_handler_is_registered(self, monkeypatch, tmp_path):
+        h = _load_harness(monkeypatch, tmp_path)
+        json_handlers = [
+            handler for handler in h.logging.getLogger().handlers
+            if handler.name == h._JSON_STDOUT_HANDLER_NAME
+        ]
+        assert len(json_handlers) == 1
+
+        # Behavioral check rather than isinstance: harness.py is reloaded
+        # fresh per test, so a handler registered by an earlier test's module
+        # instance carries a formatter class object from that earlier
+        # instance — a genuinely different (if identically-defined) class,
+        # so isinstance against *this* test's h._JsonLogFormatter would be a
+        # false negative. What matters is that it behaves like the JSON
+        # formatter, which this confirms directly.
+        line = json_handlers[0].formatter.format(self._record())
+        parsed = json.loads(line)
+        assert set(parsed.keys()) == {"timestamp", "level", "session_id", "feature_id", "message"}
 
 
 # ── tools.py ─────────────────────────────────────────────────────────────────

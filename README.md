@@ -134,6 +134,27 @@ Edit `feature_list.json` to describe what you want to build. Each entry is a fea
 | `depends_on` | int[] | IDs of features that must be `done` before this one runs. Use `[]` for no dependencies |
 | `created_at` | string | ISO timestamp |
 
+`id`, `title`, `description`, and `status` are required. `e2e`, `depends_on`, and `created_at` are optional — omitting them defaults to `false`, `[]`, and unset respectively.
+
+### Schema validation
+
+`feature_list.json` entries are validated against a versioned pydantic schema, `FeatureSchema` in `harness.py` (current version: `FEATURE_SCHEMA_VERSION = "1.0"`). The schema rejects unknown fields (`extra="forbid"`) — this is what catches a typo like `"depnds_on"` instead of `"depends_on"`, which would otherwise be silently ignored by every `dict.get(...)` call in the codebase and just sit there as dead JSON with no error and no dependency enforcement.
+
+Beyond the table above, these fields are also accepted because something in the harness (or a premium plugin) writes them:
+
+| Field | Written by | Purpose |
+|---|---|---|
+| `updated_at` | `update_feature_status()` (`tools.py`), `recover_stale_features()` (`harness.py`) | Last-modified timestamp |
+| `recovery_note` | `recover_stale_features()` (`harness.py`) | Explains why a feature was reset to `pending` after a crash |
+| `_checkpoint` | `_save_checkpoint()` (`harness.py`) | Resume point (`step`, `attempt`, `saved_at`) for crash recovery — see [Resuming after a crash](#resuming-after-a-crash) |
+| `requires_human_gate` | Premium **Human-in-the-loop gates** plugin | Pauses the pipeline before the Spec Writer runs until a human approves — see [⭐ Premium modules](#-premium-modules) |
+
+You never need to set `updated_at`, `recovery_note`, or `_checkpoint` by hand — the harness manages them. `requires_human_gate` is the one field you may add yourself if you're running the premium edition.
+
+**Error handling:** validation runs on startup, right before the dependency-graph check (schema errors are checked first, since a missing `id` field would otherwise crash the dependency check). If errors are found, they're printed as a panel in the terminal and logged to `progress/harness.log` — same non-fatal pattern as the dependency-graph check below. The harness still starts; fix `feature_list.json` and restart.
+
+If you add a new field to `feature_list.json` (in core code or a premium plugin), add it to `FeatureSchema` and bump `FEATURE_SCHEMA_VERSION` — otherwise every feature using it will fail validation as an unrecognized field.
+
 ### Feature dependencies
 
 The `depends_on` field lets you declare that a feature requires one or more others to be completed first. The harness resolves the full dependency graph on startup and injects a computed execution order into the Leader's context — the Leader does not need to infer ordering itself.
@@ -260,6 +281,32 @@ Key settings in `harness.py`:
 | `SANDBOX_MODE` | `docker` | Where `run_bash` executes — `docker` (isolated container, recommended) or `local` (direct on host). See [Sandboxed execution](#sandboxed-execution) |
 | `SANDBOX_NETWORK_MODE` | `egress-proxy` | Container network mode — `egress-proxy` (default-deny allowlist, most secure), `bridge` (full outbound, opt out), or `none` (fully air-gapped) |
 | `SANDBOX_EGRESS_ALLOWLIST` | *(registries)* | Comma-separated hostnames reachable in `egress-proxy` mode; `*.example.com` matches subdomains too. See [Sandboxed execution](#sandboxed-execution) |
+| `STRUCTURED_LOG_STDOUT` | `true` | Emit structured JSON logs to stdout, in addition to `progress/harness.log`. Set to `false` to disable. See [Structured logging](#structured-logging) |
+
+### Structured logging
+
+The harness logs to two destinations at once — nothing you had before is removed:
+
+1. **`progress/harness.log`** — plain text, unchanged (`%(asctime)s | %(levelname)s | %(message)s`). Anything already tailing this file, or any plugin that just calls `logging.getLogger(...).info(...)` and expects a configured root logger, keeps working exactly as before.
+2. **stdout** — one JSON object per line, for log aggregators or structured-logging pipelines:
+
+```json
+{"timestamp": "2026-06-30T18:04:12.501Z", "level": "INFO", "session_id": "3f1e2b9a-...", "feature_id": 3, "message": "[IMPLEMENTER] SPAWN feature=3 attempt=1"}
+```
+
+| Field | Description |
+|---|---|
+| `timestamp` | UTC, ISO 8601, millisecond precision |
+| `level` | `INFO` \| `WARNING` \| `ERROR` |
+| `session_id` | UUID generated once per harness process — the correlation ID for every log line in that run |
+| `feature_id` | The feature currently being processed by `run_feature_cycle()`, or `null` outside that scope (e.g. leader-level orchestration) |
+| `message` | Same text that goes to `progress/harness.log` |
+
+Both handlers are fed by the same `logging` calls, so this applies to any plugin's own logging too, with zero changes on the plugin side — `logging.getLogger(__name__).warning(...)` in a plugin shows up in both `progress/harness.log` and the JSON stdout stream automatically, since both are handlers on the root logger.
+
+To consume the stream: `python3 harness.py | jq 'select(.level == "ERROR")'`, or point a log shipper (Vector, Fluent Bit, etc.) at the process's stdout.
+
+Set `STRUCTURED_LOG_STDOUT=false` in `.env` to turn off the stdout handler (e.g. running inside a TUI that already owns stdout) — `progress/harness.log` is unaffected either way.
 
 ### Per-agent model selection
 
@@ -549,6 +596,12 @@ Active development continues in the premium edition. See the [⭐ Premium module
 ---
 
 ## Changelog
+
+### v1.19.0
+- **Structured JSON logging on stdout, alongside (not instead of) `progress/harness.log`.** The root logger previously had a single `logging.basicConfig(filename="progress/harness.log", ...)` handler — fine for humans tailing a file, unusable for a log aggregator, and with no correlation ID to tie a run's log lines together. Added a second handler: a `logging.StreamHandler(sys.stdout)` with a new `_JsonLogFormatter` that renders one JSON object per line (`timestamp`, `level`, `session_id`, `feature_id`, `message`). `progress/harness.log` and its exact plain-text format are untouched — this was additive by design, checked against `plugins/example_plugin.py` and the documented premium plugins first, since any plugin that just calls `logging.getLogger(...).info(...)` relies on the root logger already being configured; both handlers fire from the same call, so plugin log lines get the JSON treatment too with no plugin-side changes needed. `session_id` is a UUID generated once per harness process (`_SESSION_ID`). `feature_id` is populated via a `contextvars.ContextVar` (`_CURRENT_FEATURE_ID`) set for the duration of each feature's cycle — `run_feature_cycle()` became a thin wrapper around the renamed `_run_feature_cycle_impl()` that sets the var in a `try`/`finally` so it's reset even if the cycle raises; contextvars are per-thread, so this stays correct under the premium parallel-feature-execution plugin's `ThreadPoolExecutor`. New `STRUCTURED_LOG_STDOUT=false` env var (default on) disables the stdout handler without touching the file handler. The handler registration is guarded against duplicates (checked by handler name) so re-importing the module — e.g. across this project's own test suite — never piles up extra stdout handlers. See the new [Structured logging](#structured-logging) section. 7 new tests in `tests/test_harness_core.py::TestStructuredLogging`.
+
+### v1.18.0
+- **Versioned schema validation for `feature_list.json`.** Entries were parsed with no schema — every field access went through `dict.get(...)`, so a misspelled field like `"depnds_on"` instead of `"depends_on"` was silently ignored: no error, no dependency enforcement, just dead JSON sitting in the file. Added `FeatureSchema` (pydantic, `FEATURE_SCHEMA_VERSION = "1.0"`) in `harness.py`, with `extra="forbid"` so unknown fields are rejected instead of dropped. Required: `id`, `title`, `description`, `status` (validated against `tools.VALID_FEATURE_STATUSES`, the existing single source of truth, reused rather than duplicated). Optional with defaults: `e2e`, `depends_on`, `created_at`. Also allowlisted the fields the harness itself writes back into feature entries (`updated_at`, `recovery_note` from `recover_stale_features()`/`update_feature_status()`, `_checkpoint` from `_save_checkpoint()`) and the one field the premium **Human-in-the-loop gates** plugin sets (`requires_human_gate`) — none of those would have validated under a naive "only the README's table" schema. `_validate_feature_schema()` runs on startup in `main()`, right before `_validate_dependencies()` (schema errors are checked first, since a missing `id` would otherwise crash the dependency-graph check) — same non-fatal panel + log pattern as the existing circular-dependency check, never crashes the harness. See the new [Schema validation](#schema-validation) section. 9 new tests in `tests/test_harness_core.py::TestFeatureSchema`.
 
 ### v1.17.0
 - **Per-model cost pricing, replacing the single global `_PRICE_INPUT`/`_PRICE_OUTPUT` constants.** Those two constants were calibrated for `deepseek-v4-pro` only, but `MODEL_BY_ROLE` already lets each role run a different model and `LLM_FALLBACK_CHAIN` already lets any role's calls land on a different provider mid-session — so reported cost in a mixed-model/mixed-provider run was silently approximate, with no indication anything was off. Replaced the two constants with `MODEL_PRICING`, a `model_name -> {input_price, output_price}` dict in `harness.py`, plus `_price_for_model()`, which falls back to `deepseek-v4-pro` pricing for any unlisted model and logs a warning the first time that happens per model per session (not on every call, to avoid log spam). `_track_usage` now takes the model that actually generated each response (`api_response.model`, which reflects any `LLM_MODEL_MAP` provider translation) and prices that specific call with it, instead of applying one rate to every token in the session; `_SESSION_COSTS` buckets now accumulate `cost_usd` directly per role rather than being recomputed from raw token totals at read time. See the updated [Costs](#costs) section. New tests in `tests/test_harness_core.py::TestPerModelPricing` cover a known model's own pricing being used, an unknown model falling back with a one-time warning, and a mixed run (three different models across three roles) reporting the correct per-role and total cost.

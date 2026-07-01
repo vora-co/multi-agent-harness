@@ -1,4 +1,4 @@
-import os, re, json, time, logging, datetime, subprocess, sys
+import os, re, json, time, logging, datetime, subprocess, sys, uuid, contextvars
 from typing import Optional
 
 # Load .env as early as possible — before any module (e.g. tools.py) reads
@@ -53,6 +53,7 @@ def _ensure_deps():
         print("✓ Playwright listo.\n")
 
 from openai import OpenAI
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
@@ -63,7 +64,7 @@ import agents.implementer as impl_cfg
 import agents.reviewer as reviewer_cfg
 import agents.e2e_tester as e2e_cfg
 import agents.spec_writer as spec_cfg
-from tools import execute_tool, SAFE_WRITE_DIRS
+from tools import execute_tool, SAFE_WRITE_DIRS, VALID_FEATURE_STATUSES
 from stack_layout import resolve_layout
 
 print(f"[CONFIG] SAFE_WRITE_DIRS = {SAFE_WRITE_DIRS}")
@@ -217,12 +218,68 @@ def _price_for_model(model_name: str) -> dict[str, float]:
     return MODEL_PRICING[_DEFAULT_PRICING_MODEL]
 
 # ─── STRUCTURED LOGGING ──────────────────────────────────────────────────────
+# Two handlers on the root logger, both fed by the same logging.info/warning/
+# error() calls (via _log() below, or called directly — e.g. by a plugin):
+#
+#   1. progress/harness.log — plain text, UNCHANGED from before. Any existing
+#      tooling or premium plugin that tails this file, or that just calls
+#      logging.getLogger().info(...) and expects a configured root logger,
+#      keeps working exactly as before — this handler is never removed.
+#   2. stdout — one JSON object per line (timestamp, level, session_id,
+#      feature_id, message), for log aggregators / structured-logging
+#      pipelines. session_id is a UUID generated once per harness process;
+#      feature_id is populated from a contextvar set by run_feature_cycle()
+#      while a feature is being processed (None outside that scope, e.g.
+#      leader-level orchestration log lines).
+#
+# Set STRUCTURED_LOG_STDOUT=false in .env to disable the stdout handler (e.g.
+# running inside a TUI that already owns stdout) — the file handler is always
+# on and is not affected by this flag.
+_SESSION_ID = str(uuid.uuid4())
+
+# Set by run_feature_cycle() for the duration of a feature's spec→impl→e2e→
+# review cycle; contextvars are isolated per-thread, so this stays correct
+# under the premium parallel-feature-execution plugin's ThreadPoolExecutor.
+_CURRENT_FEATURE_ID: "contextvars.ContextVar[Optional[int]]" = contextvars.ContextVar(
+    "current_feature_id", default=None
+)
+
+
+class _JsonLogFormatter(logging.Formatter):
+    """Renders a LogRecord as a single-line JSON object for the stdout handler."""
+
+    def format(self, record: logging.LogRecord) -> str:
+        payload = {
+            "timestamp":  datetime.datetime.utcfromtimestamp(record.created)
+                              .isoformat(timespec="milliseconds") + "Z",
+            "level":      record.levelname,
+            "session_id": _SESSION_ID,
+            "feature_id": _CURRENT_FEATURE_ID.get(),
+            "message":    record.getMessage(),
+        }
+        return json.dumps(payload, ensure_ascii=False)
+
+
 logging.basicConfig(
     filename="progress/harness.log",
     level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S"
 )
+
+_JSON_STDOUT_HANDLER_NAME = "harness_json_stdout"
+_root_logger = logging.getLogger()
+if (
+    os.getenv("STRUCTURED_LOG_STDOUT", "true").strip().lower() not in ("false", "0", "no")
+    # Guard against duplicate handlers if this module is ever re-imported in
+    # the same process (e.g. the test suite reloads harness.py per test).
+    and not any(h.name == _JSON_STDOUT_HANDLER_NAME for h in _root_logger.handlers)
+):
+    _json_handler = logging.StreamHandler(sys.stdout)
+    _json_handler.set_name(_JSON_STDOUT_HANDLER_NAME)
+    _json_handler.setLevel(logging.INFO)
+    _json_handler.setFormatter(_JsonLogFormatter())
+    _root_logger.addHandler(_json_handler)
 
 def _log(role: str, event: str, detail: str = "", level: str = "info"):
     msg = f"[{role.upper()}] {event}" + (f" | {detail}" if detail else "")
@@ -680,6 +737,98 @@ def _validate_dependencies(features: list) -> list[str]:
             f"Break the cycle by removing at least one depends_on edge."
         )
 
+    return errors
+
+
+# ─── FEATURE_LIST.JSON SCHEMA ────────────────────────────────────────────────
+# Versioned schema for a single feature_list.json entry. Bump
+# FEATURE_SCHEMA_VERSION whenever a field is added, renamed, or removed —
+# it's written into progress/session_costs.json-style metadata is not needed
+# here, but it's surfaced in error messages and the README so a malformed
+# feature_list.json can be traced back to the schema revision that rejected it.
+#
+# extra="forbid" is the whole point of this validator: today a misspelled
+# field (e.g. "depnds_on" instead of "depends_on") is silently ignored by
+# every `.get(...)` call in this file and just sits there as dead JSON,
+# producing no error and no dependency enforcement. Rejecting unknown fields
+# turns that into a startup-time error instead of a silent no-op.
+#
+# Known optional fields beyond the "Feature fields" table in the README:
+#   - updated_at, recovery_note   written by the harness itself
+#                                  (update_feature_status in tools.py,
+#                                  recover_stale_features() in this file)
+#   - _checkpoint                 written by _save_checkpoint() in this file
+#                                  for crash resumability (see "CHECKPOINTING"
+#                                  below)
+#   - requires_human_gate         read by the premium human-in-the-loop-gates
+#                                  plugin (see README "Premium modules") —
+#                                  the public core never sets or reads it,
+#                                  but must not reject it either.
+FEATURE_SCHEMA_VERSION = "1.0"
+
+
+class _CheckpointSchema(BaseModel):
+    """Shape of the "_checkpoint" field written by _save_checkpoint()."""
+    model_config = ConfigDict(extra="forbid")
+
+    step:     str
+    attempt:  int
+    saved_at: str
+
+
+class FeatureSchema(BaseModel):
+    """
+    A single feature_list.json entry — see FEATURE_SCHEMA_VERSION above.
+    `id`, `title`, `description`, and `status` are required because harness.py
+    indexes them directly (e.g. f["id"] in _topological_sort). The rest have
+    defaults matching how the rest of the codebase already treats a missing
+    field (e.g. agents/leader.py: "[e2e] If not present, use false").
+    """
+    model_config = ConfigDict(extra="forbid", populate_by_name=True)
+
+    id:          int
+    title:       str
+    description: str
+    status:      str
+    e2e:         bool = False
+    depends_on:  list[int] = Field(default_factory=list)
+    created_at:  Optional[str] = None
+
+    # Harness-written fields (see module-level comment above).
+    updated_at:     Optional[str] = None
+    recovery_note:  Optional[str] = None
+    checkpoint:     Optional[_CheckpointSchema] = Field(default=None, alias="_checkpoint")
+
+    # Premium plugin field (human-in-the-loop gates) — see module-level comment above.
+    requires_human_gate: Optional[bool] = None
+
+    @field_validator("status")
+    @classmethod
+    def _status_must_be_valid(cls, v: str) -> str:
+        if v not in VALID_FEATURE_STATUSES:
+            raise ValueError(f"must be one of {sorted(VALID_FEATURE_STATUSES)}, got '{v}'")
+        return v
+
+
+def _validate_feature_schema(features: list) -> list[str]:
+    """
+    Validate every feature_list.json entry against FeatureSchema.
+
+    Returns a list of human-readable error strings (empty list = every entry
+    is valid). Never raises — a malformed entry produces an error message,
+    not a crash, so the harness can still start and the file can be fixed
+    without losing the rest of the session. Same non-fatal pattern as
+    _validate_dependencies().
+    """
+    errors: list[str] = []
+    for i, raw in enumerate(features):
+        label = f"#{raw['id']}" if isinstance(raw, dict) and "id" in raw else f"at index {i}"
+        try:
+            FeatureSchema.model_validate(raw)
+        except ValidationError as exc:
+            for err in exc.errors():
+                field = ".".join(str(p) for p in err["loc"]) or "(root)"
+                errors.append(f"Feature {label}: field '{field}' — {err['msg']}")
     return errors
 
 
@@ -1969,7 +2118,19 @@ def run_feature_cycle(feature_id: int, description: str, e2e: bool = True) -> di
       4. Reviewer validates tests + checkpoints.
     If the reviewer rejects, retries impl→e2e→review with the injected reason.
     Returns dict with: approved (bool), attempts (int), final_verdict (str).
+
+    Sets _CURRENT_FEATURE_ID for the duration of the cycle so every log line
+    emitted while this feature is being processed — including from nested
+    agent calls — carries feature_id in the structured JSON log on stdout.
     """
+    _feature_id_token = _CURRENT_FEATURE_ID.set(feature_id)
+    try:
+        return _run_feature_cycle_impl(feature_id, description, e2e)
+    finally:
+        _CURRENT_FEATURE_ID.reset(_feature_id_token)
+
+
+def _run_feature_cycle_impl(feature_id: int, description: str, e2e: bool = True) -> dict:
     # ── Lifecycle hook ───────────────────────────────────────────────────────
     _fire("before_feature", feature_id=feature_id, description=description, e2e=e2e)
 
@@ -2377,11 +2538,25 @@ def main():
     # Checkpointing: recover features stuck from previous sessions
     recover_stale_features()
 
-    # Validate the dependency graph on startup and warn immediately if broken.
-    # This catches cycles and missing IDs before the Leader wastes tokens on them.
+    # Validate feature_list.json against FeatureSchema and the dependency graph
+    # on startup, and warn immediately if either is broken. Schema errors are
+    # checked first since a missing "id" field would otherwise crash the
+    # dependency-graph check below.
     try:
         with open("feature_list.json", "r", encoding="utf-8") as f:
             _startup_features = json.load(f)
+
+        _schema_errors = _validate_feature_schema(_startup_features)
+        if _schema_errors:
+            for _err in _schema_errors:
+                _log("harness", "SCHEMA_ERROR", _err, level="error")
+            console.print(Panel(
+                "\n".join(f"[red]• {e}[/]" for e in _schema_errors),
+                title=f"[red]⚠ feature_list.json schema errors (v{FEATURE_SCHEMA_VERSION}) — fix before running[/]",
+                border_style="red",
+                padding=(0, 1)
+            ))
+
         _dep_errors = _validate_dependencies(_startup_features)
         if _dep_errors:
             console.print(Panel(
