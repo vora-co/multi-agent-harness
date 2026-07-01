@@ -547,20 +547,6 @@ git push origin main
 
 ---
 
-## SDLC governance
-
-### Fork boundary CI gate
-
-The "never edit base files in the premium fork" rule from [Open-core fork setup](#open-core-fork-setup) is enforced mechanically, not just by convention. `.github/workflows/fork-boundary-check.yml` runs on every push and pull request and fails the job if `harness.py`, `tools.py`, `stack_layout.py`, or any `agents/*.py` file was hand-edited in this fork.
-
-**How it decides what's a violation:** the workflow adds the public repo as a remote named `upstream`, fetches `upstream/main`, then computes `git merge-base HEAD upstream/main` — the last commit this branch and `upstream/main` actually shared. It diffs the guarded files between that merge-base and `HEAD`, not between `HEAD` and `upstream/main`'s current tip. This distinction matters: a compliant fork only ever updates those files via `git merge upstream/main`, so right after a real merge they're identical to upstream at that point. If upstream gains new commits afterward that this fork simply hasn't merged yet, comparing against upstream's current tip would flag that ordinary lag as a false positive. Comparing against the merge-base isolates "were these files edited since the last legitimate sync" from "is this fork behind upstream," which is what the rule is actually meant to catch.
-
-**Setup:** add a repository variable named `UPSTREAM_REPO_URL` (Settings → Secrets and variables → Actions → Variables) pointing at the public `multi-agent-harness` repo. The job fails fast with a clear error if it's unset.
-
-**On failure**, the job prints which guarded files diverged and how to fix it: revert the direct edit, sync the change in properly via `git fetch upstream && git merge upstream/main` if it was meant to come from upstream, or move the behavior into a `plugins/` module if it's new premium logic.
-
----
-
 ## How agents communicate
 
 Agents don't pass results through chat — they write to files in `progress/`. This prevents context bloat and keeps each agent focused on its task.
@@ -605,9 +591,6 @@ Active development continues in the premium edition. See the [⭐ Premium module
 
 ### v1.17.0
 - **Per-model cost pricing, replacing the single global `_PRICE_INPUT`/`_PRICE_OUTPUT` constants.** Those two constants were calibrated for `deepseek-v4-pro` only, but `MODEL_BY_ROLE` already lets each role run a different model and `LLM_FALLBACK_CHAIN` already lets any role's calls land on a different provider mid-session — so reported cost in a mixed-model/mixed-provider run was silently approximate, with no indication anything was off. Replaced the two constants with `MODEL_PRICING`, a `model_name -> {input_price, output_price}` dict in `harness.py`, plus `_price_for_model()`, which falls back to `deepseek-v4-pro` pricing for any unlisted model and logs a warning the first time that happens per model per session (not on every call, to avoid log spam). `_track_usage` now takes the model that actually generated each response (`api_response.model`, which reflects any `LLM_MODEL_MAP` provider translation) and prices that specific call with it, instead of applying one rate to every token in the session; `_SESSION_COSTS` buckets now accumulate `cost_usd` directly per role rather than being recomputed from raw token totals at read time. See the updated [Costs](#costs) section. New tests in `tests/test_harness_core.py::TestPerModelPricing` cover a known model's own pricing being used, an unknown model falling back with a one-time warning, and a mixed run (three different models across three roles) reporting the correct per-role and total cost.
-
-### v1.16.0
-- **CI gate enforcing the premium fork's golden rule.** Until now, "premium never hand-edits `harness.py`, `tools.py`, `stack_layout.py`, or `agents/*.py`" was documentation only (see [Open-core fork setup](#open-core-fork-setup)) — nothing stopped a direct edit from slipping in. Added `.github/workflows/fork-boundary-check.yml`, which runs on every push and PR, fetches the public repo as an `upstream` remote, and diffs the guarded files between `HEAD` and `git merge-base HEAD upstream/main` (not `upstream/main`'s current tip). Diffing against the merge-base instead of the tip is the part that needed care: right after a real `git merge upstream/main`, the guarded files are byte-identical to upstream at that point, but if upstream gains commits afterward that this fork hasn't merged yet, comparing against upstream's current tip would misreport that ordinary lag as a violation. The merge-base comparison isolates actual hand-edits since the last legitimate sync from simply being behind. See the new [SDLC governance](#sdlc-governance) section for setup (`UPSTREAM_REPO_URL` repository variable) and how to fix a failing run.
 
 ### v1.15.0
 - **Implementer: React/Next.js hooks-order guard.** A generated component placed a conditional `if (...) return null;` between `useState` calls and later `useCallback`/`useEffect`/`useMemo` calls — syntactically valid and undetected by lint rules that only check for hooks inside loops/conditionals, but it changes how many hooks run between renders, so React throws `Error: Rendered more hooks than during the previous render` the instant the guard's condition flips (Next.js renders this as a full-page dev error overlay instead of the component). `agents/implementer.py`'s CONVENTIONS section gained a mandatory rule: every hook call must sit at the top of the component, before any early-return guard, even when the guard "logically belongs" right next to the data it checks (e.g. a role check right after `useAuth()`).
