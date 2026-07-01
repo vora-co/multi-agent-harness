@@ -783,7 +783,11 @@ class TestRunPlaywrightTests:
         result = json.loads(t.run_playwright_tests(base_url="http://localhost:8000"))
 
         assert result["success"] is True
-        assert any("python -m pytest tests/e2e/" in c for c in calls)
+        # Not "python -m pytest": the command is built from sys.executable
+        # (see tools.py::_run_playwright_tests_python), which is an absolute
+        # interpreter path (e.g. "/usr/bin/python3.9") on every real machine,
+        # never the literal string "python". Match runtime-agnostically.
+        assert any("-m pytest tests/e2e/" in c for c in calls)
         assert not any("npx playwright test" in c for c in calls)
 
     def test_node_stack_uses_npx_playwright_test(self, monkeypatch, tmp_path):
@@ -803,7 +807,10 @@ class TestRunPlaywrightTests:
         assert result["success"] is True
         assert any("npx playwright test e2e/" in c for c in calls)
         assert any("PLAYWRIGHT_BASE_URL=http://localhost:8000" in c for c in calls)
-        assert not any("python -m pytest" in c for c in calls)
+        # Same sys.executable reasoning as above — "python -m pytest" would
+        # never match even if the python branch ran by mistake, making this
+        # assertion vacuous. "-m pytest" is the runtime-agnostic marker.
+        assert not any("-m pytest" in c for c in calls)
 
     def test_node_stack_installs_playwright_when_missing(self, monkeypatch, tmp_path):
         t = self._load_tools(monkeypatch, tmp_path,
