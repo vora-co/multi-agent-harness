@@ -1228,6 +1228,80 @@ def _verdict_is(result: str, marker: str) -> bool:
     return cleaned[:len(marker)].upper() == marker.upper()
 
 
+# ─── STRUCTURED AGENT STATUS (progress/<stage>_<id>.json) ────────────────────
+# Agents write a sibling JSON file next to their prose report (e.g.
+# progress/impl_3.json next to progress/impl_3.md) with a minimal structured
+# status: {schema_version, status, tests_passed, files_touched, reason}. This
+# replaces the substring/prefix heuristics below (_verdict_is + .replace(...)
+# on a returned chat string, "passed" in content on impl_N.md) with an exact
+# field read, while falling back to the old heuristic when the sibling file
+# is absent — so progress/ directories from before this schema existed keep
+# working unmodified. A sibling file (not a block embedded in the .md) was
+# chosen deliberately: agents/spec_writer.py's own template instructs writing
+# example response shapes like {data, total, page, page_size} directly into
+# the prose, and impl/review reports embed raw pytest output — both can
+# contain JSON-looking text, so scanning the .md for "the" JSON block would
+# be ambiguous. A sibling file has no such collision risk and needs no
+# extraction/regex — just json.load() the whole file.
+
+def _read_structured_status(report_path: str) -> Optional[dict]:
+    """
+    Read the sibling <report_path minus extension>.json written alongside an
+    agent's prose report. Returns None (never raises) if the file is absent,
+    unreadable, not valid JSON, not a dict, or missing "schema_version" —
+    that last check means foreign/unrelated JSON is treated the same as a
+    missing file, so callers always have a single "structured data available
+    or not" branch to handle.
+    """
+    json_path = os.path.splitext(report_path)[0] + ".json"
+    if not os.path.exists(json_path):
+        return None
+    try:
+        with open(json_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception:
+        return None
+    if not isinstance(data, dict) or "schema_version" not in data:
+        return None
+    return data
+
+
+def _reviewer_verdict(result: str, review_path: str) -> tuple[bool, str]:
+    """
+    Decide reviewer approval and extract the rejection reason.
+    Prefers the structured progress/review_<id>.json ("status": "approved"/
+    "rejected", "reason") over parsing the returned chat string; falls back
+    to _verdict_is(result, "APPROVED") + stripping the "REJECTED:" prefix
+    when no structured file exists.
+    """
+    status = _read_structured_status(review_path)
+    if status is not None:
+        approved = status.get("status") == "approved"
+        reason = "" if approved else (status.get("reason") or "")
+        return approved, reason
+    approved = _verdict_is(result, "APPROVED")
+    reason = "" if approved else result.replace("REJECTED:", "").strip()
+    return approved, reason
+
+
+def _e2e_verdict(result: str, e2e_path: str) -> tuple[bool, str]:
+    """
+    Decide E2E pass/fail and extract the failure reason.
+    Prefers the structured progress/e2e_<id>.json ("status": "passed"/
+    "failed", "reason") over parsing the returned chat string; falls back
+    to _verdict_is(result, "E2E_PASSED") + stripping the "E2E_FAILED:"
+    prefix when no structured file exists.
+    """
+    status = _read_structured_status(e2e_path)
+    if status is not None:
+        passed = status.get("status") == "passed"
+        reason = "" if passed else (status.get("reason") or "")
+        return passed, reason
+    passed = _verdict_is(result, "E2E_PASSED")
+    reason = "" if passed else result.replace("E2E_FAILED:", "").strip()
+    return passed, reason
+
+
 def _classify_error(error_msg: str) -> str:
     """
     Classify an error to decide the retry strategy.
@@ -1877,17 +1951,29 @@ def spawn_implementer(feature_id: int, description: str, attempt: int = 1,
     """
     impl_path = f"progress/impl_{feature_id}.md"
 
-    # Reuse existing impl if it already exists and shows passing tests
+    # Reuse existing impl if it already exists and shows passing tests.
+    # Prefers the structured progress/impl_<id>.json ("tests_passed": bool,
+    # "status" != "error") over the substring fallback below — the fallback
+    # is exact-match-fragile (e.g. pytest output containing "2 failed, 1
+    # passed" matches "passed" in content even though the run failed) but is
+    # kept for progress/ directories written before this schema existed.
     if attempt == 1 and os.path.exists(impl_path):
-        try:
-            with open(impl_path, "r", encoding="utf-8") as f:
-                content = f.read()
-            if "passed" in content and "[ERROR" not in content:
+        status = _read_structured_status(impl_path)
+        if status is not None:
+            if status.get("tests_passed") and status.get("status") != "error":
                 _log("implementer", "SKIP", f"Existing impl with passing tests: {impl_path}")
                 console.print(f"  [blue]🔨 IMPLEMENTER[/] [dim]↩ reusing existing impl →[/] {impl_path}")
                 return impl_path
-        except Exception:
-            pass
+        else:
+            try:
+                with open(impl_path, "r", encoding="utf-8") as f:
+                    content = f.read()
+                if "passed" in content and "[ERROR" not in content:
+                    _log("implementer", "SKIP", f"Existing impl with passing tests: {impl_path}")
+                    console.print(f"  [blue]🔨 IMPLEMENTER[/] [dim]↩ reusing existing impl →[/] {impl_path}")
+                    return impl_path
+            except Exception:
+                pass
 
     context = ""
     if attempt > 1 and rejection_reason:
@@ -2219,11 +2305,12 @@ def _run_feature_cycle_impl(feature_id: int, description: str, e2e: bool = True)
         # this only rejected strings starting with "E2E_FAILED", so a timeout
         # or any other unexpected verdict silently fell through as an
         # implicit pass and reached the Reviewer with no real E2E evidence.
-        e2e_passed = _verdict_is(e2e_result, "E2E_PASSED")
+        # _e2e_verdict prefers the structured progress/e2e_<id>.json written
+        # alongside the report, falling back to this same string parsing.
+        e2e_passed, e2e_reason = _e2e_verdict(e2e_result, f"progress/e2e_{feature_id}.md")
         if e2e_passed:
             _save_checkpoint(feature_id, "e2e_done", attempt=attempt)
         else:
-            e2e_reason = e2e_result.replace("E2E_FAILED:", "").strip()
             _log("harness", "E2E_FAILED",
                  f"feature={feature_id} attempt={attempt} reason={e2e_reason[:100]}", level="warning")
             # E2E failure counts as rejection — implementer fixes it on next attempt
@@ -2238,8 +2325,12 @@ def _run_feature_cycle_impl(feature_id: int, description: str, e2e: bool = True)
             continue
 
         # ── Step 4: Review ───────────────────────────────────────────────────
+        # _reviewer_verdict prefers the structured progress/review_<id>.json
+        # written alongside the report, falling back to parsing the returned
+        # chat string (_verdict_is + stripping "REJECTED:") when absent.
         review_result = spawn_reviewer(feature_id, e2e=e2e, attempt=attempt)
-        if _verdict_is(review_result, "APPROVED"):
+        approved, rejection_reason = _reviewer_verdict(review_result, f"progress/review_{feature_id}.md")
+        if approved:
             gate_block = _fire_gate(
                 "before_approval_finalized",
                 feature_id=feature_id, description=description,
@@ -2269,7 +2360,7 @@ def _run_feature_cycle_impl(feature_id: int, description: str, e2e: bool = True)
                 ))
             continue
 
-        rejection_reason = review_result.replace("REJECTED:", "").strip()
+        # rejection_reason was already set above by _reviewer_verdict()
         _log("harness", "CYCLE_RETRY",
              f"feature={feature_id} attempt={attempt}/{MAX_RETRIES_REVIEW} reason={rejection_reason[:100]}",
              level="warning")

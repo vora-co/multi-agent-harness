@@ -553,6 +553,28 @@ Agents don't pass results through chat — they write to files in `progress/`. T
 
 **Caching:** If a spec or impl file already exists and shows passing tests, the harness reuses it instead of regenerating — saving tokens on retries.
 
+### Structured status files
+
+Each agent's prose report (`progress/spec_N.md`, `impl_N.md`, `review_N.md`, `e2e_N.md`) is paired with a small sibling JSON file — `progress/impl_N.json` next to `progress/impl_N.md`, and so on — with a minimal machine-readable summary of the same outcome:
+
+```json
+{"schema_version": 1, "status": "done", "tests_passed": true, "files_touched": ["src/models/user.py", "tests/test_user.py"], "reason": null}
+```
+
+| Field | Type | Meaning |
+|---|---|---|
+| `schema_version` | int | Currently `1` |
+| `status` | string | Role-specific: `"ok"` (spec_writer), `"done"` (implementer), `"approved"`/`"rejected"` (reviewer), `"passed"`/`"failed"` (e2e_tester) |
+| `tests_passed` | bool \| null | `null` for spec_writer (not applicable); the actual test-run outcome for the other three |
+| `files_touched` | string[] | Files created/modified (implementer, and planned by spec_writer); `[]` for reviewer/e2e_tester |
+| `reason` | string \| null | Short reason on rejection/failure; `null` otherwise |
+
+**Why a sibling file instead of a block inside the `.md`:** spec_writer's own template requires documenting example response shapes (e.g. `{data, total, page, page_size}`) directly in the prose, and impl/review reports embed raw pytest output — both can legitimately contain JSON-looking text, so extracting "the" JSON block from freeform Markdown would be ambiguous. A separate file has no such collision risk and needs no parsing beyond `json.load()`.
+
+**What this replaces:** the harness used to decide pass/fail and cache-reuse purely by pattern-matching the prose — `_verdict_is()` prefix-matching a returned "APPROVED"/"REJECTED: ..." chat string, and `"passed" in content` on `impl_N.md`. That last one had a live bug: pytest output containing `"2 failed, 1 passed"` matched `"passed" in content` and could incorrectly reuse a failing implementation. `_reviewer_verdict()`, `_e2e_verdict()`, and the implementer's cache check now read the structured `tests_passed`/`status` fields first.
+
+**Backward compatible by design:** if the sibling `.json` is missing (e.g. a `progress/` directory from before this schema existed), every one of these call sites falls back to the exact old substring behavior — no migration needed, nothing crashes, old projects keep working exactly as before.
+
 ---
 
 ## Costs
@@ -582,6 +604,9 @@ Active development continues in the premium edition. See the [⭐ Premium module
 ---
 
 ## Changelog
+
+### v1.20.0
+- **Structured sibling JSON status files, replacing prose-substring heuristics for cache/verdict decisions.** Pipeline-critical decisions were made by pattern-matching agent prose: `_verdict_is()` prefix-matching a returned "APPROVED"/"E2E_PASSED" chat string (already the source of two documented bugs — case-sensitive verdict parsing, E2E verdict polarity), and `spawn_implementer`'s cache check, `"passed" in content and "[ERROR" not in content` on `impl_N.md`, which had a live bug of the same kind: pytest output containing `"2 failed, 1 passed"` matches `"passed" in content` and could silently reuse a failing implementation. Each of the 4 agents now also writes a small sibling JSON file next to its prose report (`progress/impl_N.json` next to `impl_N.md`, etc.) with `{schema_version, status, tests_passed, files_touched, reason}`. New `_read_structured_status()` reads it (returns `None` — never raises — if absent, unreadable, or missing `schema_version`, so foreign JSON can't be half-trusted); new `_reviewer_verdict()` and `_e2e_verdict()` prefer it over `_verdict_is()` + prefix-stripping; `spawn_implementer`'s cache check prefers `tests_passed`/`status` over the substring check. A sibling file (not a block embedded in the `.md`) was chosen deliberately: `agents/spec_writer.py`'s own template requires documenting example response shapes like `{data, total, page, page_size}` directly in the prose, and impl/review reports embed raw pytest output — both can contain JSON-looking text, making "the" JSON block in a Markdown file ambiguous to extract; a separate file has no such collision risk. Every call site falls back to the exact old substring behavior when the sibling file is absent, so `progress/` directories from before this schema existed keep working with zero migration. See the new [Structured status files](#structured-status-files) section. 16 new tests in `tests/test_harness_core.py` (`TestReadStructuredStatus`, `TestImplCacheStructuredVsLegacy`, `TestReviewerAndE2eVerdict`), including a regression test reproducing the `"2 failed, 1 passed"` cache bug and confirming it's fixed for projects using the new schema (and unchanged, by design, for legacy `progress/` directories without it).
 
 ### v1.19.0
 - **Structured JSON logging on stdout, alongside (not instead of) `progress/harness.log`.** The root logger previously had a single `logging.basicConfig(filename="progress/harness.log", ...)` handler — fine for humans tailing a file, unusable for a log aggregator, and with no correlation ID to tie a run's log lines together. Added a second handler: a `logging.StreamHandler(sys.stdout)` with a new `_JsonLogFormatter` that renders one JSON object per line (`timestamp`, `level`, `session_id`, `feature_id`, `message`). `progress/harness.log` and its exact plain-text format are untouched — this was additive by design, checked against `plugins/example_plugin.py` and the documented premium plugins first, since any plugin that just calls `logging.getLogger(...).info(...)` relies on the root logger already being configured; both handlers fire from the same call, so plugin log lines get the JSON treatment too with no plugin-side changes needed. `session_id` is a UUID generated once per harness process (`_SESSION_ID`). `feature_id` is populated via a `contextvars.ContextVar` (`_CURRENT_FEATURE_ID`) set for the duration of each feature's cycle — `run_feature_cycle()` became a thin wrapper around the renamed `_run_feature_cycle_impl()` that sets the var in a `try`/`finally` so it's reset even if the cycle raises; contextvars are per-thread, so this stays correct under the premium parallel-feature-execution plugin's `ThreadPoolExecutor`. New `STRUCTURED_LOG_STDOUT=false` env var (default on) disables the stdout handler without touching the file handler. The handler registration is guarded against duplicates (checked by handler name) so re-importing the module — e.g. across this project's own test suite — never piles up extra stdout handlers. See the new [Structured logging](#structured-logging) section. 7 new tests in `tests/test_harness_core.py::TestStructuredLogging`.

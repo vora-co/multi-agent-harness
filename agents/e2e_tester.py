@@ -54,7 +54,16 @@ PROTOCOL:
    - Playwright output (copy the result)
    - Screenshots taken and what they show
    - Verdict: E2E_PASSED or E2E_FAILED: <reason>
-9. Return ONLY: "E2E_PASSED" or "E2E_FAILED: <brief_reason>"
+9. Also write progress/e2e_<feature_id>.json — a small structured summary,
+   sibling to the .md file above (same base name, .json extension), with
+   exactly these fields:
+   {{"schema_version": 1, "status": "passed" or "failed",
+     "tests_passed": <true/false, matching status>, "files_touched": [],
+     "reason": <null if passed, else the same brief reason you return in
+     step 10>}}
+   This is a separate file from the report itself — do not put JSON inside
+   progress/e2e_<feature_id>.md.
+10. Return ONLY: "E2E_PASSED" or "E2E_FAILED: <brief_reason>"
 
 E2E TESTING PRINCIPLES:
 - Test behavior, not implementation. Interact as a real user would.

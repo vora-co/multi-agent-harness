@@ -66,7 +66,15 @@ New libraries the implementer must install (if any).
 Design decisions, constraints, or specific warnings for this feature.
 ---
 
-3. Return ONLY the path: progress/spec_<feature_id>.md
+3. Also write progress/spec_<feature_id>.json — a small structured summary,
+   sibling to the .md file above (same base name, .json extension), with
+   exactly these fields:
+   {{"schema_version": 1, "status": "ok", "tests_passed": null,
+     "files_touched": ["<every path from your "Files to create or modify"
+     section above>"]}}
+   This is a separate file from the spec itself — do not put JSON inside
+   progress/spec_<feature_id>.md.
+4. Return ONLY the path: progress/spec_<feature_id>.md
 
 HARD RULES:
 - TOOL-CALL BATCHING (mandatory): step 1 typically means reading several existing source files

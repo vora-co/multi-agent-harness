@@ -567,6 +567,181 @@ class TestStructuredLogging:
         assert set(parsed.keys()) == {"timestamp", "level", "session_id", "feature_id", "message"}
 
 
+# ── Structured agent status (progress/<stage>_<id>.json) ───────────────────────
+
+class TestReadStructuredStatus:
+    def test_missing_file_returns_none(self, monkeypatch, tmp_path):
+        h = _load_harness(monkeypatch, tmp_path)
+        (tmp_path / "progress").mkdir(exist_ok=True)
+        (tmp_path / "progress" / "impl_1.md").write_text("report body")
+        assert h._read_structured_status("progress/impl_1.md") is None
+
+    def test_invalid_json_returns_none(self, monkeypatch, tmp_path):
+        h = _load_harness(monkeypatch, tmp_path)
+        (tmp_path / "progress").mkdir(exist_ok=True)
+        (tmp_path / "progress" / "impl_1.json").write_text("NOT JSON {{{")
+        assert h._read_structured_status("progress/impl_1.md") is None
+
+    def test_json_missing_schema_version_returns_none(self, monkeypatch, tmp_path):
+        # Foreign/unrelated JSON that happens to share the sibling path must
+        # be treated the same as "no structured status" — not crash, not be
+        # half-trusted.
+        h = _load_harness(monkeypatch, tmp_path)
+        (tmp_path / "progress").mkdir(exist_ok=True)
+        (tmp_path / "progress" / "impl_1.json").write_text(json.dumps({"status": "done"}))
+        assert h._read_structured_status("progress/impl_1.md") is None
+
+    def test_valid_status_is_parsed(self, monkeypatch, tmp_path):
+        h = _load_harness(monkeypatch, tmp_path)
+        (tmp_path / "progress").mkdir(exist_ok=True)
+        payload = {"schema_version": 1, "status": "done", "tests_passed": True, "files_touched": ["src/x.py"]}
+        (tmp_path / "progress" / "impl_1.json").write_text(json.dumps(payload))
+        assert h._read_structured_status("progress/impl_1.md") == payload
+
+
+class TestImplCacheStructuredVsLegacy:
+    def _stub_run_agent(self, h, monkeypatch, calls):
+        def fake_run_agent(*a, **kw):
+            calls.append(1)
+            return "progress/impl_1.md"
+        monkeypatch.setattr(h, "run_agent", fake_run_agent)
+
+    def test_structured_tests_passed_true_reuses_without_calling_agent(self, monkeypatch, tmp_path):
+        h = _load_harness(monkeypatch, tmp_path)
+        (tmp_path / "progress").mkdir(exist_ok=True)
+        (tmp_path / "progress" / "impl_1.md").write_text("Full pytest output:\n2 failed, 1 passed")
+        (tmp_path / "progress" / "impl_1.json").write_text(json.dumps(
+            {"schema_version": 1, "status": "done", "tests_passed": True, "files_touched": []}
+        ))
+        calls = []
+        self._stub_run_agent(h, monkeypatch, calls)
+
+        result = h.spawn_implementer(1, "desc")
+
+        assert result == "progress/impl_1.md"
+        assert calls == []  # cache hit — agent never invoked
+
+    def test_structured_tests_passed_false_does_not_reuse(self, monkeypatch, tmp_path):
+        # This is the regression case: pytest output containing "2 failed, 1
+        # passed" would fool the old "passed" in content heuristic, but the
+        # structured tests_passed field is exact and correctly forces a
+        # fresh implementer run instead of reusing a failing attempt.
+        h = _load_harness(monkeypatch, tmp_path)
+        (tmp_path / "progress").mkdir(exist_ok=True)
+        (tmp_path / "progress" / "impl_1.md").write_text("Full pytest output:\n2 failed, 1 passed")
+        (tmp_path / "progress" / "impl_1.json").write_text(json.dumps(
+            {"schema_version": 1, "status": "done", "tests_passed": False, "files_touched": []}
+        ))
+        calls = []
+        self._stub_run_agent(h, monkeypatch, calls)
+
+        h.spawn_implementer(1, "desc")
+
+        assert calls == [1]  # cache miss — agent was invoked to redo the work
+
+    def test_legacy_no_json_falls_back_to_substring_heuristic(self, monkeypatch, tmp_path):
+        # No sibling .json (progress/ predates this schema) — old behavior
+        # is preserved exactly, bug and all: "passed" in content matches
+        # even inside "2 failed, 1 passed", so this legacy path still
+        # reuses. Documents that the fix only applies going forward, not to
+        # pre-existing progress/ directories, by design (no migration).
+        h = _load_harness(monkeypatch, tmp_path)
+        (tmp_path / "progress").mkdir(exist_ok=True)
+        (tmp_path / "progress" / "impl_1.md").write_text("Full pytest output:\n2 failed, 1 passed")
+        calls = []
+        self._stub_run_agent(h, monkeypatch, calls)
+
+        result = h.spawn_implementer(1, "desc")
+
+        assert result == "progress/impl_1.md"
+        assert calls == []
+
+    def test_legacy_error_marker_prevents_reuse(self, monkeypatch, tmp_path):
+        h = _load_harness(monkeypatch, tmp_path)
+        (tmp_path / "progress").mkdir(exist_ok=True)
+        (tmp_path / "progress" / "impl_1.md").write_text("[ERROR: something broke]\n0 passed")
+        calls = []
+        self._stub_run_agent(h, monkeypatch, calls)
+
+        h.spawn_implementer(1, "desc")
+
+        assert calls == [1]
+
+
+class TestReviewerAndE2eVerdict:
+    def test_reviewer_structured_approved(self, monkeypatch, tmp_path):
+        h = _load_harness(monkeypatch, tmp_path)
+        (tmp_path / "progress").mkdir(exist_ok=True)
+        (tmp_path / "progress" / "review_1.json").write_text(json.dumps(
+            {"schema_version": 1, "status": "approved", "tests_passed": True, "files_touched": [], "reason": None}
+        ))
+        approved, reason = h._reviewer_verdict("irrelevant raw text", "progress/review_1.md")
+        assert approved is True
+        assert reason == ""
+
+    def test_reviewer_structured_rejected_uses_reason_field(self, monkeypatch, tmp_path):
+        h = _load_harness(monkeypatch, tmp_path)
+        (tmp_path / "progress").mkdir(exist_ok=True)
+        (tmp_path / "progress" / "review_1.json").write_text(json.dumps(
+            {"schema_version": 1, "status": "rejected", "tests_passed": False,
+             "files_touched": [], "reason": "missing null check"}
+        ))
+        approved, reason = h._reviewer_verdict("Approved.", "progress/review_1.md")
+        # Structured status wins even though the raw string looks like an approval.
+        assert approved is False
+        assert reason == "missing null check"
+
+    def test_reviewer_falls_back_when_no_json(self, monkeypatch, tmp_path):
+        h = _load_harness(monkeypatch, tmp_path)
+        (tmp_path / "progress").mkdir(exist_ok=True)
+        approved, reason = h._reviewer_verdict("REJECTED: bad code", "progress/review_1.md")
+        assert approved is False
+        assert reason == "bad code"
+
+    def test_reviewer_falls_back_on_malformed_json(self, monkeypatch, tmp_path):
+        h = _load_harness(monkeypatch, tmp_path)
+        (tmp_path / "progress").mkdir(exist_ok=True)
+        (tmp_path / "progress" / "review_1.json").write_text("NOT JSON")
+        approved, reason = h._reviewer_verdict("APPROVED", "progress/review_1.md")
+        assert approved is True
+
+    def test_e2e_structured_passed(self, monkeypatch, tmp_path):
+        h = _load_harness(monkeypatch, tmp_path)
+        (tmp_path / "progress").mkdir(exist_ok=True)
+        (tmp_path / "progress" / "e2e_1.json").write_text(json.dumps(
+            {"schema_version": 1, "status": "passed", "tests_passed": True, "files_touched": [], "reason": None}
+        ))
+        passed, reason = h._e2e_verdict("irrelevant", "progress/e2e_1.md")
+        assert passed is True
+        assert reason == ""
+
+    def test_e2e_structured_failed_uses_reason_field(self, monkeypatch, tmp_path):
+        h = _load_harness(monkeypatch, tmp_path)
+        (tmp_path / "progress").mkdir(exist_ok=True)
+        (tmp_path / "progress" / "e2e_1.json").write_text(json.dumps(
+            {"schema_version": 1, "status": "failed", "tests_passed": False,
+             "files_touched": [], "reason": "login button not found"}
+        ))
+        passed, reason = h._e2e_verdict("E2E_PASSED", "progress/e2e_1.md")
+        # Structured status wins even though the raw string looks like a pass.
+        assert passed is False
+        assert reason == "login button not found"
+
+    def test_e2e_falls_back_when_no_json(self, monkeypatch, tmp_path):
+        h = _load_harness(monkeypatch, tmp_path)
+        (tmp_path / "progress").mkdir(exist_ok=True)
+        passed, reason = h._e2e_verdict("E2E_FAILED: timeout waiting for selector", "progress/e2e_1.md")
+        assert passed is False
+        assert reason == "timeout waiting for selector"
+
+    def test_e2e_falls_back_on_malformed_json(self, monkeypatch, tmp_path):
+        h = _load_harness(monkeypatch, tmp_path)
+        (tmp_path / "progress").mkdir(exist_ok=True)
+        (tmp_path / "progress" / "e2e_1.json").write_text("[1, 2, 3]")  # valid JSON, not a dict
+        passed, reason = h._e2e_verdict("E2E_PASSED", "progress/e2e_1.md")
+        assert passed is True
+
+
 # ── tools.py ─────────────────────────────────────────────────────────────────
 
 class TestTools:

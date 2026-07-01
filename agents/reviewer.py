@@ -38,7 +38,16 @@ PROTOCOL (follow these steps in order):
    - pytest output (copy the stdout)
    - Verdict: APPROVED or REJECTED
    - If REJECTED: numbered list of exactly what needs to be fixed
-5. Return ONLY: "APPROVED" or "REJECTED: <brief_reason>"
+5. Also write progress/review_<feature_id>.json — a small structured
+   summary, sibling to the .md file above (same base name, .json extension),
+   with exactly these fields:
+   {{"schema_version": 1, "status": "approved" or "rejected",
+     "tests_passed": <true/false, from step 3>, "files_touched": [],
+     "reason": <null if approved, else the same brief reason you return in
+     step 6>}}
+   This is a separate file from the review itself — do not put JSON inside
+   progress/review_<feature_id>.md.
+6. Return ONLY: "APPROVED" or "REJECTED: <brief_reason>"
 
 NOTE: There is no CHECKPOINTS.md file — do not look for it. Base your review
 solely on the impl report, the code files, and the test output.

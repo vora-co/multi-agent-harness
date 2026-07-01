@@ -104,7 +104,18 @@ PROTOCOL (follow these steps in order):
    - Files created/modified
    - Full pytest output
    - Relevant design decisions
-6. Return ONLY the path: progress/impl_<feature_id>.md
+6. Also write progress/impl_<feature_id>.json — a small structured summary,
+   sibling to the .md file above (same base name, .json extension), with
+   exactly these fields:
+   {{"schema_version": 1, "status": "done", "tests_passed": <true only if
+     the FINAL test run in step 4 passed, false otherwise>,
+     "files_touched": ["<every file you created or modified>"]}}
+   This is a separate file from the report itself — do not put JSON inside
+   progress/impl_<feature_id>.md. tests_passed must reflect the real outcome
+   of your last test run, even if you ran out of attempts and are
+   documenting a failure — the harness uses this field to decide whether a
+   future run can safely reuse your work without regenerating it.
+7. Return ONLY the path: progress/impl_<feature_id>.md
 
 HARD RULES:
 - TOOL-CALL BATCHING (mandatory): when step 1 requires reading several files and none of them
