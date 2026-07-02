@@ -60,6 +60,22 @@ import threading
 import time
 from abc import ABC, abstractmethod
 
+
+def _sanitized_host_env() -> dict:
+    """
+    A copy of os.environ with every LLM-provider credential (DEEPSEEK_API_KEY,
+    OPENAI_API_KEY, GROQ_API_KEY, CUSTOM_API_KEY, and any future <PROVIDER>_API_KEY
+    added via LLM_FALLBACK_CHAIN — see harness.py's _build_provider_chain) stripped
+    out. SANDBOX_MODE=local runs agent shell commands as a direct subprocess of this
+    Python process; without this, subprocess.run() inherits the full host
+    environment, so a command as innocuous as `env` or `printenv` would print the
+    harness's own API keys straight into the tool result — which then gets logged.
+    Docker mode doesn't have this problem: it only ever passes an explicit,
+    harness-controlled `environment=` dict into the container (see
+    DockerSandboxRunner.run below), never a copy of the host's.
+    """
+    return {k: v for k, v in os.environ.items() if not k.endswith("_API_KEY")}
+
 # ─── CONFIG (.env) ───────────────────────────────────────────────────────────
 
 SANDBOX_MODE        = os.getenv("SANDBOX_MODE", "docker").strip().lower()
@@ -132,7 +148,7 @@ class LocalSubprocessRunner(SandboxRunner):
         try:
             result = subprocess.run(
                 command, shell=True, capture_output=True, text=True,
-                timeout=timeout, cwd=cwd
+                timeout=timeout, cwd=cwd, env=_sanitized_host_env()
             )
             return {
                 "stdout": result.stdout,

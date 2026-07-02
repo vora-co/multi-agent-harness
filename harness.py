@@ -10,6 +10,27 @@ load_dotenv(override=True)  # .env is the source of truth (documented workflow e
                             # shell too); without override=True a stale shell-exported var from an
                             # earlier session silently wins over an edited .env value.
 
+# ─── SECRET REDACTION ─────────────────────────────────────────────────────────
+# Every *_API_KEY value currently in the environment (DEEPSEEK_API_KEY,
+# OPENAI_API_KEY, GROQ_API_KEY, CUSTOM_API_KEY, and any future <PROVIDER>_API_KEY
+# from LLM_FALLBACK_CHAIN) — captured once, right after .env loads, before any
+# tool call or log line could possibly carry one. Belt-and-suspenders on top of
+# blocking .env reads (tools.py) and stripping these from the local sandbox's
+# subprocess environment (sandbox.py): if some path I haven't thought of ever
+# puts a raw key into a tool result or exception message, this still keeps it
+# out of progress/harness.log, the JSON stdout stream, and the LLM's own
+# context (redaction runs on tool results before they're appended to messages).
+_REDACT_VALUES = tuple(v for k, v in os.environ.items() if k.endswith("_API_KEY") and v)
+
+
+def _redact(text: str) -> str:
+    """Replace any known secret value in `text` with a placeholder."""
+    if not text:
+        return text
+    for secret in _REDACT_VALUES:
+        text = text.replace(secret, "***REDACTED***")
+    return text
+
 # ─── AUTO-INSTALACIÓN DE DEPENDENCIAS ────────────────────────────────────────
 def _ensure_deps():
     """
@@ -318,7 +339,7 @@ if (
     _root_logger.addHandler(_json_handler)
 
 def _log(role: str, event: str, detail: str = "", level: str = "info"):
-    msg = f"[{role.upper()}] {event}" + (f" | {detail}" if detail else "")
+    msg = _redact(f"[{role.upper()}] {event}" + (f" | {detail}" if detail else ""))
     getattr(logging, level)(msg)
     # Warnings/errors always print, independent of HARNESS_VERBOSITY — they're
     # anomalies, not routine per-agent progress chatter, so summary mode
@@ -1473,7 +1494,7 @@ def run_agent(system_prompt: str, tools: list, task: str,
                 _agent_action(role, fn_name, args_preview, i + 1)
 
             _log(role, "TOOL_CALL", f"{fn_name}({json.dumps(fn_args, ensure_ascii=False)[:100]})")
-            result = execute_tool(fn_name, fn_args)
+            result = _redact(execute_tool(fn_name, fn_args))
             _log(role, "TOOL_RESULT", result[:200])
 
             # Best-effort: track tool-call errors so that if this attempt hits
@@ -2631,7 +2652,7 @@ def run_leader(user_task: str) -> str:
                     }
                 result = json.dumps(cycle_result, ensure_ascii=False)
             else:
-                result = execute_tool(fn_name, fn_args)
+                result = _redact(execute_tool(fn_name, fn_args))
                 if _verbosity_at_least("verbose"):
                     console.print(Panel(
                         f"[dim]{result[:300]}[/]",
@@ -2702,7 +2723,7 @@ def main():
     # Load plugins before the banner so hooks are registered before anything runs
     _load_plugins()
 
-    console.rule("Multi-Agent Harness", style="white")
+    console.rule("Vora Engine", style="white")
     orch_label   = "[cyan]Prefect[/]" if ORCHESTRATOR == "prefect" else "[dim]local[/]"
     budget_label = f"[yellow]USD {COST_BUDGET_USD:.2f} limit[/]" if COST_BUDGET_USD > 0 else "[dim]no limit[/]"
     console.print(

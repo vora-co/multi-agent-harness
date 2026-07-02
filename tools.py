@@ -25,6 +25,18 @@ BLOCKED_BASH_PATTERNS = [
 # Valid feature statuses
 VALID_FEATURE_STATUSES = {"pending", "in_progress", "done", "failed"}
 
+# Secret-holding files agents must never read, regardless of SAFE_WRITE_DIRS —
+# read_file/list_files are not otherwise confined the way write_file/append_file
+# are, so an agent debugging an API connectivity issue could plausibly try
+# read_file(".env") and get DEEPSEEK_API_KEY etc. back as a tool result, which
+# then flows straight into the LLM's own context and into logs. Matches ".env",
+# ".env.local", ".env.production", etc. — not just a literal ".env".
+_SECRET_FILENAME_RE = re.compile(r"^\.env(\..+)?$")
+
+def _is_secret_path(path: str) -> bool:
+    """True if `path`'s basename looks like a secrets file (.env, .env.local, ...)."""
+    return bool(_SECRET_FILENAME_RE.match(os.path.basename(str(path).rstrip("/"))))
+
 def _is_safe_path(path: str) -> bool:
     """Check that the path is within the allowed directories.
     Accepts absolute paths by converting them to relative paths from cwd.
@@ -61,6 +73,11 @@ def _is_safe_command(command: str) -> tuple[bool, str]:
 def read_file(path: str = None, limit: int = None, offset: int = 0,
               file_path: str = None, file: str = None, filename: str = None) -> str:
     path = path or file_path or file or filename
+    if _is_secret_path(path):
+        return json.dumps({
+            "error": f"Refusing to read '{path}' — it matches a secrets file pattern (.env*). "
+                     f"Credentials are never readable by agents, regardless of the reason."
+        })
     try:
         with open(path, "r", encoding="utf-8") as f:
             lines = f.readlines()
@@ -128,6 +145,8 @@ def list_files(directory: str = ".", depth: int = None, limit: int = None, **kwa
                 if current_depth >= depth:
                     dirs[:] = []
             for file in files:
+                if _is_secret_path(file):
+                    continue  # never surface .env* — see _is_secret_path
                 result.append(os.path.join(root, file))
                 if limit is not None and len(result) >= limit:
                     return json.dumps({"files": result, "truncated": True})

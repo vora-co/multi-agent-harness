@@ -926,6 +926,117 @@ class TestValidateSpecStackAware:
         assert "Existing files in src/:" not in user_msg
 
 
+# ── Secret redaction ─────────────────────────────────────────────────────────
+
+class TestRedact:
+    def test_replaces_known_secret_value(self, monkeypatch, tmp_path):
+        h = _load_harness(monkeypatch, tmp_path)
+        monkeypatch.setattr(h, "_REDACT_VALUES", ("sk-super-secret",))
+        assert h._redact("here is sk-super-secret in the middle") == "here is ***REDACTED*** in the middle"
+
+    def test_leaves_unrelated_text_untouched(self, monkeypatch, tmp_path):
+        h = _load_harness(monkeypatch, tmp_path)
+        monkeypatch.setattr(h, "_REDACT_VALUES", ("sk-super-secret",))
+        assert h._redact("nothing sensitive here") == "nothing sensitive here"
+
+    def test_handles_empty_text(self, monkeypatch, tmp_path):
+        h = _load_harness(monkeypatch, tmp_path)
+        assert h._redact("") == ""
+
+    def test_redacts_multiple_distinct_secrets(self, monkeypatch, tmp_path):
+        h = _load_harness(monkeypatch, tmp_path)
+        monkeypatch.setattr(h, "_REDACT_VALUES", ("secret-one", "secret-two"))
+        assert h._redact("secret-one and secret-two") == "***REDACTED*** and ***REDACTED***"
+
+
+class TestToolResultRedactionInRunAgent:
+    """
+    Belt-and-suspenders check: even if a tool result somehow contains a raw
+    secret (e.g. the .env-read block in tools.py were ever bypassed), it must
+    never reach the LLM's own conversation history — not just the logs —
+    since that history gets written into progress/*.md reports too.
+    """
+
+    def _fake_tool_call(self, call_id, name, args_json):
+        from types import SimpleNamespace
+        fn = SimpleNamespace(name=name, arguments=args_json)
+        return SimpleNamespace(id=call_id, function=fn)
+
+    def _fake_response(self, content=None, tool_calls=None):
+        from types import SimpleNamespace
+        msg = SimpleNamespace(content=content, tool_calls=tool_calls)
+        usage = SimpleNamespace(prompt_tokens=10, completion_tokens=5)
+        choice = SimpleNamespace(message=msg)
+        return SimpleNamespace(choices=[choice], usage=usage, model="deepseek-v4-pro")
+
+    def test_secret_stripped_before_appended_to_messages(self, monkeypatch, tmp_path):
+        h = _load_harness(monkeypatch, tmp_path)
+        monkeypatch.setattr(h, "_REDACT_VALUES", ("sk-leaked-secret-value",))
+
+        tool_call_response = self._fake_response(
+            content=None,
+            tool_calls=[self._fake_tool_call("c1", "read_file", '{"path": "x"}')],
+        )
+        final_response = self._fake_response(content="done")
+
+        monkeypatch.setattr(h, "_call_api_with_fallback",
+                             MagicMock(side_effect=[tool_call_response, final_response]))
+        monkeypatch.setattr(h, "execute_tool", MagicMock(
+            return_value=json.dumps({"content": "DEEPSEEK_API_KEY=sk-leaked-secret-value"})
+        ))
+
+        result = h.run_agent("sys", [], "task", role="implementer", max_iter=5)
+
+        assert result == "done"
+        second_call_messages = h._call_api_with_fallback.call_args_list[1].kwargs["messages"]
+        tool_messages = [m for m in second_call_messages if isinstance(m, dict) and m.get("role") == "tool"]
+        assert len(tool_messages) == 1
+        assert "sk-leaked-secret-value" not in tool_messages[0]["content"]
+        assert "***REDACTED***" in tool_messages[0]["content"]
+
+    def test_secret_not_printed_in_verbose_tier(self, monkeypatch, tmp_path):
+        h = _load_harness(monkeypatch, tmp_path, {"HARNESS_VERBOSITY": "verbose"})
+        monkeypatch.setattr(h, "_REDACT_VALUES", ("sk-leaked-secret-value",))
+
+        tool_call_response = self._fake_response(
+            content=None,
+            tool_calls=[self._fake_tool_call("c1", "read_file", '{"path": "x"}')],
+        )
+        final_response = self._fake_response(content="done")
+
+        monkeypatch.setattr(h, "_call_api_with_fallback",
+                             MagicMock(side_effect=[tool_call_response, final_response]))
+        monkeypatch.setattr(h, "execute_tool", MagicMock(
+            return_value=json.dumps({"content": "DEEPSEEK_API_KEY=sk-leaked-secret-value"})
+        ))
+
+        h.run_agent("sys", [], "task", role="implementer", max_iter=5)
+
+        printed = [str(a) for call in h.console.print.call_args_list for a in call.args]
+        assert not any("sk-leaked-secret-value" in p for p in printed)
+
+
+class TestSandboxLocalEnvSanitization:
+    def test_api_keys_stripped_from_local_subprocess_env(self, monkeypatch):
+        monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-should-be-stripped")
+        monkeypatch.setenv("OPENAI_API_KEY", "sk-also-stripped")
+        monkeypatch.setenv("HARNESS_TEST_KEEP_ME", "keep-me")
+
+        for key in list(sys.modules.keys()):
+            if key == "sandbox":
+                del sys.modules[key]
+        root = Path(__file__).parent.parent
+        if str(root) not in sys.path:
+            sys.path.insert(0, str(root))
+        sandbox = importlib.import_module("sandbox")
+
+        env = sandbox._sanitized_host_env()
+
+        assert "DEEPSEEK_API_KEY" not in env
+        assert "OPENAI_API_KEY" not in env
+        assert env.get("HARNESS_TEST_KEEP_ME") == "keep-me"
+
+
 # ── tools.py ─────────────────────────────────────────────────────────────────
 
 class TestTools:
@@ -966,6 +1077,37 @@ class TestTools:
     def test_path_traversal_blocked(self, monkeypatch, tmp_path):
         t = self._load_tools(monkeypatch, tmp_path)
         assert t._is_safe_path("src/../secrets/key.txt") is False
+
+    # _is_secret_path / read_file / list_files blocking .env*
+
+    @pytest.mark.parametrize("name", [".env", ".env.local", ".env.production", "a/b/.env"])
+    def test_is_secret_path_matches_env_variants(self, monkeypatch, tmp_path, name):
+        t = self._load_tools(monkeypatch, tmp_path)
+        assert t._is_secret_path(name) is True
+
+    @pytest.mark.parametrize("name", ["main.py", "environment.py", ".envrc", "config/.env-example.md"])
+    def test_is_secret_path_does_not_match_unrelated_names(self, monkeypatch, tmp_path, name):
+        t = self._load_tools(monkeypatch, tmp_path)
+        assert t._is_secret_path(name) is False
+
+    def test_read_file_refuses_env_file(self, monkeypatch, tmp_path):
+        # read_file has no SAFE_WRITE_DIRS-style confinement (unlike write_file),
+        # so this is the only thing stopping an agent debugging a connectivity
+        # issue from doing read_file(".env") and getting DEEPSEEK_API_KEY back
+        # as a tool result.
+        t = self._load_tools(monkeypatch, tmp_path)
+        (tmp_path / ".env").write_text("DEEPSEEK_API_KEY=sk-super-secret-value")
+        result = json.loads(t.read_file(".env"))
+        assert "error" in result
+        assert "sk-super-secret-value" not in json.dumps(result)
+
+    def test_list_files_omits_env_file(self, monkeypatch, tmp_path):
+        t = self._load_tools(monkeypatch, tmp_path)
+        (tmp_path / ".env").write_text("DEEPSEEK_API_KEY=sk-super-secret-value")
+        (tmp_path / "README.md").write_text("hi")
+        result = json.loads(t.list_files("."))
+        assert not any(f.endswith(".env") for f in result["files"])
+        assert any(f.endswith("README.md") for f in result["files"])
 
     # update_feature_status
 
