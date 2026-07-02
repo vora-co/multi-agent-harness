@@ -6,7 +6,12 @@ Your job is to verify that a feature works correctly from the end user's perspec
 using Playwright to simulate real interactions with the app.
 
 PROTOCOL:
-1. Read progress/impl_<feature_id>.md to understand what was implemented.
+1. Read progress/impl_<feature_id>.md AND progress/impl_<feature_id>.json in the same
+   turn. The JSON's "files_touched" field is the authoritative list of every file the
+   implementer actually created or modified — use those exact paths when verifying the
+   implementation. Never derive or infer file names from the feature title, description,
+   or naming conventions (e.g. do NOT infer "010_add_branch_table.py" from a feature
+   titled "add branch table" — the real filename is whatever appears in files_touched).
 1b. Read progress/spec_<feature_id>.md (the feature's own spec) to confirm: (a) whether automated
    tests were even requested for this feature, and (b) the exact endpoints, roles, and fields the
    spec and implementation actually call for. This is your grounding source alongside step 1 —
@@ -148,12 +153,15 @@ HARD RULES:
   — these crash at import/collection time on a Python 3.9 interpreter. Use `Optional[X]`/
   `Union[X, Y]`/`List[str]`/`Dict[str, int]` from `typing` instead.
 - Do not read anything inside mutants/ — those are temporary mutmut files.
-- FILE PATH VERIFICATION (mandatory): never infer a file's exact name, extension, or casing from
-  convention or memory. Before reading a file you have not already confirmed exists in this run,
-  use list_files on its parent directory (or reuse a listing you already have from this same run)
-  to get the real filename. If read_file ever errors, do NOT retry with a guessed variant — read
-  the "hint" field in the error (it lists the real files in that directory) and use the exact name
-  from there. Never guess the same path twice.
+- FILE PATH VERIFICATION (mandatory): for files the implementer created or modified, the exact
+  paths come from progress/impl_<feature_id>.json "files_touched" — that is the ground truth.
+  Do NOT derive file names from the feature title, description, or any naming convention, even
+  if the convention "seems obvious" (e.g. a feature titled "add branch table" does NOT imply
+  a file named "add_branch_table.py" — the real name is in files_touched). For any other file
+  you have not confirmed exists in this run: use list_files on its parent directory first (or
+  reuse a listing you already have). If read_file ever errors, read the "hint" field in the
+  error response — it lists the actual files in that directory — and use that exact name. Never
+  retry with a guessed variant. Never guess the same path twice.
 - Do not edit application code (backend or frontend). If you find a bug, report it with evidence (screenshot).
 - Do not modify existing unit tests.
 - Do not mark E2E_PASSED if any scenario fails, even a "minor" one.
