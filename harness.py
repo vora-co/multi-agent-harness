@@ -1785,8 +1785,15 @@ def _validate_spec(spec_path: str) -> str:
     except Exception:
         return ""
 
-    tree_src   = _file_tree("src")
-    tree_tests = _file_tree("tests")
+    # Stack-aware (CODE_TREE_DIRS, resolved from stack_layout — same source
+    # of truth spawn_implementer/spawn_reviewer already use), not a
+    # hardcoded "src"/"tests" — a project whose stack profile names its
+    # source dir something else (e.g. backend/) would otherwise get an
+    # empty/wrong tree here, silently making this validation useless for it.
+    tree_sections = "\n\n".join(
+        f"Existing files in {d}/:\n{_file_tree(d) if os.path.exists(d) else '(not created yet)'}"
+        for d in CODE_TREE_DIRS
+    )
 
     try:
         response = _call_api_with_fallback(
@@ -1806,10 +1813,14 @@ def _validate_spec(spec_path: str) -> str:
                     "role": "user",
                     "content": (
                         f"Spec to review:\n{spec_content[:3000]}\n\n"
-                        f"Existing files in src/:\n{tree_src}\n\n"
-                        f"Existing files in tests/:\n{tree_tests}\n\n"
+                        f"{tree_sections}\n\n"
                         "List only concrete issues: wrong file paths, conflicting interfaces, "
                         "duplicate responsibilities, or missing prerequisite files. "
+                        "The file lists above may be truncated (noted inline when they are) — "
+                        "never report a file as missing/nonexistent solely because it doesn't "
+                        "appear in a truncated list; only flag a file path issue you can "
+                        "actually confirm is wrong (e.g. references a directory that doesn't "
+                        "exist at all, or clearly contradicts a file you CAN see). "
                         "Ignore style and completeness. If none, reply: OK"
                     )
                 }
@@ -1898,7 +1909,16 @@ def _extract_retry_context(rejection_reason: str) -> str:
 # ─── SPAWNERS ────────────────────────────────────────────────────────────────
 
 def _file_tree(path: str, max_files: int = 60) -> str:
-    """Compact snapshot of the relevant file tree (without node_modules)."""
+    """
+    Compact snapshot of the relevant file tree (without node_modules).
+
+    Sorts alphabetically and truncates at max_files. When truncated, appends
+    a note saying so — without it, a file whose path sorts past the cutoff
+    (e.g. tests/test_migrations.py in a large tests/ dir) reads as "absent"
+    to anything consuming this string, which _validate_spec previously
+    misread as "doesn't exist" and reported as a spec issue even though the
+    file was on disk the whole time.
+    """
     try:
         result = subprocess.run(
             ["find", path, "-type", "f",
@@ -1907,8 +1927,15 @@ def _file_tree(path: str, max_files: int = 60) -> str:
              "-not", "-path", "*/.git/*"],
             capture_output=True, text=True, timeout=5
         )
-        lines = sorted(result.stdout.strip().splitlines())[:max_files]
-        return "\n".join(lines) or "(empty)"
+        all_lines = sorted(result.stdout.strip().splitlines())
+        lines = all_lines[:max_files]
+        tree = "\n".join(lines) or "(empty)"
+        if len(all_lines) > max_files:
+            tree += (
+                f"\n... ({len(all_lines)} files total, showing first {max_files} alphabetically — "
+                f"this list is truncated, absence from it is not proof a file doesn't exist)"
+            )
+        return tree
     except Exception:
         return "(not available)"
 

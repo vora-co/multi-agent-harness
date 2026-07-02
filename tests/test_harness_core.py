@@ -853,6 +853,79 @@ class TestReviewerAndE2eVerdict:
         assert passed is True
 
 
+# ── _file_tree truncation + _validate_spec stack-awareness ─────────────────────
+
+class TestFileTree:
+    def _make_files(self, tmp_path, n):
+        d = tmp_path / "many"
+        d.mkdir()
+        for i in range(n):
+            (d / f"file_{i:03d}.py").write_text("")
+        return d
+
+    def test_no_truncation_note_under_cap(self, monkeypatch, tmp_path):
+        h = _load_harness(monkeypatch, tmp_path)
+        d = self._make_files(tmp_path, 10)
+        tree = h._file_tree(str(d), max_files=60)
+        assert "truncated" not in tree
+
+    def test_no_truncation_note_exactly_at_cap(self, monkeypatch, tmp_path):
+        h = _load_harness(monkeypatch, tmp_path)
+        d = self._make_files(tmp_path, 60)
+        tree = h._file_tree(str(d), max_files=60)
+        assert "truncated" not in tree
+
+    def test_truncation_note_over_cap(self, monkeypatch, tmp_path):
+        # Regression: a file whose path sorts past the cutoff (e.g.
+        # tests/test_migrations.py in a large tests/ dir) used to look
+        # "absent" to anything consuming this string, which _validate_spec
+        # misread as "doesn't exist" — a false positive on a real file.
+        h = _load_harness(monkeypatch, tmp_path)
+        d = self._make_files(tmp_path, 75)
+        tree = h._file_tree(str(d), max_files=60)
+        assert "75 files total, showing first 60" in tree
+        assert "not proof a file doesn't exist" in tree
+        # The 75th file (alphabetically last) must not silently look absent —
+        # it's summarized by the truncation note instead of just missing.
+        assert "file_074.py" not in tree
+
+
+class TestValidateSpecStackAware:
+    def test_uses_code_tree_dirs_not_hardcoded_src_tests(self, monkeypatch, tmp_path):
+        # _validate_spec previously hardcoded _file_tree("src") / _file_tree("tests")
+        # instead of the stack-resolved CODE_TREE_DIRS every other spawn_*
+        # function already uses — silently useless for a project whose stack
+        # profile names its source dir something else (e.g. backend/).
+        #
+        # resolve_layout() is @lru_cache'd on the stack_layout module object,
+        # which the shared _load_harness() helper doesn't purge from
+        # sys.modules (only "harness"/"harness.*") — an earlier test's
+        # resolution would otherwise stick for the rest of the process, same
+        # as TestRunPlaywrightTests._load_tools already works around.
+        for key in list(sys.modules.keys()):
+            if key in ("tools", "stack_layout"):
+                del sys.modules[key]
+        h = _load_harness(monkeypatch, tmp_path, {"CODE_TREE_DIRS": "backend,backend/tests"})
+        (tmp_path / "progress").mkdir(exist_ok=True)
+        spec_path = tmp_path / "progress" / "spec_1.md"
+        spec_path.write_text("# spec")
+
+        captured = {}
+
+        def fake_call(model, messages, tools, role):
+            captured["messages"] = messages
+            return None
+
+        monkeypatch.setattr(h, "_call_api_with_fallback", fake_call)
+
+        h._validate_spec(str(spec_path))
+
+        user_msg = captured["messages"][1]["content"]
+        assert "Existing files in backend/:" in user_msg
+        assert "Existing files in backend/tests/:" in user_msg
+        assert "Existing files in src/:" not in user_msg
+
+
 # ── tools.py ─────────────────────────────────────────────────────────────────
 
 class TestTools:
