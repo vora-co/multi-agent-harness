@@ -216,6 +216,7 @@ You → process all pending features
 | `/costs` | Shows token usage and estimated cost for this session |
 | `/budget` | Shows current spend vs. budget limit with a progress bar |
 | `/status` | Shows the current state (progress/current.md) |
+| `/verbosity [summary\|normal\|verbose]` | Shows or changes the active console verbosity tier for the rest of the session. See [Console verbosity](#console-verbosity) |
 | `/quit` | Exits the harness |
 
 ---
@@ -281,14 +282,15 @@ Key settings in `harness.py`:
 | `SANDBOX_MODE` | `docker` | Where `run_bash` executes — `docker` (isolated container, recommended) or `local` (direct on host). See [Sandboxed execution](#sandboxed-execution) |
 | `SANDBOX_NETWORK_MODE` | `egress-proxy` | Container network mode — `egress-proxy` (default-deny allowlist, most secure), `bridge` (full outbound, opt out), or `none` (fully air-gapped) |
 | `SANDBOX_EGRESS_ALLOWLIST` | *(registries)* | Comma-separated hostnames reachable in `egress-proxy` mode; `*.example.com` matches subdomains too. See [Sandboxed execution](#sandboxed-execution) |
-| `STRUCTURED_LOG_STDOUT` | `true` | Emit structured JSON logs to stdout, in addition to `progress/harness.log`. Set to `false` to disable. See [Structured logging](#structured-logging) |
+| `STRUCTURED_LOG_STDOUT` | `false` | Emit structured JSON logs to stdout, in addition to `progress/harness.log`. Off by default so it doesn't interleave with the Rich panels meant for a human at the terminal. Set to `true` to opt in. See [Structured logging](#structured-logging) |
+| `HARNESS_VERBOSITY` | `normal` | Console output tier: `summary` \| `normal` \| `verbose`. See [Console verbosity](#console-verbosity) |
 
 ### Structured logging
 
 The harness logs to two destinations at once — nothing you had before is removed:
 
 1. **`progress/harness.log`** — plain text, unchanged (`%(asctime)s | %(levelname)s | %(message)s`). Anything already tailing this file, or any plugin that just calls `logging.getLogger(...).info(...)` and expects a configured root logger, keeps working exactly as before.
-2. **stdout** — one JSON object per line, for log aggregators or structured-logging pipelines:
+2. **stdout** — one JSON object per line, for log aggregators or structured-logging pipelines. **Off by default** — a human at the terminal is watching the Rich panels described in [Console verbosity](#console-verbosity) below, and a raw JSON line per log event interleaved with those panels is noise for that audience:
 
 ```json
 {"timestamp": "2026-06-30T18:04:12.501Z", "level": "INFO", "session_id": "3f1e2b9a-...", "feature_id": 3, "message": "[IMPLEMENTER] SPAWN feature=3 attempt=1"}
@@ -304,9 +306,28 @@ The harness logs to two destinations at once — nothing you had before is remov
 
 Both handlers are fed by the same `logging` calls, so this applies to any plugin's own logging too, with zero changes on the plugin side — `logging.getLogger(__name__).warning(...)` in a plugin shows up in both `progress/harness.log` and the JSON stdout stream automatically, since both are handlers on the root logger.
 
-To consume the stream: `python3 harness.py | jq 'select(.level == "ERROR")'`, or point a log shipper (Vector, Fluent Bit, etc.) at the process's stdout.
+Set `STRUCTURED_LOG_STDOUT=true` in `.env` to opt in — for CI, or when piping this process's stdout to a log aggregator (Vector, Fluent Bit, etc.) that wants the machine-readable stream instead: `STRUCTURED_LOG_STDOUT=true python3 harness.py | jq 'select(.level == "ERROR")'`. `progress/harness.log` is unaffected either way.
 
-Set `STRUCTURED_LOG_STDOUT=false` in `.env` to turn off the stdout handler (e.g. running inside a TUI that already owns stdout) — `progress/harness.log` is unaffected either way.
+### Console verbosity
+
+Three tiers, ascending, controlling how much lands on the terminal (`HARNESS_VERBOSITY` in `.env`, default `normal`):
+
+| Tier | Shows |
+|---|---|
+| `summary` | Feature start, final verdict (approved/rejected), session cost summary. Nothing else. |
+| `normal` (default) | Everything in `summary`, plus one line per agent step — spec written, impl done, E2E result, review verdict, retry/skip notices. |
+| `verbose` | Everything in `normal`, plus per-tool-call detail inside each agent's own loop (which tool, what arguments, what result). |
+
+Warnings and errors always print regardless of tier — those are anomalies, not routine progress chatter, so `summary` mode doesn't hide them.
+
+Change it for the session in `.env`, or live during a run with the `/verbosity` REPL command:
+
+```
+You → /verbosity
+  Verbosity: normal
+You → /verbosity summary
+  Verbosity set to summary
+```
 
 ### Per-agent model selection
 
@@ -604,6 +625,9 @@ Active development continues in the premium edition. See the [⭐ Premium module
 ---
 
 ## Changelog
+
+### v1.21.0
+- **`STRUCTURED_LOG_STDOUT` defaults to `false`; new `HARNESS_VERBOSITY` console tiers, replacing `VERBOSE`.** With structured JSON logging defaulting on, every one of `_log()`'s ~50 call sites also emitted a raw JSON line on stdout — interleaved with the Rich panels meant for a human at the terminal, two audiences fighting for one screen. Flipped the default off (opt in with `STRUCTURED_LOG_STDOUT=true` for CI/log aggregators); extracted `_structured_log_stdout_enabled()` so the default is unit-testable without going through actual (process-global, only-configures-once) handler registration. Separately: the old `VERBOSE` flag (hardcoded `True`) already gated *tool-call-level* detail inside `run_agent`'s and `run_leader`'s loops, but the *per-agent* lines (spec/impl/e2e/review one-liners, retry/skip panels) had no gate at all — always printed, no way to quiet them, and no "just tell me when a feature starts and finishes" tier existed at all. Replaced `VERBOSE` with `HARNESS_VERBOSITY=summary|normal|verbose` (`.env` default, or change live with the new `/verbosity` REPL command) and a thin `_vprint(min_level, ...)` wrapper around `console.print` — `_verbosity_at_least()` is the single place tier-comparison logic lives, so none of the ~20 migrated call sites duplicate it. `summary` is genuinely new: added a "▶ Feature #N started" line and "✅/❌ approved/failed" verdict lines to `_run_feature_cycle_impl`, since nothing at that granularity existed before. Warnings/errors from `_log()` always print regardless of tier — anomalies, not routine chatter. A larger fourth idea (buffering each feature's output into one grouped panel, using the existing `_CURRENT_FEATURE_ID` contextvar) was investigated and deliberately deferred: it's cheap to build on top of the `_vprint` funnel this adds, but premium's `harness_parallel.py` documents that it currently relies on immediate, interleaved `console.print` from concurrent threads — changing that shared behavior isn't a call the public repo should make unilaterally without premium verifying it first. 29 new tests in `tests/test_harness_core.py` (`TestStructuredLogStdoutDefault`, `TestVerbosity`, `TestFeatureCycleVerbosityIntegration`), including an end-to-end regression proving `summary` mode suppresses a retry panel that `normal` mode shows. See [Structured logging](#structured-logging) and the new [Console verbosity](#console-verbosity) section.
 
 ### v1.20.0
 - **Structured sibling JSON status files, replacing prose-substring heuristics for cache/verdict decisions.** Pipeline-critical decisions were made by pattern-matching agent prose: `_verdict_is()` prefix-matching a returned "APPROVED"/"E2E_PASSED" chat string (already the source of two documented bugs — case-sensitive verdict parsing, E2E verdict polarity), and `spawn_implementer`'s cache check, `"passed" in content and "[ERROR" not in content` on `impl_N.md`, which had a live bug of the same kind: pytest output containing `"2 failed, 1 passed"` matches `"passed" in content` and could silently reuse a failing implementation. Each of the 4 agents now also writes a small sibling JSON file next to its prose report (`progress/impl_N.json` next to `impl_N.md`, etc.) with `{schema_version, status, tests_passed, files_touched, reason}`. New `_read_structured_status()` reads it (returns `None` — never raises — if absent, unreadable, or missing `schema_version`, so foreign JSON can't be half-trusted); new `_reviewer_verdict()` and `_e2e_verdict()` prefer it over `_verdict_is()` + prefix-stripping; `spawn_implementer`'s cache check prefers `tests_passed`/`status` over the substring check. A sibling file (not a block embedded in the `.md`) was chosen deliberately: `agents/spec_writer.py`'s own template requires documenting example response shapes like `{data, total, page, page_size}` directly in the prose, and impl/review reports embed raw pytest output — both can contain JSON-looking text, making "the" JSON block in a Markdown file ambiguous to extract; a separate file has no such collision risk. Every call site falls back to the exact old substring behavior when the sibling file is absent, so `progress/` directories from before this schema existed keep working with zero migration. See the new [Structured status files](#structured-status-files) section. 16 new tests in `tests/test_harness_core.py` (`TestReadStructuredStatus`, `TestImplCacheStructuredVsLegacy`, `TestReviewerAndE2eVerdict`), including a regression test reproducing the `"2 failed, 1 passed"` cache bug and confirming it's fixed for projects using the new schema (and unchanged, by design, for legacy `progress/` directories without it).

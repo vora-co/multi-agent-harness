@@ -108,7 +108,29 @@ MODEL_BY_ROLE: dict[str, str] = {
     "compaction":  os.getenv("MODEL_COMPACTION",   "deepseek-v4-flash"), # unused since deterministic compaction (no LLM call) — kept for plugins that may still want a cheap model for this role
 }
 
-VERBOSE = True
+# ─── CONSOLE VERBOSITY ────────────────────────────────────────────────────────
+# Three tiers, ascending:
+#   summary — feature start, final verdict (approved/rejected), session summary.
+#             Nothing else — no per-agent lines.
+#   normal  — summary, plus one line per agent step (spawn_spec_writer,
+#             spawn_implementer, spawn_e2e_tester, spawn_reviewer, and the
+#             retry/skip/resume lines in _run_feature_cycle_impl). Default.
+#   verbose — normal, plus per-tool-call detail inside run_agent's and
+#             run_leader's loops (which tool, what args, what result).
+# Warnings/errors logged via _log() always print regardless of tier — those
+# are anomalies, not routine progress chatter, so summary mode doesn't hide
+# them. Change at runtime with the /verbosity REPL command, or set
+# HARNESS_VERBOSITY in .env for the session default.
+_VERBOSITY_LEVELS = ("summary", "normal", "verbose")  # ascending
+HARNESS_VERBOSITY = os.getenv("HARNESS_VERBOSITY", "normal").strip().lower()
+if HARNESS_VERBOSITY not in _VERBOSITY_LEVELS:
+    logging.warning(f"HARNESS_VERBOSITY={HARNESS_VERBOSITY!r} is invalid — falling back to 'normal'")
+    HARNESS_VERBOSITY = "normal"
+
+
+def _verbosity_at_least(min_level: str) -> bool:
+    """True if the active HARNESS_VERBOSITY tier is at or above min_level."""
+    return _VERBOSITY_LEVELS.index(HARNESS_VERBOSITY) >= _VERBOSITY_LEVELS.index(min_level)
 
 # ─── ORCHESTRATOR SELECTION ──────────────────────────────────────────────────
 # Controls whether the harness runs in plain Python mode or wraps execution
@@ -232,9 +254,12 @@ def _price_for_model(model_name: str) -> dict[str, float]:
 #      while a feature is being processed (None outside that scope, e.g.
 #      leader-level orchestration log lines).
 #
-# Set STRUCTURED_LOG_STDOUT=false in .env to disable the stdout handler (e.g.
-# running inside a TUI that already owns stdout) — the file handler is always
-# on and is not affected by this flag.
+# Off by default: a human at the terminal is watching Rich panels, and a raw
+# JSON line per _log() call interleaved with those panels is noise for that
+# audience. Set STRUCTURED_LOG_STDOUT=true in .env to opt in — for CI, or
+# when piping this process's stdout to a log aggregator (Vector, Fluent Bit,
+# etc.) that wants the machine-readable stream instead. The file handler is
+# always on regardless of this flag.
 _SESSION_ID = str(uuid.uuid4())
 
 # Set by run_feature_cycle() for the duration of a feature's spec→impl→e2e→
@@ -267,10 +292,21 @@ logging.basicConfig(
     datefmt="%Y-%m-%d %H:%M:%S"
 )
 
+def _structured_log_stdout_enabled() -> bool:
+    """
+    Whether the JSON stdout handler should be active. Pulled out as its own
+    function (rather than inlined in the `if` below) so the default can be
+    unit-tested directly — actual handler registration is process-global and
+    only-configures-once (same quirk as progress/harness.log's handler), so
+    testing that side effect directly is order-dependent across a test run.
+    """
+    return os.getenv("STRUCTURED_LOG_STDOUT", "false").strip().lower() not in ("false", "0", "no")
+
+
 _JSON_STDOUT_HANDLER_NAME = "harness_json_stdout"
 _root_logger = logging.getLogger()
 if (
-    os.getenv("STRUCTURED_LOG_STDOUT", "true").strip().lower() not in ("false", "0", "no")
+    _structured_log_stdout_enabled()
     # Guard against duplicate handlers if this module is ever re-imported in
     # the same process (e.g. the test suite reloads harness.py per test).
     and not any(h.name == _JSON_STDOUT_HANDLER_NAME for h in _root_logger.handlers)
@@ -284,10 +320,22 @@ if (
 def _log(role: str, event: str, detail: str = "", level: str = "info"):
     msg = f"[{role.upper()}] {event}" + (f" | {detail}" if detail else "")
     getattr(logging, level)(msg)
-    if VERBOSE and level in ("warning", "error"):
+    # Warnings/errors always print, independent of HARNESS_VERBOSITY — they're
+    # anomalies, not routine per-agent progress chatter, so summary mode
+    # doesn't hide them.
+    if level in ("warning", "error"):
         console.print(f"  [dim red]{msg}[/]")
 
 console = Console()
+
+
+def _vprint(min_level: str, *args, **kwargs) -> None:
+    """console.print(...), only emitted if the active HARNESS_VERBOSITY tier
+    is at or above min_level. Thin wrapper so the tier-comparison logic lives
+    in exactly one place (_verbosity_at_least) instead of being duplicated at
+    every call site."""
+    if _verbosity_at_least(min_level):
+        console.print(*args, **kwargs)
 
 # ─── LLM PROVIDER RESILIENCE ─────────────────────────────────────────────────
 # The harness supports an ordered fallback chain of OpenAI-compatible providers.
@@ -557,10 +605,11 @@ def _phase_header(agent: str, action: str, feature_id: int = None,
     feat_info = f" → Feature #{feature_id}" if feature_id else ""
     attempt_info = f" [dim](attempt {attempt})[/]" if attempt and attempt > 1 else ""
 
-    console.rule(
-        f"[{color}]{icon} {agent.upper()} — {action}{feat_info}[/]{attempt_info}{progress}",
-        style=color
-    )
+    if _verbosity_at_least("normal"):
+        console.rule(
+            f"[{color}]{icon} {agent.upper()} — {action}{feat_info}[/]{attempt_info}{progress}",
+            style=color
+        )
 
 def _agent_action(agent: str, tool: str, args_preview: str, step: int):
     """Compact line showing which tool the agent is using."""
@@ -1420,7 +1469,7 @@ def run_agent(system_prompt: str, tools: list, task: str,
                 continue
 
             args_preview = json.dumps(fn_args, ensure_ascii=False)[:80]
-            if VERBOSE:
+            if _verbosity_at_least("verbose"):
                 _agent_action(role, fn_name, args_preview, i + 1)
 
             _log(role, "TOOL_CALL", f"{fn_name}({json.dumps(fn_args, ensure_ascii=False)[:100]})")
@@ -1438,7 +1487,7 @@ def run_agent(system_prompt: str, tools: list, task: str,
             except Exception:
                 pass
 
-            if VERBOSE:
+            if _verbosity_at_least("verbose"):
                 try:
                     parsed = json.loads(result)
                     success = not ("error" in parsed) and parsed.get("success", True) is not False
@@ -1962,7 +2011,7 @@ def spawn_implementer(feature_id: int, description: str, attempt: int = 1,
         if status is not None:
             if status.get("tests_passed") and status.get("status") != "error":
                 _log("implementer", "SKIP", f"Existing impl with passing tests: {impl_path}")
-                console.print(f"  [blue]🔨 IMPLEMENTER[/] [dim]↩ reusing existing impl →[/] {impl_path}")
+                _vprint("normal", f"  [blue]🔨 IMPLEMENTER[/] [dim]↩ reusing existing impl →[/] {impl_path}")
                 return impl_path
         else:
             try:
@@ -1970,7 +2019,7 @@ def spawn_implementer(feature_id: int, description: str, attempt: int = 1,
                     content = f.read()
                 if "passed" in content and "[ERROR" not in content:
                     _log("implementer", "SKIP", f"Existing impl with passing tests: {impl_path}")
-                    console.print(f"  [blue]🔨 IMPLEMENTER[/] [dim]↩ reusing existing impl →[/] {impl_path}")
+                    _vprint("normal", f"  [blue]🔨 IMPLEMENTER[/] [dim]↩ reusing existing impl →[/] {impl_path}")
                     return impl_path
             except Exception:
                 pass
@@ -2022,7 +2071,7 @@ def spawn_implementer(feature_id: int, description: str, attempt: int = 1,
                        role="implementer", color="blue", max_iter=MAX_ITER_IMPL,
                        checkpoint_key=f"implementer_{feature_id}_{attempt}")
     done = not result.startswith("[ERROR")
-    console.print(f"  [blue]🔨 IMPLEMENTER[/] {'[green]✓ done[/]' if done else '[red]✗ error[/]'} → {result[:80]}")
+    _vprint("normal", f"  [blue]🔨 IMPLEMENTER[/] {'[green]✓ done[/]' if done else '[red]✗ error[/]'} → {result[:80]}")
     return result
 
 
@@ -2035,7 +2084,7 @@ def spawn_spec_writer(feature_id: int, description: str) -> str:
     # Reuse existing spec — avoids spending iterations regenerating
     if os.path.exists(spec_path):
         _log("spec_writer", "SKIP", f"Spec already exists: {spec_path}")
-        console.print(f"  [cyan]📋 SPEC_WRITER[/] [dim]↩ reusing existing spec →[/] {spec_path}")
+        _vprint("normal", f"  [cyan]📋 SPEC_WRITER[/] [dim]↩ reusing existing spec →[/] {spec_path}")
         return spec_path
 
     _phase_header("spec_writer", "Writing spec", feature_id)
@@ -2057,7 +2106,7 @@ def spawn_spec_writer(feature_id: int, description: str) -> str:
                        role="spec_writer", color="cyan", max_iter=MAX_ITER_SPEC,
                        checkpoint_key=f"spec_writer_{feature_id}_1")
     done = not result.startswith("[ERROR")
-    console.print(f"  [cyan]📋 SPEC_WRITER[/] {'[green]✓ spec ready[/]' if done else '[red]✗ error[/]'} → {result[:80]}")
+    _vprint("normal", f"  [cyan]📋 SPEC_WRITER[/] {'[green]✓ spec ready[/]' if done else '[red]✗ error[/]'} → {result[:80]}")
 
     # Validate the freshly generated spec against the current codebase.
     # Skipped if the spec failed to generate or the agent returned an error.
@@ -2067,7 +2116,7 @@ def spawn_spec_writer(feature_id: int, description: str) -> str:
         if issues_text:
             spec_issues = [l for l in issues_text.splitlines() if l.strip()]
             _log("spec_writer", "SPEC_VALIDATION_ISSUES", issues_text[:300], level="warning")
-            console.print(f"  [cyan]📋 SPEC_WRITER[/] [yellow]⚠ validation issues found — annotating spec[/]")
+            _vprint("normal", f"  [cyan]📋 SPEC_WRITER[/] [yellow]⚠ validation issues found — annotating spec[/]")
             try:
                 with open(spec_path, "a", encoding="utf-8") as f:
                     f.write(
@@ -2080,7 +2129,7 @@ def spawn_spec_writer(feature_id: int, description: str) -> str:
             except Exception:
                 pass
         else:
-            console.print(f"  [cyan]📋 SPEC_WRITER[/] [dim]✓ spec validated — no issues[/]")
+            _vprint("normal", f"  [cyan]📋 SPEC_WRITER[/] [dim]✓ spec validated — no issues[/]")
 
     _fire("after_spec_generated",
           feature_id=feature_id, spec_path=spec_path, issues=spec_issues)
@@ -2154,7 +2203,7 @@ def spawn_reviewer(feature_id: int, e2e: bool = True, attempt: int = 1) -> str:
     verdict_color = "green" if approved else "red"
     verdict_icon  = "✅" if approved else "❌"
     _log("reviewer", "VERDICT", result[:200], level="info" if approved else "warning")
-    console.print(f"  [magenta]🔍 REVIEWER[/] [{verdict_color}]{verdict_icon} {result[:100]}[/]")
+    _vprint("normal", f"  [magenta]🔍 REVIEWER[/] [{verdict_color}]{verdict_icon} {result[:100]}[/]")
     return result
 
 
@@ -2184,7 +2233,7 @@ def spawn_e2e_tester(feature_id: int, attempt: int = 1) -> str:
     passed = _verdict_is(result, "E2E_PASSED")
     color  = "green" if passed else "red"
     _log("e2e_tester", "VERDICT", result[:200], level="info" if passed else "warning")
-    console.print(Panel(
+    _vprint("normal", Panel(
         f"[bold]{result[:200]}[/]",
         title=f"[{color}]<< E2E_TESTER verdict[/]",
         border_style=color,
@@ -2220,6 +2269,10 @@ def _run_feature_cycle_impl(feature_id: int, description: str, e2e: bool = True)
     # ── Lifecycle hook ───────────────────────────────────────────────────────
     _fire("before_feature", feature_id=feature_id, description=description, e2e=e2e)
 
+    # summary-tier: always shown, even at HARNESS_VERBOSITY=summary — this is
+    # the "a feature started" signal that tier is meant to preserve.
+    console.print(f"[bold]▶ Feature #{feature_id}[/] {description[:80]}")
+
     # ── Budget guard ─────────────────────────────────────────────────────────
     if _BUDGET_EXCEEDED:
         msg = f"[BUDGET_EXCEEDED] Feature #{feature_id} skipped — session budget of USD {COST_BUDGET_USD:.2f} was reached."
@@ -2232,7 +2285,8 @@ def _run_feature_cycle_impl(feature_id: int, description: str, e2e: bool = True)
     if _ckpt:
         _ckpt_step    = _ckpt.get("step", "")
         _ckpt_attempt = int(_ckpt.get("attempt", 1))
-        console.print(
+        _vprint(
+            "normal",
             f"  [cyan]↺ Resuming feature #{feature_id} from checkpoint[/] "
             f"[dim](step={_ckpt_step}, attempt={_ckpt_attempt})[/]"
         )
@@ -2246,7 +2300,7 @@ def _run_feature_cycle_impl(feature_id: int, description: str, e2e: bool = True)
     # Skip if spec was already written in a previous run.
     if _ckpt_step in ("spec_done", "impl_done", "e2e_done"):
         spec_path = f"progress/spec_{feature_id}.md"
-        console.print(f"  [dim]↺ skipping spec (already done)[/]")
+        _vprint("normal", f"  [dim]↺ skipping spec (already done)[/]")
     else:
         spec_result = spawn_spec_writer(feature_id, description)
         spec_path = spec_result.strip() if not spec_result.startswith("[ERROR") else None
@@ -2265,7 +2319,7 @@ def _run_feature_cycle_impl(feature_id: int, description: str, e2e: bool = True)
             and _ckpt_attempt == attempt
         )
         if _skip_impl:
-            console.print(f"  [dim]↺ skipping impl attempt {attempt} (already done)[/]")
+            _vprint("normal", f"  [dim]↺ skipping impl attempt {attempt} (already done)[/]")
             impl_result = "RESUMED"
         else:
             impl_result = spawn_implementer(
@@ -2280,6 +2334,7 @@ def _run_feature_cycle_impl(feature_id: int, description: str, e2e: bool = True)
                      f"feature={feature_id} type={err_type} detail={impl_result[:200]}", level="error")
                 if err_type == "FATAL":
                     _clear_checkpoint(feature_id)
+                    console.print(f"[red]❌ Feature #{feature_id} failed[/]: {impl_result[:100]}")
                     return {"approved": False, "attempts": attempt, "final_verdict": impl_result}
                 rejection_reason = impl_result
                 continue
@@ -2294,7 +2349,7 @@ def _run_feature_cycle_impl(feature_id: int, description: str, e2e: bool = True)
         if not e2e:
             e2e_result = "E2E_PASSED"  # not applicable — skip silently
         elif _skip_e2e:
-            console.print(f"  [dim]↺ skipping e2e attempt {attempt} (already done)[/]")
+            _vprint("normal", f"  [dim]↺ skipping e2e attempt {attempt} (already done)[/]")
             e2e_result = "E2E_PASSED"
         else:
             e2e_result = spawn_e2e_tester(feature_id, attempt=attempt)
@@ -2316,7 +2371,7 @@ def _run_feature_cycle_impl(feature_id: int, description: str, e2e: bool = True)
             # E2E failure counts as rejection — implementer fixes it on next attempt
             rejection_reason = f"E2E failed: {e2e_reason}"
             if attempt < MAX_RETRIES_REVIEW:
-                console.print(Panel(
+                _vprint("normal", Panel(
                     f"[red]E2E failed — retrying impl (attempt {attempt+1}/{MAX_RETRIES_REVIEW})[/]\n"
                     f"[dim]{e2e_reason[:200]}[/]",
                     title=f"[red]↻ E2E → impl — feature #{feature_id}[/]",
@@ -2340,6 +2395,7 @@ def _run_feature_cycle_impl(feature_id: int, description: str, e2e: bool = True)
                 _clear_checkpoint(feature_id)
                 _fire("after_feature_approved",
                       feature_id=feature_id, description=description, attempts=attempt)
+                console.print(f"[green]✅ Feature #{feature_id} approved[/] ({attempt} attempt(s))")
                 return {"approved": True, "attempts": attempt, "final_verdict": review_result}
 
             # A plugin vetoed the approval. Fold it into the existing
@@ -2352,7 +2408,7 @@ def _run_feature_cycle_impl(feature_id: int, description: str, e2e: bool = True)
                  f"plugin={gate_block.get('plugin', '?')} reason={rejection_reason[:150]}",
                  level="warning")
             if attempt < MAX_RETRIES_REVIEW:
-                console.print(Panel(
+                _vprint("normal", Panel(
                     f"[red]Approval blocked by a governance plugin — retry {attempt+1}/{MAX_RETRIES_REVIEW}[/]\n"
                     f"[dim]{rejection_reason[:200]}[/]",
                     title=f"[red]🚧 gate vetoed verdict — feature #{feature_id}[/]",
@@ -2365,7 +2421,7 @@ def _run_feature_cycle_impl(feature_id: int, description: str, e2e: bool = True)
              f"feature={feature_id} attempt={attempt}/{MAX_RETRIES_REVIEW} reason={rejection_reason[:100]}",
              level="warning")
         if attempt < MAX_RETRIES_REVIEW:
-            console.print(Panel(
+            _vprint("normal", Panel(
                 f"[yellow]Reviewer rejected — retry {attempt+1}/{MAX_RETRIES_REVIEW}[/]\n"
                 f"[dim]{rejection_reason[:200]}[/]",
                 title=f"[yellow]↻ impl→e2e→review cycle — feature #{feature_id}[/]",
@@ -2377,6 +2433,7 @@ def _run_feature_cycle_impl(feature_id: int, description: str, e2e: bool = True)
     _fire("after_feature_failed",
           feature_id=feature_id, description=description,
           attempts=MAX_RETRIES_REVIEW, final_verdict=final_verdict)
+    console.print(f"[red]❌ Feature #{feature_id} failed[/]: {final_verdict[:100]}")
     return {"approved": False, "attempts": MAX_RETRIES_REVIEW, "final_verdict": final_verdict}
 
 
@@ -2512,7 +2569,7 @@ def run_leader(user_task: str) -> str:
                 })
                 continue
 
-            if VERBOSE and fn_name != "run_feature_cycle":
+            if _verbosity_at_least("verbose") and fn_name != "run_feature_cycle":
                 args_preview = json.dumps(fn_args, ensure_ascii=False)[:200]
                 console.print(Panel(
                     f"[bold]Action:[/]  [cyan]{fn_name}[/]\n[dim]{args_preview}[/]",
@@ -2548,7 +2605,7 @@ def run_leader(user_task: str) -> str:
                 result = json.dumps(cycle_result, ensure_ascii=False)
             else:
                 result = execute_tool(fn_name, fn_args)
-                if VERBOSE:
+                if _verbosity_at_least("verbose"):
                     console.print(Panel(
                         f"[dim]{result[:300]}[/]",
                         title="[yellow]Observation[/]",
@@ -2610,6 +2667,8 @@ def print_features():
 
 
 def main():
+    global HARNESS_VERBOSITY  # /verbosity REPL command mutates this below
+
     # Verify and install dependencies before showing any UI
     _ensure_deps()
 
@@ -2620,9 +2679,9 @@ def main():
     orch_label   = "[cyan]Prefect[/]" if ORCHESTRATOR == "prefect" else "[dim]local[/]"
     budget_label = f"[yellow]USD {COST_BUDGET_USD:.2f} limit[/]" if COST_BUDGET_USD > 0 else "[dim]no limit[/]"
     console.print(
-        f"  Model: [cyan]{MODEL}[/]  |  Orchestrator: {orch_label}  |  Budget: {budget_label}\n"
+        f"  Model: [cyan]{MODEL}[/]  |  Orchestrator: {orch_label}  |  Budget: {budget_label}  |  Verbosity: [cyan]{HARNESS_VERBOSITY}[/]\n"
         f"  Flow: [green]👑 Leader[/] → [cyan]📋 Spec[/] → [blue]🔨 Impl[/] → [yellow]🧪 E2E[/] → [magenta]🔍 Reviewer[/]\n"
-        f"  [dim]Commands: /quit | /status | /features | /costs | /budget[/]"
+        f"  [dim]Commands: /quit | /status | /features | /costs | /budget | /verbosity[/]"
     )
     console.rule(style="dim")
 
@@ -2703,6 +2762,18 @@ def main():
                     console.print(
                         f"  Spent this session: [cyan]USD {current_usd:.4f}[/]  "
                         f"[dim](no budget limit set — add COST_BUDGET_USD=N to .env to enable)[/]"
+                    )
+                continue
+            elif user_input.startswith("/verbosity"):
+                arg = user_input[len("/verbosity"):].strip().lower()
+                if not arg:
+                    console.print(f"  Verbosity: [cyan]{HARNESS_VERBOSITY}[/]")
+                elif arg in _VERBOSITY_LEVELS:
+                    HARNESS_VERBOSITY = arg
+                    console.print(f"  Verbosity set to [cyan]{HARNESS_VERBOSITY}[/]")
+                else:
+                    console.print(
+                        f"  [red]Unknown level '{arg}'[/] — choose one of: {', '.join(_VERBOSITY_LEVELS)}"
                     )
                 continue
 

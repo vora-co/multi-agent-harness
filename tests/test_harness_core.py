@@ -548,7 +548,13 @@ class TestStructuredLogging:
         )
 
     def test_exactly_one_json_stdout_handler_is_registered(self, monkeypatch, tmp_path):
-        h = _load_harness(monkeypatch, tmp_path)
+        # STRUCTURED_LOG_STDOUT defaults to off (see TestStructuredLogStdoutDefault
+        # below), so this test — which is specifically about the opt-in "enabled"
+        # path — must request it explicitly. Otherwise this would be order-dependent:
+        # it'd only pass if some earlier test in the same pytest process happened to
+        # enable it first (the handler-registration guard is process-global, same
+        # "only configures once" quirk as progress/harness.log's handler).
+        h = _load_harness(monkeypatch, tmp_path, {"STRUCTURED_LOG_STDOUT": "true"})
         json_handlers = [
             handler for handler in h.logging.getLogger().handlers
             if handler.name == h._JSON_STDOUT_HANDLER_NAME
@@ -565,6 +571,111 @@ class TestStructuredLogging:
         line = json_handlers[0].formatter.format(self._record())
         parsed = json.loads(line)
         assert set(parsed.keys()) == {"timestamp", "level", "session_id", "feature_id", "message"}
+
+
+class TestStructuredLogStdoutDefault:
+    def test_unset_env_var_is_disabled(self, monkeypatch, tmp_path):
+        h = _load_harness(monkeypatch, tmp_path)
+        assert h._structured_log_stdout_enabled() is False
+
+    @pytest.mark.parametrize("value", ["true", "TRUE", "1", "yes", "on"])
+    def test_truthy_values_enable_it(self, monkeypatch, tmp_path, value):
+        h = _load_harness(monkeypatch, tmp_path, {"STRUCTURED_LOG_STDOUT": value})
+        assert h._structured_log_stdout_enabled() is True
+
+    @pytest.mark.parametrize("value", ["false", "FALSE", "0", "no", "No"])
+    def test_falsy_values_disable_it(self, monkeypatch, tmp_path, value):
+        h = _load_harness(monkeypatch, tmp_path, {"STRUCTURED_LOG_STDOUT": value})
+        assert h._structured_log_stdout_enabled() is False
+
+
+# ── Console verbosity tiers (summary/normal/verbose) ────────────────────────────
+
+class TestVerbosity:
+    def test_default_is_normal(self, monkeypatch, tmp_path):
+        h = _load_harness(monkeypatch, tmp_path)
+        assert h.HARNESS_VERBOSITY == "normal"
+
+    @pytest.mark.parametrize("level", ["summary", "normal", "verbose"])
+    def test_explicit_valid_value_is_used(self, monkeypatch, tmp_path, level):
+        h = _load_harness(monkeypatch, tmp_path, {"HARNESS_VERBOSITY": level})
+        assert h.HARNESS_VERBOSITY == level
+
+    def test_invalid_value_falls_back_to_normal(self, monkeypatch, tmp_path):
+        h = _load_harness(monkeypatch, tmp_path, {"HARNESS_VERBOSITY": "extremely_loud"})
+        assert h.HARNESS_VERBOSITY == "normal"
+
+    @pytest.mark.parametrize("active,min_level,expected", [
+        ("summary", "summary", True), ("summary", "normal", False), ("summary", "verbose", False),
+        ("normal",  "summary", True), ("normal",  "normal",  True),  ("normal",  "verbose", False),
+        ("verbose", "summary", True), ("verbose", "normal",  True),  ("verbose", "verbose", True),
+    ])
+    def test_verbosity_at_least(self, monkeypatch, tmp_path, active, min_level, expected):
+        h = _load_harness(monkeypatch, tmp_path, {"HARNESS_VERBOSITY": active})
+        assert h._verbosity_at_least(min_level) is expected
+
+    def test_vprint_emits_when_tier_sufficient(self, monkeypatch, tmp_path):
+        h = _load_harness(monkeypatch, tmp_path, {"HARNESS_VERBOSITY": "normal"})
+        h._vprint("normal", "hello")
+        h.console.print.assert_called_once_with("hello")
+
+    def test_vprint_suppressed_when_tier_insufficient(self, monkeypatch, tmp_path):
+        h = _load_harness(monkeypatch, tmp_path, {"HARNESS_VERBOSITY": "summary"})
+        h._vprint("normal", "hello")
+        h.console.print.assert_not_called()
+
+
+class TestFeatureCycleVerbosityIntegration:
+    """
+    End-to-end: with spawn_* mocked (same pattern as
+    test_resumability.py::TestRunFeatureCycleResume._patch_cycle), verify
+    HARNESS_VERBOSITY actually gates the retry Panel emitted directly by
+    _run_feature_cycle_impl, while the summary-tier start/verdict lines
+    always show regardless of tier.
+    """
+
+    def _patch_cycle(self, h, monkeypatch, review_results):
+        monkeypatch.setattr(h, "spawn_spec_writer", MagicMock(return_value="progress/spec_1.md"))
+        monkeypatch.setattr(h, "spawn_implementer", MagicMock(return_value="ok"))
+        monkeypatch.setattr(h, "spawn_e2e_tester", MagicMock(return_value="E2E_PASSED"))
+        monkeypatch.setattr(h, "spawn_reviewer", MagicMock(side_effect=review_results))
+        monkeypatch.setattr(h, "_fire", MagicMock())
+        monkeypatch.setattr(h, "_fire_gate", MagicMock(return_value=None))
+        monkeypatch.setattr(h, "_track_usage", MagicMock())
+
+    def _printed_args(self, h):
+        return [a for call in h.console.print.call_args_list for a in call.args]
+
+    def test_normal_tier_shows_retry_panel(self, monkeypatch, tmp_path):
+        (tmp_path / "progress").mkdir(exist_ok=True)
+        h = _load_harness(monkeypatch, tmp_path, {"HARNESS_VERBOSITY": "normal"})
+        self._patch_cycle(h, monkeypatch, review_results=["REJECTED: bad code", "APPROVED"])
+
+        result = h.run_feature_cycle(1, "desc", e2e=False)
+
+        assert result["approved"] is True
+        printed = self._printed_args(h)
+        assert any("Feature #1" in str(a) for a in printed)   # summary: start line
+        assert any("approved" in str(a) for a in printed)     # summary: verdict line
+        # The one Panel() construction in this scenario is the reviewer-retry
+        # panel; since rich.panel is mocked, Panel(...) always returns the
+        # same MagicMock singleton (Panel.return_value) — checking whether
+        # that singleton reached console.print is the tier-gating signal,
+        # since str(a) on a bare MagicMock wouldn't contain the panel's text.
+        assert h.Panel.return_value in printed
+
+    def test_summary_tier_hides_retry_panel(self, monkeypatch, tmp_path):
+        (tmp_path / "progress").mkdir(exist_ok=True)
+        h = _load_harness(monkeypatch, tmp_path, {"HARNESS_VERBOSITY": "summary"})
+        self._patch_cycle(h, monkeypatch, review_results=["REJECTED: bad code", "APPROVED"])
+
+        result = h.run_feature_cycle(1, "desc", e2e=False)
+
+        assert result["approved"] is True
+        printed = self._printed_args(h)
+        assert any("Feature #1" in str(a) for a in printed)   # summary line still shows
+        assert any("approved" in str(a) for a in printed)     # summary line still shows
+        assert h.Panel.return_value not in printed             # normal-tier panel suppressed
 
 
 # ── Structured agent status (progress/<stage>_<id>.json) ───────────────────────
