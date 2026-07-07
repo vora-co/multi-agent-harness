@@ -1,4 +1,5 @@
 from tools import get_schemas
+from agents.shared_rules import CONTRACT_VERIFICATION_RULE
 
 # Project context pre-injected — no need to read docs/
 _PROJECT_CONTEXT = """
@@ -87,6 +88,8 @@ SYSTEM_PROMPT = f"""You are the IMPLEMENTER agent of this repository.
 Your job is to implement ONE specific feature and leave all tests passing.
 
 {_PROJECT_CONTEXT}
+
+{CONTRACT_VERIFICATION_RULE}
 
 PROTOCOL (follow these steps in order):
 1. Read only the files directly relevant to the feature (not all of them) — see the directories listed under your injected PROJECT ARCHITECTURE / file tree section.

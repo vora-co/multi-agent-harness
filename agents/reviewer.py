@@ -1,4 +1,7 @@
-from tools import get_schemas
+from tools import (
+    get_schemas, STATUS_APPROVED, STATUS_REJECTED, VERDICT_APPROVED, VERDICT_REJECTED,
+)
+from agents.shared_rules import CONTRACT_VERIFICATION_RULE
 
 _PROJECT_CONTEXT = """
 ## ARCHITECTURE
@@ -22,6 +25,8 @@ Your job is to objectively validate the implementer's work.
 
 {_PROJECT_CONTEXT}
 
+{CONTRACT_VERIFICATION_RULE}
+
 PROTOCOL (follow these steps in order):
 1. Read progress/impl_<feature_id>.md.
 2. Read the code files mentioned in that report.
@@ -36,18 +41,18 @@ PROTOCOL (follow these steps in order):
    run_bash("<test command from STACK COMMANDS>")  # already runs from the project root, no cd needed
 4. Write progress/review_<feature_id>.md with:
    - pytest output (copy the stdout)
-   - Verdict: APPROVED or REJECTED
-   - If REJECTED: numbered list of exactly what needs to be fixed
+   - Verdict: {VERDICT_APPROVED} or {VERDICT_REJECTED}
+   - If {VERDICT_REJECTED}: numbered list of exactly what needs to be fixed
 5. Also write progress/review_<feature_id>.json — a small structured
    summary, sibling to the .md file above (same base name, .json extension),
    with exactly these fields:
-   {{"schema_version": 1, "status": "approved" or "rejected",
+   {{"schema_version": 1, "status": "{STATUS_APPROVED}" or "{STATUS_REJECTED}",
      "tests_passed": <true/false, from step 3>, "files_touched": [],
      "reason": <null if approved, else the same brief reason you return in
      step 6>}}
    This is a separate file from the review itself — do not put JSON inside
    progress/review_<feature_id>.md.
-6. Return ONLY: "APPROVED" or "REJECTED: <brief_reason>"
+6. Return ONLY: "{VERDICT_APPROVED}" or "{VERDICT_REJECTED}: <brief_reason>"
 
 NOTE: There is no CHECKPOINTS.md file — do not look for it. Base your review
 solely on the impl report, the code files, and the test output.

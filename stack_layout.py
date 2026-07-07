@@ -68,6 +68,7 @@ _DEFAULT: dict = {
     "code_tree_dirs": ("src", "frontend/src", "tests"),
     "test_runner":    "python3 -m pytest tests/ -v --tb=short",
     "server_cmd":     "python3 -m uvicorn src.main:app --port 8000",
+    "port":           8000,
     "dirs":           "src/... (default fallback — stack_profiles.json not found or unreadable)",
     "db_family":      "asyncpg",
     "backend_key":    "python-fastapi",
@@ -104,11 +105,14 @@ def resolve_layout() -> dict:
     Single source of truth for stack-dependent file layout.
 
     Returns a dict with keys: safe_write_dirs (tuple[str]), code_tree_dirs
-    (tuple[str]), test_runner (str), server_cmd (str), dirs (str),
+    (tuple[str]), test_runner (str), server_cmd (str), port (int), dirs (str),
     db_family (str), backend_key (str), frontend_key (str), app_name (str),
     e2e_runtime (str | None), e2e_test_dir (str | None),
     e2e_file_ext (str | None), e2e_run_cmd (str | None), e2e_notes (str),
     e2e_key (str). See "E2E RESOLUTION" above for how the e2e_* keys resolve.
+    "port" is the backend's listen port, parsed from the resolved profile's
+    "port" field — used by tools.py to build a default Playwright base_url
+    without a hardcoded "localhost:8000" duplicated across files.
 
     Cached after first call — the stack doesn't change mid-run, and re-reading
     two JSON files on every call would be wasted I/O. Call
@@ -152,6 +156,7 @@ def resolve_layout() -> dict:
                 "code_tree_dirs":  _substitute_placeholder(tuple(entry["code_tree_dirs"]), app_name),
                 "test_runner":     entry["test_runner"],
                 "server_cmd":      entry["server_cmd"],
+                "port":            entry.get("port", 8000),
                 "dirs":            _substitute_placeholder(entry["dirs"], app_name),
                 "db_family":       entry.get("db_family", "none"),
                 "backend_key":     bkey,

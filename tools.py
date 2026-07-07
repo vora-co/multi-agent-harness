@@ -25,6 +25,47 @@ BLOCKED_BASH_PATTERNS = [
 # Valid feature statuses
 VALID_FEATURE_STATUSES = {"pending", "in_progress", "done", "failed"}
 
+# Path to the feature list, single source of truth so harness.py and tools.py
+# never drift if this filename ever changes.
+FEATURE_LIST_PATH = "feature_list.json"
+
+# Root directory for per-feature agent reports (impl_N.md, spec_N.md, ...).
+PROGRESS_DIR = "progress"
+
+# Agent role names — the harness's MODEL_BY_ROLE, _SESSION_COSTS, and
+# _AGENT_STYLES dicts are all keyed by these and asserted to match at import
+# time (see harness.py), so a typo in a dict's keys fails loudly instead of
+# silently misattributing cost/style tracking to the wrong role.
+ROLES = ("leader", "spec_writer", "implementer", "reviewer", "e2e_tester")
+
+# Structured "status" field values written to progress/<stage>_<id>.json,
+# read back by harness.py's _reviewer_verdict()/_e2e_verdict(). Kept as
+# constants and interpolated into both the harness's comparisons and the
+# reviewer/e2e_tester SYSTEM_PROMPTs so the two can never drift apart.
+STATUS_APPROVED = "approved"
+STATUS_REJECTED = "rejected"
+STATUS_PASSED = "passed"
+STATUS_FAILED = "failed"
+
+# Chat-return verdict markers, parsed case-tolerantly by harness.py's
+# _verdict_is(). Same drift-prevention rationale as STATUS_* above.
+VERDICT_APPROVED = "APPROVED"
+VERDICT_REJECTED = "REJECTED"
+VERDICT_E2E_PASSED = "E2E_PASSED"
+VERDICT_E2E_FAILED = "E2E_FAILED"
+
+# Where E2E/manual screenshots are written and read from. Not stack-dependent
+# (unlike test_runner/server_cmd in stack_layout.py) — every backend profile
+# writes screenshots to the same place — so a plain constant here is enough.
+SCREENSHOTS_DIR = "tests/screenshots"
+
+# Subprocess timeouts (seconds), kept separate even though they currently
+# share a value: E2E and mutation testing are unrelated processes and may
+# need to diverge later. The user-facing "N minutes" messages are built from
+# these so the number and the message can never drift apart.
+E2E_SUBPROCESS_TIMEOUT_S = 300
+MUTATION_TEST_TIMEOUT_S = 300
+
 # Secret-holding files agents must never read, regardless of SAFE_WRITE_DIRS —
 # read_file/list_files are not otherwise confined the way write_file/append_file
 # are, so an agent debugging an API connectivity issue could plausibly try
@@ -187,7 +228,7 @@ def update_feature_status(feature_id: int, status: str) -> str:
             "error": f"Invalid status '{status}'. Allowed values: {sorted(VALID_FEATURE_STATUSES)}"
         })
     try:
-        with open("feature_list.json", "r") as f:
+        with open(FEATURE_LIST_PATH, "r") as f:
             features = json.load(f)
         updated = False
         for feat in features:
@@ -198,7 +239,7 @@ def update_feature_status(feature_id: int, status: str) -> str:
                 break
         if not updated:
             return json.dumps({"error": f"Feature #{feature_id} not found in feature_list.json"})
-        with open("feature_list.json", "w") as f:
+        with open(FEATURE_LIST_PATH, "w") as f:
             json.dump(features, f, indent=2, ensure_ascii=False)
         return json.dumps({"status": "ok", "feature_id": feature_id, "new_status": status})
     except Exception as e:
@@ -206,12 +247,12 @@ def update_feature_status(feature_id: int, status: str) -> str:
 
 def read_feature_list() -> str:
     try:
-        with open("feature_list.json", "r") as f:
+        with open(FEATURE_LIST_PATH, "r") as f:
             return json.dumps(json.load(f), ensure_ascii=False)
     except Exception as e:
         return json.dumps({"error": str(e)})
 
-def run_playwright_tests(test_path: str = None, base_url: str = "http://localhost:8000",
+def run_playwright_tests(test_path: str = None, base_url: str = None,
                          headed: bool = False, timeout_ms: int = 30000) -> str:
     """
     Run E2E tests with Playwright. Branches on the configured e2e runtime
@@ -224,10 +265,16 @@ def run_playwright_tests(test_path: str = None, base_url: str = "http://localhos
     If test_path is not given, it defaults to the resolved stack's
     e2e_test_dir (e.g. "tests/e2e/" for Python, "e2e/" for Node) instead of
     a hardcoded Python-only path.
+
+    If base_url is not given, it's derived from the resolved stack's "port"
+    (stack_profiles.json's backend entry) instead of a hardcoded
+    "localhost:8000" — so a project whose backend listens on a different
+    port doesn't silently get E2E tests pointed at the wrong URL.
     """
     layout = resolve_layout()
     runtime = layout.get("e2e_runtime") or "python"
     resolved_test_path = test_path or layout.get("e2e_test_dir") or "tests/e2e/"
+    base_url = base_url or f"http://localhost:{layout.get('port', 8000)}"
 
     if runtime == "node":
         return _run_playwright_tests_node(resolved_test_path, base_url, headed, timeout_ms)
@@ -258,25 +305,25 @@ def _run_playwright_tests_python(test_path: str, base_url: str, headed: bool, ti
         if install.returncode != 0:
             return json.dumps({"error": "Failed to install playwright", "stderr": install.stderr[:500]})
 
-    os.makedirs("tests/screenshots", exist_ok=True)
+    os.makedirs(SCREENSHOTS_DIR, exist_ok=True)
 
     headed_flag = "--headed" if headed else ""
     cmd = (
         f"{py} -m pytest {test_path} -v --tb=short "
         f"--base-url={base_url} "
         f"--screenshot=only-on-failure "
-        f"--output=tests/screenshots "
+        f"--output={SCREENSHOTS_DIR} "
         f"--timeout={timeout_ms // 1000} "
         f"{headed_flag} 2>&1"
     )
     try:
-        result = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=300)
+        result = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=E2E_SUBPROCESS_TIMEOUT_S)
         output = result.stdout + result.stderr
 
         # List generated screenshots if there were failures
         screenshots = []
-        if os.path.exists("tests/screenshots"):
-            screenshots = [f for f in os.listdir("tests/screenshots") if f.endswith(".png")]
+        if os.path.exists(SCREENSHOTS_DIR):
+            screenshots = [f for f in os.listdir(SCREENSHOTS_DIR) if f.endswith(".png")]
 
         return json.dumps({
             "output": output[-3000:],
@@ -286,7 +333,7 @@ def _run_playwright_tests_python(test_path: str, base_url: str, headed: bool, ti
             "tip": "If the test failed, read error-context.md in the same test-results subfolder for the full stack trace and code context."
         })
     except subprocess.TimeoutExpired:
-        return json.dumps({"error": "Timeout: E2E tests took more than 5 minutes."})
+        return json.dumps({"error": f"Timeout: E2E tests took more than {E2E_SUBPROCESS_TIMEOUT_S // 60} minutes."})
     except Exception as e:
         return json.dumps({"error": str(e)})
 
@@ -312,7 +359,7 @@ def _run_playwright_tests_node(test_path: str, base_url: str, headed: bool, time
         if install.returncode != 0:
             return json.dumps({"error": "Failed to install @playwright/test", "stderr": install.stderr[:500]})
 
-    os.makedirs("tests/screenshots", exist_ok=True)
+    os.makedirs(SCREENSHOTS_DIR, exist_ok=True)
 
     layout = resolve_layout()
     e2e_test_dir = layout.get("e2e_test_dir") or ""
@@ -330,15 +377,15 @@ def _run_playwright_tests_node(test_path: str, base_url: str, headed: bool, time
         f"{headed_flag} 2>&1"
     )
     try:
-        result = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=300)
+        result = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=E2E_SUBPROCESS_TIMEOUT_S)
         output = result.stdout + result.stderr
 
         # @playwright/test writes failure artifacts under test-results/ by
         # default; also check tests/screenshots/ in case the spec takes its
         # own explicit page.screenshot() calls there.
         screenshots = []
-        if os.path.exists("tests/screenshots"):
-            screenshots += [f for f in os.listdir("tests/screenshots") if f.endswith(".png")]
+        if os.path.exists(SCREENSHOTS_DIR):
+            screenshots += [f for f in os.listdir(SCREENSHOTS_DIR) if f.endswith(".png")]
         if os.path.exists("test-results"):
             for root, _, files in os.walk("test-results"):
                 screenshots += [os.path.join(root, f) for f in files if f.endswith(".png")]
@@ -354,12 +401,12 @@ def _run_playwright_tests_node(test_path: str, base_url: str, headed: bool, time
                     "takes precedence.")
         })
     except subprocess.TimeoutExpired:
-        return json.dumps({"error": "Timeout: E2E tests took more than 5 minutes."})
+        return json.dumps({"error": f"Timeout: E2E tests took more than {E2E_SUBPROCESS_TIMEOUT_S // 60} minutes."})
     except Exception as e:
         return json.dumps({"error": str(e)})
 
 
-def take_screenshot(url: str, output_path: str = "tests/screenshots/manual.png") -> str:
+def take_screenshot(url: str, output_path: str = f"{SCREENSHOTS_DIR}/manual.png") -> str:
     """
     Takes a screenshot of a URL using Playwright (headless).
     Useful for verifying the visual state of the app at a specific point.
@@ -429,7 +476,7 @@ runner = "python3 -m pytest {tests_dir} -x -q"
         # Run mutmut (ignore returncode — 1 means mutants survived, not an error)
         subprocess.run(
             "python3 -m mutmut run 2>/dev/null",
-            shell=True, capture_output=True, text=True, timeout=300
+            shell=True, capture_output=True, text=True, timeout=MUTATION_TEST_TIMEOUT_S
         )
 
         # Get structured summary
@@ -476,7 +523,7 @@ runner = "python3 -m pytest {tests_dir} -x -q"
         })
     except subprocess.TimeoutExpired:
         return json.dumps({
-            "error": "Timeout: mutation testing took more than 5 minutes.",
+            "error": f"Timeout: mutation testing took more than {MUTATION_TEST_TIMEOUT_S // 60} minutes.",
             "tip": "Report in the progress file that mutation testing was skipped due to timeout and continue.",
             "status": "timeout"
         })
@@ -545,7 +592,7 @@ TOOLS_SCHEMA = {
         "Automatically captures screenshots on failures. Returns output, success, and screenshot list.",
         {
             "test_path":   {"type": "string", "description": "E2E test folder or file. Default: 'tests/e2e/'"},
-            "base_url":    {"type": "string", "description": "App base URL. Default: 'http://localhost:8000'"},
+            "base_url":    {"type": "string", "description": "App base URL. Default: derived from the resolved stack's port (e.g. 'http://localhost:8000')."},
             "headed":      {"type": "boolean","description": "Show browser. Default: false (headless)"},
             "timeout_ms":  {"type": "integer","description": "Timeout per test in ms. Default: 30000"}
         }, []),
@@ -555,7 +602,7 @@ TOOLS_SCHEMA = {
         "Take a screenshot of a URL with Playwright (headless). Useful for verifying visual state.",
         {
             "url":         {"type": "string", "description": "URL to capture"},
-            "output_path": {"type": "string", "description": "Output .png path. Default: 'tests/screenshots/manual.png'"}
+            "output_path": {"type": "string", "description": f"Output .png path. Default: '{SCREENSHOTS_DIR}/manual.png'"}
         }, ["url"]),
 
     "run_mutation_tests": _schema(

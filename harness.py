@@ -85,7 +85,12 @@ import agents.implementer as impl_cfg
 import agents.reviewer as reviewer_cfg
 import agents.e2e_tester as e2e_cfg
 import agents.spec_writer as spec_cfg
-from tools import execute_tool, SAFE_WRITE_DIRS, VALID_FEATURE_STATUSES
+from tools import (
+    execute_tool, SAFE_WRITE_DIRS, VALID_FEATURE_STATUSES,
+    FEATURE_LIST_PATH, PROGRESS_DIR, ROLES,
+    STATUS_APPROVED, STATUS_REJECTED, STATUS_PASSED, STATUS_FAILED,
+    VERDICT_APPROVED, VERDICT_REJECTED, VERDICT_E2E_PASSED, VERDICT_E2E_FAILED,
+)
 from stack_layout import resolve_layout
 
 print(f"[CONFIG] SAFE_WRITE_DIRS = {SAFE_WRITE_DIRS}")
@@ -193,10 +198,10 @@ else:
         return fn if fn is not None else lambda f: f
 
 # ─── ROBUSTNESS SETTINGS ─────────────────────────────────────────────────────
-MAX_RETRIES_API    = 3   # Retries on transient API errors (rate limit, timeout)
-MAX_RETRIES_IMPL   = 3   # How many times the implementer can retry a feature
-MAX_RETRIES_REVIEW = 2   # How many times the impl→review cycle repeats before marking "failed"
-MAX_ITER_LEADER    = 30  # Max iterations for the leader loop
+MAX_RETRIES_API    = int(os.getenv("MAX_RETRIES_API", "3"))     # Retries on transient API errors (rate limit, timeout)
+MAX_RETRIES_IMPL   = int(os.getenv("MAX_RETRIES_IMPL", "3"))    # How many times the implementer can retry a feature
+MAX_RETRIES_REVIEW = int(os.getenv("MAX_RETRIES_REVIEW", "2"))  # How many times the impl→review cycle repeats before marking "failed"
+MAX_ITER_LEADER    = int(os.getenv("MAX_ITER_LEADER", "30"))    # Max iterations for the leader loop
 MAX_ITER_AGENT     = int(os.getenv("MAX_ITER_AGENT", "30"))  # Default — e2e_tester: override via .env if E2E setup + fix cycles need more iterations
 MAX_ITER_IMPL      = int(os.getenv("MAX_ITER_IMPL", "50"))  # Implementer: read context + write code + tests — override via .env
 MAX_ITER_REVIEWER  = int(os.getenv("MAX_ITER_REVIEWER", "40"))  # Reviewer: read reports + run tests + mutation testing — override via .env
@@ -307,7 +312,7 @@ class _JsonLogFormatter(logging.Formatter):
 
 
 logging.basicConfig(
-    filename="progress/harness.log",
+    filename=f"{PROGRESS_DIR}/harness.log",
     level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S"
@@ -616,6 +621,16 @@ _AGENT_STYLES = {
     "reviewer":    ("magenta", "🔍"),
 }
 
+# A typo in any of the role-keyed dicts above/below would otherwise fail
+# silently — e.g. _track_usage()'s _SESSION_COSTS.get(role, _SESSION_COSTS["leader"])
+# fallback would misattribute cost tracking to "leader" with no error. Fail
+# loudly at import time instead. MODEL_BY_ROLE/_SESSION_COSTS also carry a
+# "compaction" pseudo-role beyond the five spawnable agents, so those two
+# are checked as a superset of ROLES rather than an exact match.
+assert set(ROLES) <= set(MODEL_BY_ROLE), f"MODEL_BY_ROLE missing role(s): {set(ROLES) - set(MODEL_BY_ROLE)}"
+assert set(ROLES) <= set(_SESSION_COSTS), f"_SESSION_COSTS missing role(s): {set(ROLES) - set(_SESSION_COSTS)}"
+assert set(ROLES) == set(_AGENT_STYLES), f"_AGENT_STYLES out of sync with ROLES: {set(ROLES) ^ set(_AGENT_STYLES)}"
+
 def _phase_header(agent: str, action: str, feature_id: int = None,
                   attempt: int = None, total_features: int = None, current_feature: int = None):
     """Print a clear phase header with agent, action and context."""
@@ -712,15 +727,15 @@ def _write_session_costs() -> None:
             "estimated_usd":     round(total_cost_usd, 6),
         }
     }
-    os.makedirs("progress", exist_ok=True)
-    path = "progress/session_costs.json"
+    os.makedirs(PROGRESS_DIR, exist_ok=True)
+    path = f"{PROGRESS_DIR}/session_costs.json"
     with open(path, "w", encoding="utf-8") as f:
         json.dump(summary, f, indent=2, ensure_ascii=False)
 
     console.print(Panel(
         f"Total tokens: [cyan]{total_prompt + total_completion:,}[/]  |  "
         f"Estimated cost: [yellow]USD {total_cost_usd:.4f}[/]",
-        title="[dim]Session costs → progress/session_costs.json[/]",
+        title=f"[dim]Session costs → {path}[/]",
         border_style="dim",
         padding=(0, 1)
     ))
@@ -926,7 +941,7 @@ def _validate_feature_schema(features: list) -> list[str]:
 def _read_feature_list_raw() -> list:
     """Read feature_list.json. Returns [] on any error."""
     try:
-        with open("feature_list.json", "r", encoding="utf-8") as f:
+        with open(FEATURE_LIST_PATH, "r", encoding="utf-8") as f:
             return json.load(f)
     except Exception:
         return []
@@ -935,16 +950,25 @@ def _read_feature_list_raw() -> list:
 def _write_feature_list_raw(features: list) -> None:
     """Overwrite feature_list.json. Silently ignores write errors."""
     try:
-        with open("feature_list.json", "w", encoding="utf-8") as f:
+        with open(FEATURE_LIST_PATH, "w", encoding="utf-8") as f:
             json.dump(features, f, indent=2, ensure_ascii=False)
     except Exception as exc:
         _log("harness", "CHECKPOINT_WRITE_ERROR", str(exc), level="warning")
 
 
+# Checkpoint step markers written to feature_list.json's "_checkpoint" field
+# by _save_checkpoint() and compared against by run_feature_cycle() to decide
+# what to skip on resume. Internal to this file only (never sent to an agent
+# prompt), unlike the STATUS_*/VERDICT_* constants in tools.py.
+CKPT_SPEC_DONE = "spec_done"
+CKPT_IMPL_DONE = "impl_done"
+CKPT_E2E_DONE = "e2e_done"
+
+
 def _save_checkpoint(feature_id: int, step: str, attempt: int = 1) -> None:
     """
     Write a checkpoint for feature_id after completing `step`.
-    step must be one of: "spec_done", "impl_done", "e2e_done".
+    step must be one of: CKPT_SPEC_DONE, CKPT_IMPL_DONE, CKPT_E2E_DONE.
     """
     features = _read_feature_list_raw()
     for feat in features:
@@ -1096,7 +1120,7 @@ def recover_stale_features() -> list[int]:
     Returns list of recovered feature IDs.
     """
     try:
-        with open("feature_list.json", "r") as f:
+        with open(FEATURE_LIST_PATH, "r") as f:
             features = json.load(f)
     except FileNotFoundError:
         return []
@@ -1120,7 +1144,7 @@ def recover_stale_features() -> list[int]:
             recovered.append(feat["id"])
 
     if recovered:
-        with open("feature_list.json", "w") as f:
+        with open(FEATURE_LIST_PATH, "w") as f:
             json.dump(features, f, indent=2, ensure_ascii=False)
         _log("harness", "CHECKPOINT_RECOVERY",
              f"Features reset to pending: {recovered}", level="warning")
@@ -1346,11 +1370,11 @@ def _reviewer_verdict(result: str, review_path: str) -> tuple[bool, str]:
     """
     status = _read_structured_status(review_path)
     if status is not None:
-        approved = status.get("status") == "approved"
+        approved = status.get("status") == STATUS_APPROVED
         reason = "" if approved else (status.get("reason") or "")
         return approved, reason
-    approved = _verdict_is(result, "APPROVED")
-    reason = "" if approved else result.replace("REJECTED:", "").strip()
+    approved = _verdict_is(result, VERDICT_APPROVED)
+    reason = "" if approved else result.replace(f"{VERDICT_REJECTED}:", "").strip()
     return approved, reason
 
 
@@ -1364,11 +1388,11 @@ def _e2e_verdict(result: str, e2e_path: str) -> tuple[bool, str]:
     """
     status = _read_structured_status(e2e_path)
     if status is not None:
-        passed = status.get("status") == "passed"
+        passed = status.get("status") == STATUS_PASSED
         reason = "" if passed else (status.get("reason") or "")
         return passed, reason
-    passed = _verdict_is(result, "E2E_PASSED")
-    reason = "" if passed else result.replace("E2E_FAILED:", "").strip()
+    passed = _verdict_is(result, VERDICT_E2E_PASSED)
+    reason = "" if passed else result.replace(f"{VERDICT_E2E_FAILED}:", "").strip()
     return passed, reason
 
 
@@ -2046,7 +2070,7 @@ def spawn_implementer(feature_id: int, description: str, attempt: int = 1,
     Launch the implementer. On first attempt, reuses existing impl if tests passed.
     On retry, injects the rejection reason so the agent doesn't repeat the same mistake.
     """
-    impl_path = f"progress/impl_{feature_id}.md"
+    impl_path = f"{PROGRESS_DIR}/impl_{feature_id}.md"
 
     # Reuse existing impl if it already exists and shows passing tests.
     # Prefers the structured progress/impl_<id>.json ("tests_passed": bool,
@@ -2127,7 +2151,7 @@ def spawn_spec_writer(feature_id: int, description: str) -> str:
     """Generate the detailed technical spec before implementing.
     If the spec already exists on disk, reuse it without calling the agent.
     """
-    spec_path = f"progress/spec_{feature_id}.md"
+    spec_path = f"{PROGRESS_DIR}/spec_{feature_id}.md"
 
     # Reuse existing spec — avoids spending iterations regenerating
     if os.path.exists(spec_path):
@@ -2209,7 +2233,7 @@ def spawn_reviewer(feature_id: int, e2e: bool = True, attempt: int = 1) -> str:
     if not e2e:
         validation_mode = (
             "LIGHTWEIGHT REVIEW MODE (e2e=false — skip browser/E2E, NOT skip tests):\n"
-            "- Read the implementer report at progress/impl_{fid}.md\n"
+            f"- Read the implementer report at {PROGRESS_DIR}/impl_{{fid}}.md\n"
             "- Verify that the files listed in the report exist on disk (use run_bash with 'ls')\n"
             "- Run tests with: run_bash(\"{test_runner}\")  # already runs from the project root, no cd needed\n"
             "  - If a test suite exists for this feature, it MUST pass — do not approve on syntax checks alone.\n"
@@ -2236,9 +2260,9 @@ def spawn_reviewer(feature_id: int, e2e: bool = True, attempt: int = 1) -> str:
         f"{arch_context}"
         f"{layout_context}"
         f"{validation_mode}\n"
-        f"The implementer report is at progress/impl_{feature_id}.md\n"
-        f"Write your verdict to progress/review_{feature_id}.md\n"
-        f"Return ONLY: 'APPROVED' or 'REJECTED: <reason>'"
+        f"The implementer report is at {PROGRESS_DIR}/impl_{feature_id}.md\n"
+        f"Write your verdict to {PROGRESS_DIR}/review_{feature_id}.md\n"
+        f"Return ONLY: '{VERDICT_APPROVED}' or '{VERDICT_REJECTED}: <reason>'"
     )
     _agent_ctx = _fire_transform("before_spawn_agent", role="reviewer",
                                  system_prompt=reviewer_cfg.SYSTEM_PROMPT,
@@ -2247,7 +2271,7 @@ def spawn_reviewer(feature_id: int, e2e: bool = True, attempt: int = 1) -> str:
                        role="reviewer", color="magenta", max_iter=max_iter,
                        checkpoint_key=f"reviewer_{feature_id}_{attempt}")
 
-    approved = _verdict_is(result, "APPROVED")
+    approved = _verdict_is(result, VERDICT_APPROVED)
     verdict_color = "green" if approved else "red"
     verdict_icon  = "✅" if approved else "❌"
     _log("reviewer", "VERDICT", result[:200], level="info" if approved else "warning")
@@ -2267,9 +2291,9 @@ def spawn_e2e_tester(feature_id: int, attempt: int = 1) -> str:
         f"{arch_context}"
         f"{layout_context}"
         f"Run E2E tests for feature #{feature_id}.\n"
-        f"The implementer report is at progress/impl_{feature_id}.md\n"
-        f"Write your report to progress/e2e_{feature_id}.md\n"
-        f"Return ONLY: 'E2E_PASSED' or 'E2E_FAILED: <reason>'"
+        f"The implementer report is at {PROGRESS_DIR}/impl_{feature_id}.md\n"
+        f"Write your report to {PROGRESS_DIR}/e2e_{feature_id}.md\n"
+        f"Return ONLY: '{VERDICT_E2E_PASSED}' or '{VERDICT_E2E_FAILED}: <reason>'"
     )
     _agent_ctx = _fire_transform("before_spawn_agent", role="e2e_tester",
                                  system_prompt=e2e_cfg.SYSTEM_PROMPT,
@@ -2278,7 +2302,7 @@ def spawn_e2e_tester(feature_id: int, attempt: int = 1) -> str:
                        role="e2e_tester", color="yellow",
                        checkpoint_key=f"e2e_tester_{feature_id}_{attempt}")
 
-    passed = _verdict_is(result, "E2E_PASSED")
+    passed = _verdict_is(result, VERDICT_E2E_PASSED)
     color  = "green" if passed else "red"
     _log("e2e_tester", "VERDICT", result[:200], level="info" if passed else "warning")
     _vprint("normal", Panel(
@@ -2346,24 +2370,24 @@ def _run_feature_cycle_impl(feature_id: int, description: str, e2e: bool = True)
 
     # ── Step 1: Spec ─────────────────────────────────────────────────────────
     # Skip if spec was already written in a previous run.
-    if _ckpt_step in ("spec_done", "impl_done", "e2e_done"):
-        spec_path = f"progress/spec_{feature_id}.md"
+    if _ckpt_step in (CKPT_SPEC_DONE, CKPT_IMPL_DONE, CKPT_E2E_DONE):
+        spec_path = f"{PROGRESS_DIR}/spec_{feature_id}.md"
         _vprint("normal", f"  [dim]↺ skipping spec (already done)[/]")
     else:
         spec_result = spawn_spec_writer(feature_id, description)
         spec_path = spec_result.strip() if not spec_result.startswith("[ERROR") else None
-        _save_checkpoint(feature_id, "spec_done", attempt=1)
+        _save_checkpoint(feature_id, CKPT_SPEC_DONE, attempt=1)
 
     rejection_reason = ""
     # Resume from the attempt that was in progress when the crash happened.
-    start_attempt = _ckpt_attempt if _ckpt_step in ("impl_done", "e2e_done") else 1
+    start_attempt = _ckpt_attempt if _ckpt_step in (CKPT_IMPL_DONE, CKPT_E2E_DONE) else 1
 
     for attempt in range(start_attempt, MAX_RETRIES_REVIEW + 1):
 
         # ── Step 2: Implement ─────────────────────────────────────────────────
         # Skip if impl was already done for this attempt in a previous run.
         _skip_impl = (
-            _ckpt_step in ("impl_done", "e2e_done")
+            _ckpt_step in (CKPT_IMPL_DONE, CKPT_E2E_DONE)
             and _ckpt_attempt == attempt
         )
         if _skip_impl:
@@ -2386,19 +2410,19 @@ def _run_feature_cycle_impl(feature_id: int, description: str, e2e: bool = True)
                     return {"approved": False, "attempts": attempt, "final_verdict": impl_result}
                 rejection_reason = impl_result
                 continue
-            _save_checkpoint(feature_id, "impl_done", attempt=attempt)
+            _save_checkpoint(feature_id, CKPT_IMPL_DONE, attempt=attempt)
 
         # ── Step 3: E2E Testing ───────────────────────────────────────────────
         # Skip if e2e was already done for this attempt in a previous run.
         _skip_e2e = (
-            _ckpt_step == "e2e_done"
+            _ckpt_step == CKPT_E2E_DONE
             and _ckpt_attempt == attempt
         )
         if not e2e:
-            e2e_result = "E2E_PASSED"  # not applicable — skip silently
+            e2e_result = VERDICT_E2E_PASSED  # not applicable — skip silently
         elif _skip_e2e:
             _vprint("normal", f"  [dim]↺ skipping e2e attempt {attempt} (already done)[/]")
-            e2e_result = "E2E_PASSED"
+            e2e_result = VERDICT_E2E_PASSED
         else:
             e2e_result = spawn_e2e_tester(feature_id, attempt=attempt)
 
@@ -2410,9 +2434,9 @@ def _run_feature_cycle_impl(feature_id: int, description: str, e2e: bool = True)
         # implicit pass and reached the Reviewer with no real E2E evidence.
         # _e2e_verdict prefers the structured progress/e2e_<id>.json written
         # alongside the report, falling back to this same string parsing.
-        e2e_passed, e2e_reason = _e2e_verdict(e2e_result, f"progress/e2e_{feature_id}.md")
+        e2e_passed, e2e_reason = _e2e_verdict(e2e_result, f"{PROGRESS_DIR}/e2e_{feature_id}.md")
         if e2e_passed:
-            _save_checkpoint(feature_id, "e2e_done", attempt=attempt)
+            _save_checkpoint(feature_id, CKPT_E2E_DONE, attempt=attempt)
         else:
             _log("harness", "E2E_FAILED",
                  f"feature={feature_id} attempt={attempt} reason={e2e_reason[:100]}", level="warning")
@@ -2432,7 +2456,7 @@ def _run_feature_cycle_impl(feature_id: int, description: str, e2e: bool = True)
         # written alongside the report, falling back to parsing the returned
         # chat string (_verdict_is + stripping "REJECTED:") when absent.
         review_result = spawn_reviewer(feature_id, e2e=e2e, attempt=attempt)
-        approved, rejection_reason = _reviewer_verdict(review_result, f"progress/review_{feature_id}.md")
+        approved, rejection_reason = _reviewer_verdict(review_result, f"{PROGRESS_DIR}/review_{feature_id}.md")
         if approved:
             gate_block = _fire_gate(
                 "before_approval_finalized",
@@ -2476,7 +2500,7 @@ def _run_feature_cycle_impl(feature_id: int, description: str, e2e: bool = True)
                 border_style="yellow", padding=(0, 1)
             ))
 
-    final_verdict = f"REJECTED after {MAX_RETRIES_REVIEW} attempts: {rejection_reason}"
+    final_verdict = f"{VERDICT_REJECTED} after {MAX_RETRIES_REVIEW} attempts: {rejection_reason}"
     _clear_checkpoint(feature_id)
     _fire("after_feature_failed",
           feature_id=feature_id, description=description,
@@ -2499,14 +2523,14 @@ def _build_leader_task(user_task: str) -> str:
     features = []
     features_json = "(not available)"
     try:
-        with open("feature_list.json", "r", encoding="utf-8") as f:
+        with open(FEATURE_LIST_PATH, "r", encoding="utf-8") as f:
             features = json.load(f)
         features_json = json.dumps(features, indent=2, ensure_ascii=False)
     except Exception as e:
         features_json = f"(not available: {e})"
 
     try:
-        with open("progress/current.md", "r", encoding="utf-8") as f:
+        with open(f"{PROGRESS_DIR}/current.md", "r", encoding="utf-8") as f:
             current_md = f.read().strip()
     except Exception:
         current_md = "(no previous state)"
@@ -2538,9 +2562,9 @@ def _build_leader_task(user_task: str) -> str:
             )
 
     return (
-        f"## feature_list.json (current state)\n```json\n{features_json}\n```\n"
+        f"## {FEATURE_LIST_PATH} (current state)\n```json\n{features_json}\n```\n"
         f"{dep_section}\n"
-        f"## progress/current.md\n{current_md}\n\n"
+        f"## {PROGRESS_DIR}/current.md\n{current_md}\n\n"
         f"## User instruction\n{user_task}"
     )
 
@@ -2696,7 +2720,7 @@ def _run_leader_flow(user_task: str) -> str:
 # ─── REPL ─────────────────────────────────────────────────────────────────────
 
 def print_features():
-    with open("feature_list.json", "r") as f:
+    with open(FEATURE_LIST_PATH, "r") as f:
         features = json.load(f)
     table = Table(show_header=True, header_style="bold")
     table.add_column("ID",     style="dim", width=4)
@@ -2741,7 +2765,7 @@ def main():
     # checked first since a missing "id" field would otherwise crash the
     # dependency-graph check below.
     try:
-        with open("feature_list.json", "r", encoding="utf-8") as f:
+        with open(FEATURE_LIST_PATH, "r", encoding="utf-8") as f:
             _startup_features = json.load(f)
 
         _schema_errors = _validate_feature_schema(_startup_features)
@@ -2787,7 +2811,7 @@ def main():
             if user_input in ("/quit", "/salir"):
                 break
             elif user_input in ("/status", "/estado"):
-                with open("progress/current.md", "r") as f:
+                with open(f"{PROGRESS_DIR}/current.md", "r") as f:
                     console.print(Markdown(f.read()))
                 continue
             elif user_input == "/features":

@@ -7,6 +7,7 @@
       "conventions": "- Python 3.9+. Always use python3, never python.\n- Type hints on public functions. Docstrings on classes.\n- Models: constructor validates invariants, raises ValueError. to_dict()/from_dict().\n- Repositories: find_all(), find_by_id(id) → None if not found, save_one(obj), delete(id) → bool.\n- API: /api/v1/ prefix, errors as {\"detail\": \"msg\"}, status codes 200/201/400/401/403/404/409.\n- Tests: tests/test_<module>.py, pytest + FastAPI TestClient, do not mock storage (use tmp_path).",
       "test_runner": "python3 -m pytest tests/ -v --tb=short",
       "server_cmd": "python3 -m uvicorn src.main:app --port 8000",
+      "port": 8000,
       "test_framework": "pytest + FastAPI TestClient",
       "file_ext": ".py",
       "db_family": "asyncpg",

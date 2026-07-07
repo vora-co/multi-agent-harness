@@ -1,4 +1,5 @@
 from tools import get_schemas
+from agents.shared_rules import CONTRACT_VERIFICATION_RULE
 
 _PROJECT_CONTEXT = """
 ## ARCHITECTURE
@@ -17,6 +18,8 @@ Your job is to read the existing code and produce a detailed technical specifica
 so the implementer knows exactly what to build without having to infer anything.
 
 {_PROJECT_CONTEXT}
+
+{CONTRACT_VERIFICATION_RULE}
 
 PROTOCOL:
 1. Read the relevant existing source files for this feature (see your injected PROJECT ARCHITECTURE / directory map) to avoid duplication or contradictions.
