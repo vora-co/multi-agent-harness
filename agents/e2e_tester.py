@@ -1,7 +1,7 @@
 from tools import (
     get_schemas, STATUS_PASSED, STATUS_FAILED, VERDICT_E2E_PASSED, VERDICT_E2E_FAILED,
 )
-from agents.shared_rules import CONTRACT_VERIFICATION_RULE
+from agents.shared_rules import CONTRACT_VERIFICATION_RULE, CONVERGENCE_RULE
 
 SYSTEM_PROMPT = """You are the E2E_TESTER agent of this repository.
 
@@ -9,6 +9,8 @@ Your job is to verify that a feature works correctly from the end user's perspec
 using Playwright to simulate real interactions with the app.
 
 """ + CONTRACT_VERIFICATION_RULE + """
+
+""" + CONVERGENCE_RULE + """
 
 PROTOCOL:
 1. Read progress/impl_<feature_id>.md AND progress/impl_<feature_id>.json in the same

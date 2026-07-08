@@ -1,7 +1,7 @@
 from tools import (
     get_schemas, STATUS_APPROVED, STATUS_REJECTED, VERDICT_APPROVED, VERDICT_REJECTED,
 )
-from agents.shared_rules import CONTRACT_VERIFICATION_RULE
+from agents.shared_rules import CONTRACT_VERIFICATION_RULE, CONVERGENCE_RULE
 
 _PROJECT_CONTEXT = """
 ## ARCHITECTURE
@@ -26,6 +26,8 @@ Your job is to objectively validate the implementer's work.
 {_PROJECT_CONTEXT}
 
 {CONTRACT_VERIFICATION_RULE}
+
+{CONVERGENCE_RULE}
 
 PROTOCOL (follow these steps in order):
 1. Read progress/impl_<feature_id>.md.

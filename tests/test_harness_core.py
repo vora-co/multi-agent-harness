@@ -1086,6 +1086,127 @@ class TestToolResultRedactionInRunAgent:
         assert not any("sk-leaked-secret-value" in p for p in printed)
 
 
+class TestIsWriteCall:
+    """Unit tests for _is_write_call, the signal behind the convergence
+    streak detector: did this tool call actually mutate a file?"""
+
+    def test_direct_write_tools_count_as_writes(self, monkeypatch, tmp_path):
+        h = _load_harness(monkeypatch, tmp_path)
+        assert h._is_write_call("write_file", '{"status": "ok"}') is True
+        assert h._is_write_call("append_file", '{"status": "ok"}') is True
+        assert h._is_write_call("update_feature_status", '{"status": "ok"}') is True
+
+    def test_read_only_tools_do_not_count(self, monkeypatch, tmp_path):
+        h = _load_harness(monkeypatch, tmp_path)
+        assert h._is_write_call("read_file", '{"content": "..."}') is False
+        assert h._is_write_call("list_files", '{"files": []}') is False
+        assert h._is_write_call("run_bash", '{"stdout": "..."}') is False
+
+    def test_successful_edit_alias_translation_counts_as_write(self, monkeypatch, tmp_path):
+        h = _load_harness(monkeypatch, tmp_path)
+        note = (
+            "Tool 'edit_file' doesn't exist in this harness — auto-translated "
+            "to a real read_file + write_file replacement."
+        )
+        assert h._is_write_call("edit_file", json.dumps({"status": "ok", "note": note})) is True
+
+    def test_failed_edit_alias_attempt_does_not_count(self, monkeypatch, tmp_path):
+        h = _load_harness(monkeypatch, tmp_path)
+        error = json.dumps({"error": "Tool 'edit_file' not found. Use read_file/write_file instead."})
+        assert h._is_write_call("edit_file", error) is False
+
+
+class TestConvergenceStreakDetector:
+    """
+    run_agent must inject a live "CONVERGENCE CHECKPOINT" nudge once the
+    agent has gone CONVERGENCE_STREAK_LIMIT consecutive iterations without
+    a write — mirroring the existing BUDGET CHECKPOINT mechanism — and must
+    reset the streak the moment a write happens.
+    """
+
+    def _fake_tool_call(self, call_id, name, args_json):
+        from types import SimpleNamespace
+        fn = SimpleNamespace(name=name, arguments=args_json)
+        return SimpleNamespace(id=call_id, function=fn)
+
+    def _fake_response(self, content=None, tool_calls=None):
+        from types import SimpleNamespace
+        msg = SimpleNamespace(content=content, tool_calls=tool_calls)
+        usage = SimpleNamespace(prompt_tokens=10, completion_tokens=5)
+        choice = SimpleNamespace(message=msg)
+        return SimpleNamespace(choices=[choice], usage=usage, model="deepseek-v4-pro")
+
+    def _checkpoint_present(self, snapshot):
+        return any(
+            isinstance(m, dict) and "CONVERGENCE CHECKPOINT" in m.get("content", "")
+            for m in snapshot
+        )
+
+    def _recording_call(self, responses):
+        """
+        A side_effect that snapshots (shallow-copies) `messages` at the exact
+        moment of each call, since `messages` is one mutable list appended to
+        in place across iterations — MagicMock's own call_args_list would
+        otherwise have every recorded call alias the same, final list.
+        """
+        captured = []
+
+        def fake_call(**kwargs):
+            captured.append(list(kwargs["messages"]))
+            return responses[len(captured) - 1]
+
+        return fake_call, captured
+
+    def test_fires_after_streak_limit_of_reads_with_no_write(self, monkeypatch, tmp_path):
+        h = _load_harness(monkeypatch, tmp_path, {"CONVERGENCE_STREAK_LIMIT": "3"})
+
+        read_call = self._fake_response(
+            content=None,
+            tool_calls=[self._fake_tool_call("c1", "read_file", '{"path": "x"}')],
+        )
+        responses = [read_call] * 5 + [self._fake_response(content="done")]
+        fake_call, captured = self._recording_call(responses)
+        monkeypatch.setattr(h, "_call_api_with_fallback", MagicMock(side_effect=fake_call))
+        monkeypatch.setattr(h, "execute_tool", MagicMock(
+            return_value=json.dumps({"content": "irrelevant file contents"})
+        ))
+
+        result = h.run_agent("sys", [], "task", role="implementer", max_iter=6)
+
+        assert result == "done"
+        # Streak reaches 3 only after the 3rd read (recorded at the end of
+        # iteration index 2), so the checkpoint must first appear in the
+        # request for iteration index 3 — not any earlier.
+        assert not self._checkpoint_present(captured[0])
+        assert not self._checkpoint_present(captured[1])
+        assert not self._checkpoint_present(captured[2])
+        assert self._checkpoint_present(captured[3])
+
+    def test_write_call_resets_the_streak(self, monkeypatch, tmp_path):
+        h = _load_harness(monkeypatch, tmp_path, {"CONVERGENCE_STREAK_LIMIT": "2"})
+
+        read_call = self._fake_response(
+            content=None,
+            tool_calls=[self._fake_tool_call("c1", "read_file", '{"path": "x"}')],
+        )
+        write_call = self._fake_response(
+            content=None,
+            tool_calls=[self._fake_tool_call("c2", "write_file", '{"path": "x", "content": "y"}')],
+        )
+        # Alternating read/write never lets the no-write streak reach 2.
+        responses = [read_call, write_call, read_call, write_call, self._fake_response(content="done")]
+        fake_call, captured = self._recording_call(responses)
+        monkeypatch.setattr(h, "_call_api_with_fallback", MagicMock(side_effect=fake_call))
+        monkeypatch.setattr(h, "execute_tool", MagicMock(
+            return_value=json.dumps({"status": "ok"})
+        ))
+
+        result = h.run_agent("sys", [], "task", role="implementer", max_iter=5)
+
+        assert result == "done"
+        assert not any(self._checkpoint_present(snap) for snap in captured)
+
+
 class TestSandboxLocalEnvSanitization:
     def test_api_keys_stripped_from_local_subprocess_env(self, monkeypatch):
         monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-should-be-stripped")

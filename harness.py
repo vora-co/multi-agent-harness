@@ -208,6 +208,15 @@ MAX_ITER_REVIEWER  = int(os.getenv("MAX_ITER_REVIEWER", "40"))  # Reviewer: read
 MAX_ITER_SPEC      = int(os.getenv("MAX_ITER_SPEC", "35"))  # Spec writer: override via .env if specs need more iterations
 RETRY_BACKOFF      = [2, 4, 8]  # seconds between API retries
 
+# Convergence streak detector (run_agent): consecutive iterations with tool
+# calls but no write (write_file/append_file/update_feature_status, or a
+# hallucinated edit-style call _edit_alias translated into one) before a live
+# nudge is injected telling the agent to stop exploring and make the edit.
+# Fires every CONVERGENCE_STREAK_LIMIT-th iteration of the streak (7, 14, 21,
+# ...) rather than once, in case the first nudge doesn't land. 0 disables it.
+CONVERGENCE_STREAK_LIMIT = int(os.getenv("CONVERGENCE_STREAK_LIMIT", "7"))
+_WRITE_TOOL_NAMES = {"write_file", "append_file", "update_feature_status"}
+
 # ─── FEATURE DESIGN RULE ─────────────────────────────────────────────────────
 # Features should touch at most 4-5 files. Larger features should be split by
 # the Leader into smaller sequential features (using depends_on) instead of
@@ -1414,6 +1423,21 @@ def _classify_error(error_msg: str) -> str:
         return "LOGICAL"
     return "FATAL"
 
+
+def _is_write_call(fn_name: str, result: str) -> bool:
+    """
+    Did this tool call actually mutate a file? True for a direct write_file/
+    append_file/update_feature_status call. Also true for a hallucinated
+    edit-style call (edit_file, str_replace, ...) that _edit_alias
+    (tools.py) transparently translated into a real write_file — recognized
+    by that translation's exact success marker, so a *failed* alias attempt
+    (path not found, old_string not unique, etc.) does not count.
+    """
+    if fn_name in _WRITE_TOOL_NAMES:
+        return True
+    return "auto-translated to a real read_file + write_file" in result
+
+
 # ─── GENERIC AGENT ENGINE ────────────────────────────────────────────────────
 
 def run_agent(system_prompt: str, tools: list, task: str,
@@ -1442,6 +1466,7 @@ def run_agent(system_prompt: str, tools: list, task: str,
         ]
     _log(role, "START", task[:120])
     tool_call_errors: list = []
+    _no_write_streak = 0
 
     # Generic, role-agnostic budget-checkpoint enforcement. Previously this
     # was only advisory prompt text in agents/e2e_tester.py's "BUDGET
@@ -1464,6 +1489,18 @@ def run_agent(system_prompt: str, tools: list, task: str,
                     "file and progress report), stop exploring now and write it with "
                     "what you already have — a concrete partial result beats running "
                     "out of iterations with nothing written."
+                )
+            })
+        if CONVERGENCE_STREAK_LIMIT and _no_write_streak and _no_write_streak % CONVERGENCE_STREAK_LIMIT == 0:
+            messages.append({
+                "role": "user",
+                "content": (
+                    f"⚠️ CONVERGENCE CHECKPOINT: you have gone {_no_write_streak} tool call "
+                    "iteration(s) without writing or editing anything. If you already know "
+                    "what to change and where, stop exploring and make the edit now — do not "
+                    "keep re-verifying something you've already confirmed. If you genuinely "
+                    "don't know yet, re-read the task description itself rather than more of "
+                    "the codebase."
                 )
             })
         if i == max_iter - 1:
@@ -1500,6 +1537,7 @@ def run_agent(system_prompt: str, tools: list, task: str,
         messages.append(msg)
         messages = _compact_messages(messages, role)
 
+        made_write_this_iter = False
         for tc in msg.tool_calls:
             fn_name = tc.function.name
             fn_args, parse_err = _safe_parse_args(tc.function.arguments, fn_name)
@@ -1520,6 +1558,9 @@ def run_agent(system_prompt: str, tools: list, task: str,
             _log(role, "TOOL_CALL", f"{fn_name}({json.dumps(fn_args, ensure_ascii=False)[:100]})")
             result = _redact(execute_tool(fn_name, fn_args))
             _log(role, "TOOL_RESULT", result[:200])
+
+            if _is_write_call(fn_name, result):
+                made_write_this_iter = True
 
             # Best-effort: track tool-call errors so that if this attempt hits
             # max_iter without a verdict, the next retry gets concrete context
@@ -1549,6 +1590,8 @@ def run_agent(system_prompt: str, tools: list, task: str,
                 "tool_call_id": tc.id,
                 "content": result
             })
+
+        _no_write_streak = 0 if made_write_this_iter else _no_write_streak + 1
 
         # Snapshot after this iteration's tool calls are recorded — a crash
         # past this point loses at most the current iteration, not the whole

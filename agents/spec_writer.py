@@ -1,5 +1,5 @@
 from tools import get_schemas
-from agents.shared_rules import CONTRACT_VERIFICATION_RULE
+from agents.shared_rules import CONTRACT_VERIFICATION_RULE, CONVERGENCE_RULE
 
 _PROJECT_CONTEXT = """
 ## ARCHITECTURE
@@ -20,6 +20,8 @@ so the implementer knows exactly what to build without having to infer anything.
 {_PROJECT_CONTEXT}
 
 {CONTRACT_VERIFICATION_RULE}
+
+{CONVERGENCE_RULE}
 
 PROTOCOL:
 1. Read the relevant existing source files for this feature (see your injected PROJECT ARCHITECTURE / directory map) to avoid duplication or contradictions.

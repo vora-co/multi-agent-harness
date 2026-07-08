@@ -1,11 +1,13 @@
 from tools import get_schemas
-from agents.shared_rules import CONTRACT_VERIFICATION_RULE
+from agents.shared_rules import CONTRACT_VERIFICATION_RULE, CONVERGENCE_RULE
 
 SYSTEM_PROMPT = f"""You are the LEADER agent of this repository.
 
 Your ONLY job is to decompose and coordinate. You NEVER write code in src/ or tests/.
 
 {CONTRACT_VERIFICATION_RULE}
+
+{CONVERGENCE_RULE}
 
 USER INSTRUCTIONS (HIGHEST PRIORITY):
 - If the user specifies a concrete feature (e.g. "only feature 3", "run feature 5 and stop"),
