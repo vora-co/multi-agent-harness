@@ -1620,6 +1620,13 @@ _HOOKS: dict[str, list] = {
     # kwargs: feature_id (int), description (str), attempts (int), final_verdict (str)
     "after_feature_failed": [],
 
+    # Fired each time the Reviewer rejects a feature cycle (before deciding
+    # whether to retry or give up). Unlike after_feature_failed, this fires
+    # on EVERY rejection, including ones that will still be retried.
+    # kwargs: feature_id (int), description (str), attempt (int),
+    #         max_attempts (int), rejection_reason (str)
+    "after_reviewer_rejected": [],
+
     # Fired once when the harness exits — even on crash (called from finally).
     # kwargs: session_costs (dict)  — same structure as progress/session_costs.json
     "after_session": [],
@@ -2492,6 +2499,10 @@ def _run_feature_cycle_impl(feature_id: int, description: str, e2e: bool = True)
         _log("harness", "CYCLE_RETRY",
              f"feature={feature_id} attempt={attempt}/{MAX_RETRIES_REVIEW} reason={rejection_reason[:100]}",
              level="warning")
+        _fire("after_reviewer_rejected",
+              feature_id=feature_id, description=description,
+              attempt=attempt, max_attempts=MAX_RETRIES_REVIEW,
+              rejection_reason=rejection_reason)
         if attempt < MAX_RETRIES_REVIEW:
             _vprint("normal", Panel(
                 f"[yellow]Reviewer rejected — retry {attempt+1}/{MAX_RETRIES_REVIEW}[/]\n"

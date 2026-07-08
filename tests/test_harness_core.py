@@ -678,6 +678,76 @@ class TestFeatureCycleVerbosityIntegration:
         assert h.Panel.return_value not in printed             # normal-tier panel suppressed
 
 
+class TestAfterReviewerRejectedHook:
+    """
+    after_reviewer_rejected must fire once per genuine Reviewer rejection —
+    including attempts that go on to be retried — with feature_id, attempt,
+    max_attempts, and rejection_reason. Same _patch_cycle pattern as
+    TestFeatureCycleVerbosityIntegration, except _fire is a spying MagicMock
+    instead of a silencing one, since this test asserts on its calls.
+    """
+
+    def _patch_cycle(self, h, monkeypatch, review_results):
+        monkeypatch.setattr(h, "spawn_spec_writer", MagicMock(return_value="progress/spec_1.md"))
+        monkeypatch.setattr(h, "spawn_implementer", MagicMock(return_value="ok"))
+        monkeypatch.setattr(h, "spawn_e2e_tester", MagicMock(return_value="E2E_PASSED"))
+        monkeypatch.setattr(h, "spawn_reviewer", MagicMock(side_effect=review_results))
+        monkeypatch.setattr(h, "_fire_gate", MagicMock(return_value=None))
+        monkeypatch.setattr(h, "_track_usage", MagicMock())
+        fire_mock = MagicMock()
+        monkeypatch.setattr(h, "_fire", fire_mock)
+        return fire_mock
+
+    def _calls_for(self, fire_mock, event):
+        return [call for call in fire_mock.call_args_list if call.args[0] == event]
+
+    def test_fires_on_every_rejected_attempt(self, monkeypatch, tmp_path):
+        (tmp_path / "progress").mkdir(exist_ok=True)
+        h = _load_harness(monkeypatch, tmp_path, {"MAX_RETRIES_REVIEW": "2"})
+        fire_mock = self._patch_cycle(
+            h, monkeypatch,
+            review_results=["REJECTED: bad code", "REJECTED: still bad"],
+        )
+
+        result = h.run_feature_cycle(1, "desc", e2e=False)
+
+        assert result["approved"] is False
+        rejected_calls = self._calls_for(fire_mock, "after_reviewer_rejected")
+        assert len(rejected_calls) == 2
+
+        first_kwargs = rejected_calls[0].kwargs
+        assert first_kwargs["feature_id"] == 1
+        assert first_kwargs["description"] == "desc"
+        assert first_kwargs["attempt"] == 1
+        assert first_kwargs["max_attempts"] == 2
+        assert "bad code" in first_kwargs["rejection_reason"]
+
+        second_kwargs = rejected_calls[1].kwargs
+        assert second_kwargs["attempt"] == 2
+        assert second_kwargs["max_attempts"] == 2
+        assert "still bad" in second_kwargs["rejection_reason"]
+
+        # after_feature_failed still fires once retries are exhausted —
+        # this hook is additive, not a replacement.
+        assert len(self._calls_for(fire_mock, "after_feature_failed")) == 1
+
+    def test_does_not_fire_on_approval(self, monkeypatch, tmp_path):
+        (tmp_path / "progress").mkdir(exist_ok=True)
+        h = _load_harness(monkeypatch, tmp_path, {"MAX_RETRIES_REVIEW": "2"})
+        fire_mock = self._patch_cycle(
+            h, monkeypatch,
+            review_results=["REJECTED: bad code", "APPROVED"],
+        )
+
+        result = h.run_feature_cycle(1, "desc", e2e=False)
+
+        assert result["approved"] is True
+        rejected_calls = self._calls_for(fire_mock, "after_reviewer_rejected")
+        assert len(rejected_calls) == 1
+        assert rejected_calls[0].kwargs["attempt"] == 1
+        assert len(self._calls_for(fire_mock, "after_feature_approved")) == 1
+
+
 # ── Structured agent status (progress/<stage>_<id>.json) ───────────────────────
 
 class TestReadStructuredStatus:

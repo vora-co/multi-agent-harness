@@ -43,6 +43,15 @@ AVAILABLE EVENTS
       Fired when a feature exhausts all retries and is marked failed.
       Use for: alerting, escalation, writing a failure report.
 
+  after_reviewer_rejected(feature_id, description, attempt, max_attempts, rejection_reason)
+      Fired every time the Reviewer rejects a feature cycle, including
+      attempts that will still be retried — unlike after_feature_failed,
+      which only fires once retries are exhausted. Does NOT fire for a
+      before_approval_finalized veto or an E2E failure — this is scoped to
+      a genuine Reviewer rejection only.
+      Use for: per-attempt diagnostics, root-cause logging, feeding a
+      failure-analysis pipeline without waiting for the feature to fully fail.
+
   before_spawn_agent(role, system_prompt, task, feature_id)
       Fired immediately before each agent is invoked — once per agent call.
       role: "spec_writer" | "implementer" | "reviewer" | "e2e_tester"
@@ -164,6 +173,18 @@ def on_feature_failed(feature_id: int, description: str,
     pass
 
 # register_hook("after_feature_failed", on_feature_failed)
+
+
+# ── Example 4b: log every individual Reviewer rejection ──────────────────────
+
+def on_reviewer_rejected(feature_id: int, description: str, attempt: int,
+                         max_attempts: int, rejection_reason: str, **kwargs):
+    """Called on every Reviewer rejection, including ones that will retry."""
+    # print(f"[example_plugin] feature #{feature_id} rejected on attempt "
+    #       f"{attempt}/{max_attempts}: {rejection_reason[:120]}")
+    pass
+
+# register_hook("after_reviewer_rejected", on_reviewer_rejected)
 
 
 # ── Example 5: override stack context before each agent ──────────────────────
