@@ -330,7 +330,14 @@ def _run_playwright_tests_python(test_path: str, base_url: str, headed: bool, ti
             "returncode": result.returncode,
             "success": result.returncode == 0,
             "screenshots": screenshots,
-            "tip": "If the test failed, read error-context.md in the same test-results subfolder for the full stack trace and code context."
+            "tip": ("pytest-playwright does not generate error-context.md (that's a Node "
+                    "@playwright/test artifact) — the authoritative source for a failure is the "
+                    "'output' field above (last ~3000 chars of pytest stdout/stderr, including the "
+                    "traceback). If the traceback only shows a generic timeout (e.g. wait_for_url/"
+                    "wait_for_selector) without explaining the cause, the page likely rendered a "
+                    "visible error (e.g. a validation/uniqueness banner) that the test never checked "
+                    "for — inspect the test's own assertions/selectors rather than assuming the "
+                    "feature is broken.")
         })
     except subprocess.TimeoutExpired:
         return json.dumps({"error": f"Timeout: E2E tests took more than {E2E_SUBPROCESS_TIMEOUT_S // 60} minutes."})

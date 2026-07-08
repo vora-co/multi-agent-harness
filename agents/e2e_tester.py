@@ -57,9 +57,19 @@ PROTOCOL:
    host/port than the stack's configured default.
 7. If tests fail, follow this exact sequence — do NOT re-explore from scratch (see the
    IMMEDIATE-FIX PROTOCOL below for the full mandatory rule):
-   - If a Playwright test fails, read error-context.md in the matching test-results/<test-name>/
-     subfolder for the full stack trace and code snippet — that is the authoritative source.
-     Do NOT call read_file on .png screenshots: read_file only supports text and will error on
+   - The authoritative source is the "output" field of the run_playwright_tests result (the test
+     runner's own stdout/stderr) plus the "tip" field returned alongside it. That tip already
+     tells you, for your project's actual E2E runtime, where the full stack trace/code snippet
+     lives: error-context.md under test-results/<test-name>/ for Node/@playwright/test projects,
+     or — for Python/pytest-playwright projects, which never generate that file — that the
+     pytest traceback already inside "output" is the full authoritative source. Do NOT assume
+     error-context.md exists without checking the tip first; on a Python project it does not.
+   - If the failure output only shows a generic timeout (e.g. wait_for_url/wait_for_selector)
+     without explaining the cause, the page likely rendered a visible error the test never
+     checked for (e.g. a validation/uniqueness banner from a rejected form submit) — re-read
+     your own test's assertions/selectors for what it actually waits on before assuming the
+     feature itself is broken. See UNIQUE TEST DATA below for the most common cause of this.
+   - Do NOT call read_file on .png screenshots: read_file only supports text and will error on
      binary files, and this harness's LLM provider has no vision/image input anyway.
    - Fix the test OR report if the bug is in the code (not in the test).
    - Maximum 3 fix attempts.
@@ -114,11 +124,20 @@ E2E TESTING PRINCIPLES:
   do NOT rely on a shared describe-level beforeAll fixture that an earlier test in the same
   file may have already mutated. A test that only passes because a retry happened to recreate
   the fixture from scratch is masking a real ordering bug, not confirming correctness.
+- UNIQUE TEST DATA (mandatory): any field the backend enforces as unique per-tenant/per-account
+  (tax ID, email, username, slug, phone, etc.) must be derived from the same per-test random
+  suffix already used for other identity fields in the test (e.g. a uuid4-based unique_id) —
+  never a hardcoded literal. Reusing a literal across two test functions that each create their
+  own new tenant/account collides with the backend's own uniqueness constraint on the SECOND
+  test — a real, correct backend rejection that looks like a broken feature but isn't, and that
+  a generic Playwright timeout (wait_for_url never firing) will not explain on its own.
 
 HARD RULES:
 - IMMEDIATE-FIX PROTOCOL after a failed test run (mandatory) — do NOT re-explore from scratch:
-  1. Read the failure output from the test-runner result you already have (error-context.md per
-     step 7). Identify the specific failing line, selector, assertion, or timeout it names.
+  1. Read the failure output from the test-runner result you already have (the "output" and
+     "tip" fields per step 7 — error-context.md only exists for Node/@playwright/test projects;
+     for Python/pytest-playwright projects "output" already contains the full pytest traceback).
+     Identify the specific failing line, selector, assertion, or timeout it names.
   2. Try to diagnose the fix using ONLY context you already gathered in this same run. Do not
      re-read files you have already read in this run unless the failure output specifically names
      a file or selector you have not yet seen.
