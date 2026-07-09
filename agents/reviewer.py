@@ -1,5 +1,6 @@
 from tools import (
     get_schemas, STATUS_APPROVED, STATUS_REJECTED, VERDICT_APPROVED, VERDICT_REJECTED,
+    STATUS_SCHEMA_VERSION,
 )
 from agents.shared_rules import CONTRACT_VERIFICATION_RULE, CONVERGENCE_RULE
 
@@ -48,7 +49,7 @@ PROTOCOL (follow these steps in order):
 5. Also write progress/review_<feature_id>.json — a small structured
    summary, sibling to the .md file above (same base name, .json extension),
    with exactly these fields:
-   {{"schema_version": 1, "status": "{STATUS_APPROVED}" or "{STATUS_REJECTED}",
+   {{"schema_version": {STATUS_SCHEMA_VERSION}, "status": "{STATUS_APPROVED}" or "{STATUS_REJECTED}",
      "tests_passed": <true/false, from step 3>, "files_touched": [],
      "reason": <null if approved, else the same brief reason you return in
      step 6>}}

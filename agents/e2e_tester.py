@@ -1,5 +1,6 @@
 from tools import (
     get_schemas, STATUS_PASSED, STATUS_FAILED, VERDICT_E2E_PASSED, VERDICT_E2E_FAILED,
+    STATUS_SCHEMA_VERSION,
 )
 from agents.shared_rules import CONTRACT_VERIFICATION_RULE, CONVERGENCE_RULE
 
@@ -81,7 +82,7 @@ PROTOCOL:
 9. Also write progress/e2e_<feature_id>.json — a small structured summary,
    sibling to the .md file above (same base name, .json extension), with
    exactly these fields:
-   {{"schema_version": 1, "status": \"""" + STATUS_PASSED + "\" or \"" + STATUS_FAILED + """\",
+   {{"schema_version": """ + str(STATUS_SCHEMA_VERSION) + """, "status": \"""" + STATUS_PASSED + "\" or \"" + STATUS_FAILED + """\",
      "tests_passed": <true/false, matching status>, "files_touched": [],
      "reason": <null if passed, else the same brief reason you return in
      step 10>}}

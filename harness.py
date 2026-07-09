@@ -89,7 +89,7 @@ import agents.spec_writer as spec_cfg
 from tools import (
     execute_tool, SAFE_WRITE_DIRS, VALID_FEATURE_STATUSES,
     FEATURE_LIST_PATH, PROGRESS_DIR, ROLES,
-    STATUS_APPROVED, STATUS_REJECTED, STATUS_PASSED, STATUS_FAILED,
+    STATUS_APPROVED, STATUS_REJECTED, STATUS_PASSED, STATUS_FAILED, STATUS_SCHEMA_VERSION,
     VERDICT_APPROVED, VERDICT_REJECTED, VERDICT_E2E_PASSED, VERDICT_E2E_FAILED,
 )
 from stack_layout import resolve_layout
@@ -1611,15 +1611,72 @@ def _verdict_is(result: str, marker: str) -> bool:
 # contain JSON-looking text, so scanning the .md for "the" JSON block would
 # be ambiguous. A sibling file has no such collision risk and needs no
 # extraction/regex — just json.load() the whole file.
+#
+# Versioning (STATUS_SCHEMA_VERSION, tools.py): the four spawnable agents all
+# write this same shape, but only checking that a "schema_version" *key* is
+# present (as the original version of this reader did) can't tell "current
+# shape" apart from "some past or future shape that happens to also carry a
+# schema_version key" — a real risk once this shape's first change ships,
+# since a stale progress/ directory from before that change would otherwise
+# be silently read as if it were current. AgentStatusSchema below validates
+# the shape (same pydantic style as FeatureSchema for feature_list.json,
+# extra="forbid" so a drifted field is a loud validation error, not a silent
+# .get()-returns-None no-op); a schema_version that doesn't match
+# STATUS_SCHEMA_VERSION is checked and logged *before* that validation runs,
+# as its own distinct outcome (STATUS_SCHEMA_VERSION_MISMATCH) rather than
+# falling through to a generic validation-failure log — it's not that the
+# file is malformed, it's that this code doesn't know that version's shape
+# yet (or anymore). Either way the never-raise contract holds: any mismatch
+# or validation failure still returns None, and every caller already treats
+# None as "fall back to the prose heuristic" — this is purely additive
+# detection on top of the exact same fallback behavior as before.
+#
+# status vocabulary: "status" means something different per writer — "ok"
+# (spec_writer), "done" (implementer), STATUS_APPROVED/STATUS_REJECTED
+# (reviewer), STATUS_PASSED/STATUS_FAILED (e2e_tester) — and this reader is
+# deliberately role-agnostic (it's handed a bare report_path, not told which
+# agent wrote it; see _reviewer_verdict/_e2e_verdict/spawn_implementer's call
+# sites). Rather than plumb a role parameter through all 3 call sites just to
+# validate each file against its own role's narrower vocabulary, _AGENT_STATUS_VALUES
+# below is every value any of the 4 writers can legitimately produce today —
+# enough to catch what actually matters (a hallucinated/typo'd status that
+# belongs to no role, e.g. "complete" instead of "done") without that plumbing.
+_AGENT_STATUS_VALUES = {"ok", "done", STATUS_APPROVED, STATUS_REJECTED, STATUS_PASSED, STATUS_FAILED}
+
+
+class AgentStatusSchema(BaseModel):
+    """
+    Shape of progress/<stage>_<id>.json — see the "STRUCTURED AGENT STATUS"
+    comment block above and STATUS_SCHEMA_VERSION (tools.py) for the version
+    this validates against.
+    """
+    model_config = ConfigDict(extra="forbid")
+
+    schema_version: int
+    status:         str
+    tests_passed:   Optional[bool] = None
+    files_touched:  Optional[list[str]] = None
+    reason:         Optional[str] = None
+
+    @field_validator("status")
+    @classmethod
+    def _status_must_be_known(cls, v: str) -> str:
+        if v not in _AGENT_STATUS_VALUES:
+            raise ValueError(f"must be one of {sorted(_AGENT_STATUS_VALUES)}, got '{v}'")
+        return v
+
 
 def _read_structured_status(report_path: str) -> Optional[dict]:
     """
     Read the sibling <report_path minus extension>.json written alongside an
     agent's prose report. Returns None (never raises) if the file is absent,
-    unreadable, not valid JSON, not a dict, or missing "schema_version" —
-    that last check means foreign/unrelated JSON is treated the same as a
-    missing file, so callers always have a single "structured data available
-    or not" branch to handle.
+    unreadable, not valid JSON, not a dict, missing "schema_version", on a
+    schema_version mismatch, or on any other AgentStatusSchema validation
+    failure — every one of those collapses to the same "no structured data
+    available" signal every caller already handles by falling back to the
+    prose heuristic. A version mismatch is logged as its own distinct event
+    (see the module comment above) before that fallback, so it's visible in
+    progress/harness.log instead of looking identical to "file never existed".
     """
     json_path = os.path.splitext(report_path)[0] + ".json"
     if not os.path.exists(json_path):
@@ -1631,6 +1688,22 @@ def _read_structured_status(report_path: str) -> Optional[dict]:
         return None
     if not isinstance(data, dict) or "schema_version" not in data:
         return None
+
+    if data.get("schema_version") != STATUS_SCHEMA_VERSION:
+        _log("harness", "STATUS_SCHEMA_VERSION_MISMATCH",
+             f"path={json_path} found_version={data.get('schema_version')!r} "
+             f"expected_version={STATUS_SCHEMA_VERSION} — ignoring, falling back "
+             f"to the prose heuristic for this file", level="warning")
+        return None
+
+    try:
+        AgentStatusSchema.model_validate(data)
+    except ValidationError as exc:
+        errs = "; ".join(f"{'.'.join(str(p) for p in e['loc']) or '(root)'}: {e['msg']}" for e in exc.errors())
+        _log("harness", "STATUS_SCHEMA_VALIDATION_ERROR",
+             f"path={json_path} — {errs}", level="warning")
+        return None
+
     return data
 
 

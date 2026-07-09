@@ -47,6 +47,19 @@ STATUS_REJECTED = "rejected"
 STATUS_PASSED = "passed"
 STATUS_FAILED = "failed"
 
+# Version of the progress/<stage>_<id>.json shape written by the 4 spawnable
+# agents (spec_writer/implementer/reviewer/e2e_tester) — see harness.py's
+# "STRUCTURED AGENT STATUS" section (AgentStatusSchema, _read_structured_status)
+# for the reader/validator this guards. Lives here, not in harness.py, for the
+# same reason STATUS_APPROVED etc. do: every agents/*.py prompt interpolates
+# it (so the literal written on disk and the version harness.py validates
+# against can never drift apart), and harness.py imports agents/*.py at
+# module load time — a harness.py-side constant would be a circular import.
+# Bump this whenever the shape changes (field added/renamed/removed, or a
+# field's meaning changes); harness.py logs a distinct
+# STATUS_SCHEMA_VERSION_MISMATCH instead of misreading an old file as current.
+STATUS_SCHEMA_VERSION = 1
+
 # Chat-return verdict markers, parsed case-tolerantly by harness.py's
 # _verdict_is(). Same drift-prevention rationale as STATUS_* above.
 VERDICT_APPROVED = "APPROVED"

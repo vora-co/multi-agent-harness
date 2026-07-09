@@ -1,4 +1,4 @@
-from tools import get_schemas
+from tools import get_schemas, STATUS_SCHEMA_VERSION
 from agents.shared_rules import CONTRACT_VERIFICATION_RULE, CONVERGENCE_RULE
 
 # Project context pre-injected — no need to read docs/
@@ -112,7 +112,7 @@ PROTOCOL (follow these steps in order):
 6. Also write progress/impl_<feature_id>.json — a small structured summary,
    sibling to the .md file above (same base name, .json extension), with
    exactly these fields:
-   {{"schema_version": 1, "status": "done", "tests_passed": <true only if
+   {{"schema_version": {STATUS_SCHEMA_VERSION}, "status": "done", "tests_passed": <true only if
      the FINAL test run in step 4 passed, false otherwise>,
      "files_touched": ["<every file you created or modified>"]}}
    This is a separate file from the report itself — do not put JSON inside

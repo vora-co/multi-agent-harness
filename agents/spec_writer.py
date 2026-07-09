@@ -1,4 +1,4 @@
-from tools import get_schemas
+from tools import get_schemas, STATUS_SCHEMA_VERSION
 from agents.shared_rules import CONTRACT_VERIFICATION_RULE, CONVERGENCE_RULE
 
 _PROJECT_CONTEXT = """
@@ -74,7 +74,7 @@ Design decisions, constraints, or specific warnings for this feature.
 3. Also write progress/spec_<feature_id>.json — a small structured summary,
    sibling to the .md file above (same base name, .json extension), with
    exactly these fields:
-   {{"schema_version": 1, "status": "ok", "tests_passed": null,
+   {{"schema_version": {STATUS_SCHEMA_VERSION}, "status": "ok", "tests_passed": null,
      "files_touched": ["<every path from your "Files to create or modify"
      section above>"]}}
    This is a separate file from the spec itself — do not put JSON inside

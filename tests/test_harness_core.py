@@ -779,6 +779,106 @@ class TestReadStructuredStatus:
         (tmp_path / "progress" / "impl_1.json").write_text(json.dumps(payload))
         assert h._read_structured_status("progress/impl_1.md") == payload
 
+    def test_current_schema_version_constant_matches_shipped_value(self, monkeypatch, tmp_path):
+        # AgentStatusSchema/_read_structured_status validate against this
+        # constant — pin it so a future bump is a deliberate, visible change
+        # to this test, not an accidental drift.
+        h = _load_harness(monkeypatch, tmp_path)
+        assert h.STATUS_SCHEMA_VERSION == 1
+
+    def test_future_schema_version_is_detected_as_mismatch_not_silently_accepted(self, monkeypatch, tmp_path):
+        # A file from a future (not-yet-written) schema version must not be
+        # half-trusted as if it were current — falls back to None/prose
+        # heuristic exactly like a missing file, but is logged distinctly.
+        h = _load_harness(monkeypatch, tmp_path)
+        (tmp_path / "progress").mkdir(exist_ok=True)
+        payload = {"schema_version": 2, "status": "done", "tests_passed": True, "files_touched": []}
+        (tmp_path / "progress" / "impl_1.json").write_text(json.dumps(payload))
+
+        logged = []
+        monkeypatch.setattr(h, "_log", lambda role, event, detail="", level="info": logged.append(event))
+
+        result = h._read_structured_status("progress/impl_1.md")
+
+        assert result is None
+        assert "STATUS_SCHEMA_VERSION_MISMATCH" in logged
+
+    def test_older_schema_version_is_also_detected_as_mismatch(self, monkeypatch, tmp_path):
+        h = _load_harness(monkeypatch, tmp_path)
+        (tmp_path / "progress").mkdir(exist_ok=True)
+        payload = {"schema_version": 0, "status": "done", "tests_passed": True, "files_touched": []}
+        (tmp_path / "progress" / "impl_1.json").write_text(json.dumps(payload))
+
+        logged = []
+        monkeypatch.setattr(h, "_log", lambda role, event, detail="", level="info": logged.append(event))
+
+        assert h._read_structured_status("progress/impl_1.md") is None
+        assert "STATUS_SCHEMA_VERSION_MISMATCH" in logged
+
+    def test_current_version_but_wrong_field_type_fails_validation_gracefully(self, monkeypatch, tmp_path):
+        # Same schema_version, but "tests_passed" is an object instead of a
+        # bool (pydantic v2's lax bool parsing accepts some strings like
+        # "yes"/"no", so use a type with no such coercion) — AgentStatusSchema
+        # must reject it (not crash, not half-trust it), falling back to None
+        # like any other invalid structured file.
+        h = _load_harness(monkeypatch, tmp_path)
+        (tmp_path / "progress").mkdir(exist_ok=True)
+        payload = {"schema_version": 1, "status": "done", "tests_passed": {"nested": True}, "files_touched": []}
+        (tmp_path / "progress" / "impl_1.json").write_text(json.dumps(payload))
+
+        logged = []
+        monkeypatch.setattr(h, "_log", lambda role, event, detail="", level="info": logged.append(event))
+
+        assert h._read_structured_status("progress/impl_1.md") is None
+        assert "STATUS_SCHEMA_VALIDATION_ERROR" in logged
+
+    def test_current_version_missing_required_field_fails_validation(self, monkeypatch, tmp_path):
+        # "status" is required by AgentStatusSchema even though the raw
+        # schema_version check alone wouldn't have caught its absence.
+        h = _load_harness(monkeypatch, tmp_path)
+        (tmp_path / "progress").mkdir(exist_ok=True)
+        payload = {"schema_version": 1, "tests_passed": True, "files_touched": []}
+        (tmp_path / "progress" / "impl_1.json").write_text(json.dumps(payload))
+        assert h._read_structured_status("progress/impl_1.md") is None
+
+    def test_current_version_unknown_extra_field_fails_validation(self, monkeypatch, tmp_path):
+        # extra="forbid", same as FeatureSchema — a drifted/renamed field is
+        # a loud validation error instead of a silently-ignored .get() miss.
+        h = _load_harness(monkeypatch, tmp_path)
+        (tmp_path / "progress").mkdir(exist_ok=True)
+        payload = {
+            "schema_version": 1, "status": "done", "tests_passed": True,
+            "files_touched": [], "unexpected_field": "oops",
+        }
+        (tmp_path / "progress" / "impl_1.json").write_text(json.dumps(payload))
+        assert h._read_structured_status("progress/impl_1.md") is None
+
+    def test_current_version_unknown_status_value_fails_validation(self, monkeypatch, tmp_path):
+        # "complete" belongs to no role's real vocabulary (done/ok/approved/
+        # rejected/passed/failed) — a hallucinated status must not pass.
+        h = _load_harness(monkeypatch, tmp_path)
+        (tmp_path / "progress").mkdir(exist_ok=True)
+        payload = {"schema_version": 1, "status": "complete", "tests_passed": True, "files_touched": []}
+        (tmp_path / "progress" / "impl_1.json").write_text(json.dumps(payload))
+        assert h._read_structured_status("progress/impl_1.md") is None
+
+    @pytest.mark.parametrize("status_value", ["ok", "done", "approved", "rejected", "passed", "failed"])
+    def test_every_real_role_status_value_is_accepted(self, monkeypatch, tmp_path, status_value):
+        h = _load_harness(monkeypatch, tmp_path)
+        (tmp_path / "progress").mkdir(exist_ok=True)
+        payload = {"schema_version": 1, "status": status_value, "tests_passed": None, "files_touched": []}
+        (tmp_path / "progress" / "impl_1.json").write_text(json.dumps(payload))
+        assert h._read_structured_status("progress/impl_1.md") == payload
+
+    def test_reason_and_optional_fields_may_be_omitted(self, monkeypatch, tmp_path):
+        # reviewer/e2e_tester write "reason": null on success, but a minimal
+        # file omitting optional fields entirely must still validate.
+        h = _load_harness(monkeypatch, tmp_path)
+        (tmp_path / "progress").mkdir(exist_ok=True)
+        payload = {"schema_version": 1, "status": "ok"}
+        (tmp_path / "progress" / "impl_1.json").write_text(json.dumps(payload))
+        assert h._read_structured_status("progress/impl_1.md") == payload
+
 
 class TestImplCacheStructuredVsLegacy:
     def _stub_run_agent(self, h, monkeypatch, calls):
