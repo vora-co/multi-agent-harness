@@ -1,5 +1,6 @@
-import os, re, json, time, logging, datetime, subprocess, sys, uuid, contextvars
+import os, re, json, time, logging, datetime, subprocess, sys, uuid, contextvars, hashlib
 from typing import Optional
+from types import SimpleNamespace
 
 # Load .env as early as possible — before any module (e.g. tools.py) reads
 # os.environ at import time. If this ran after `from tools import ...`,
@@ -541,6 +542,187 @@ def _sanitize_messages_for_provider(messages: list, provider_name: str) -> list:
     return sanitized
 
 
+# ─── LLM RESPONSE CACHE ──────────────────────────────────────────────────────
+# Opt-in, on-disk cache for chat-completion calls, keyed on a canonical hash
+# of the exact (resolved_model, outgoing wire messages, tools) tuple sent to
+# a given provider. Off by default — see _llm_cache_enabled() below.
+#
+# Why this helps: retrying a whole feature cycle from scratch after a failure
+# re-sends an identical first turn (system prompt + task, no tool-call
+# history yet) to the LLM, paying and waiting for a response the harness has
+# already seen. Same for repeated compaction/spec-validation calls over an
+# identical conversation slice. This is a *different* problem than the
+# existing mid-run resumability (_save_message_state/_load_message_state):
+# that avoids redoing a crashed run; this avoids redoing a fresh run that
+# happens to reconstruct a prompt already seen in a previous run (or earlier
+# in this one).
+#
+# Multi-provider/multi-model correctness: the cache key is built from
+# provider.resolve_model(model) — the provider-resolved model name — not the
+# caller-facing canonical `model` argument, since LLM_MODEL_MAP can resolve
+# the same canonical name to a different real model per provider (e.g.
+# "deepseek-v4-pro" -> "gpt-4o" on openai). The key is computed *inside* the
+# per-provider loop in _call_api_with_fallback, using that provider's own
+# resolved model and its own sanitized outgoing_messages (see
+# _sanitize_messages_for_provider), so a cache entry is only ever reused for
+# the exact provider+model+messages+tools combination that produced it. This
+# also means a cache entry recorded for a fallback provider (e.g. openai,
+# because deepseek was down when it was written) is correctly reused later
+# only if that same provider ends up serving the request again — never
+# silently applied to a different provider's response for the same prompt.
+#
+# Nondeterminism caveat (documented, not "fixed"): no call site sets a
+# `temperature`/`seed`, so two real calls with byte-identical input aren't
+# guaranteed to return the same output either — caching just pins one drawn
+# sample instead of drawing a fresh one on retry. No caller in this codebase
+# depends on getting a *different* response from an identical prompt (the
+# existing spec/impl report caching already treats a prior successful
+# attempt as reusable without re-running the LLM at all), so this is a safe
+# opt-in tradeoff, not a correctness regression — but it's why the feature
+# defaults off and is documented in the README rather than silently always-on.
+def _llm_cache_enabled() -> bool:
+    """
+    Whether the on-disk LLM response cache is active. Pulled out as its own
+    function (same pattern as _structured_log_stdout_enabled) so the default
+    is unit-testable without depending on module-import-time state.
+    """
+    return os.getenv("LLM_CACHE_ENABLED", "false").strip().lower() not in ("false", "0", "no")
+
+
+LLM_CACHE_ENABLED = _llm_cache_enabled()
+
+# Harness-internal state, not something agents are ever instructed to read
+# or write — same convention as the _state_*.json checkpoint files already
+# living under progress/ (see _message_state_path). Overridable via .env for
+# projects that want the cache to live outside progress/ entirely.
+LLM_CACHE_DIR = os.getenv("LLM_CACHE_DIR", os.path.join(PROGRESS_DIR, ".llm_cache"))
+
+
+def _llm_cache_key(resolved_model: str, messages: list, tools: list) -> str:
+    """
+    Canonical sha256 hash of (resolved_model, messages, tools). Messages are
+    passed through _serialize_message first so a live pydantic
+    ChatCompletionMessage and a checkpoint-reloaded plain dict for the same
+    logical turn hash identically. sort_keys + compact separators make the
+    JSON serialization canonical (stable across key order / whitespace).
+    """
+    payload = {
+        "model":    resolved_model,
+        "messages": [_serialize_message(m) for m in messages],
+        "tools":    tools or [],
+    }
+    canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True, default=str)
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _llm_cache_path(cache_key: str) -> str:
+    return os.path.join(LLM_CACHE_DIR, f"{cache_key}.json")
+
+
+def _llm_cache_get(cache_key: str) -> Optional[dict]:
+    """
+    Best-effort disk cache lookup. A missing or corrupt entry is treated as a
+    miss (mirrors _load_message_state's "corrupt state == absent" rule)
+    rather than raising — a cache must never be able to block or crash a
+    call it only exists to skip.
+    """
+    path = _llm_cache_path(cache_key)
+    if not os.path.exists(path):
+        return None
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception as exc:
+        _log("harness", "LLM_CACHE_READ_ERROR", f"key={cache_key} err={exc}", level="warning")
+        return None
+
+
+def _llm_cache_put(cache_key: str, entry: dict) -> None:
+    """Best-effort disk cache write — never raises, matching _save_message_state."""
+    try:
+        os.makedirs(LLM_CACHE_DIR, exist_ok=True)
+        with open(_llm_cache_path(cache_key), "w", encoding="utf-8") as f:
+            json.dump(entry, f, ensure_ascii=False)
+    except Exception as exc:
+        _log("harness", "LLM_CACHE_WRITE_ERROR", f"key={cache_key} err={exc}", level="warning")
+
+
+def _llm_cache_entry_from_response(response) -> dict:
+    """Build the on-disk cache entry for a successful API response."""
+    usage = getattr(response, "usage", None)
+    return {
+        "message": _serialize_message(response.choices[0].message),
+        "model":   getattr(response, "model", None),
+        "usage": {
+            "prompt_tokens":     getattr(usage, "prompt_tokens", 0) if usage else 0,
+            "completion_tokens": getattr(usage, "completion_tokens", 0) if usage else 0,
+        },
+    }
+
+
+def _llm_response_from_cache_entry(entry: dict) -> SimpleNamespace:
+    """
+    Reconstruct a response object shaped like the real OpenAI-compatible
+    response (.choices[0].message.{content,tool_calls,reasoning_content},
+    .usage.{prompt_tokens,completion_tokens}, .model) from a stored cache
+    entry, so a cache hit is indistinguishable to every caller of
+    _call_api_with_fallback from a live API response.
+    """
+    msg_data = entry.get("message", {}) or {}
+    tool_calls = None
+    raw_tool_calls = msg_data.get("tool_calls")
+    if raw_tool_calls:
+        tool_calls = [
+            SimpleNamespace(
+                id=tc.get("id"),
+                type=tc.get("type", "function"),
+                function=SimpleNamespace(
+                    name=(tc.get("function") or {}).get("name"),
+                    arguments=(tc.get("function") or {}).get("arguments"),
+                ),
+            )
+            for tc in raw_tool_calls
+        ]
+    msg = SimpleNamespace(
+        role=msg_data.get("role", "assistant"),
+        content=msg_data.get("content"),
+        tool_calls=tool_calls,
+    )
+    if msg_data.get("reasoning_content"):
+        msg.reasoning_content = msg_data["reasoning_content"]
+
+    # usage is deliberately None, not the cached token counts: callers (run_agent,
+    # run_leader) unconditionally do `_track_usage(role, api_response.usage, ...)`
+    # on whatever _call_api_with_fallback returns, without knowing whether it was
+    # a cache hit. _track_usage() no-ops on usage=None (see its own early return),
+    # so this is what keeps a cache hit out of _SESSION_COSTS without having to
+    # touch any of the 3 call sites. The real token counts were already recorded
+    # separately by _track_cache_hit() before this object was returned.
+    return SimpleNamespace(choices=[SimpleNamespace(message=msg)], usage=None, model=entry.get("model"))
+
+
+def _clear_llm_cache() -> int:
+    """Delete every on-disk cache entry. Returns the count removed. Best-effort."""
+    if not os.path.isdir(LLM_CACHE_DIR):
+        return 0
+    removed = 0
+    for fname in os.listdir(LLM_CACHE_DIR):
+        if fname.endswith(".json"):
+            try:
+                os.remove(os.path.join(LLM_CACHE_DIR, fname))
+                removed += 1
+            except Exception as exc:
+                _log("harness", "LLM_CACHE_CLEAR_ERROR", f"file={fname} err={exc}", level="warning")
+    _log("harness", "LLM_CACHE_CLEARED", f"removed={removed}")
+    return removed
+
+
+def _llm_cache_entry_count() -> int:
+    if not os.path.isdir(LLM_CACHE_DIR):
+        return 0
+    return sum(1 for f in os.listdir(LLM_CACHE_DIR) if f.endswith(".json"))
+
+
 def _call_api_with_fallback(
     model:    str,
     messages: list,
@@ -563,7 +745,14 @@ def _call_api_with_fallback(
     only affects the wire payload; the caller's own `messages` list (and
     any checkpoint saved from it) is left untouched, so a later fallback
     back to the original provider still has the field available.
+
+    If LLM_CACHE_ENABLED, each provider attempt first checks the on-disk
+    cache for this exact (provider-resolved model, outgoing messages, tools)
+    tuple before making a real call, and stores a successful response before
+    returning it. See the "LLM RESPONSE CACHE" section above.
     """
+    cache_enabled = LLM_CACHE_ENABLED
+
     for p_idx, provider in enumerate(_PROVIDERS):
         resolved = provider.resolve_model(model)
         if p_idx > 0:
@@ -571,6 +760,16 @@ def _call_api_with_fallback(
                  f"switching to provider '{provider.name}' (model={resolved})", level="warning")
 
         outgoing_messages = _sanitize_messages_for_provider(messages, provider.name)
+
+        cache_key = None
+        if cache_enabled:
+            cache_key = _llm_cache_key(resolved, outgoing_messages, tools)
+            cached_entry = _llm_cache_get(cache_key)
+            if cached_entry is not None:
+                _log(role, "CACHE_HIT",
+                     f"provider={provider.name} model={resolved} key={cache_key[:12]}")
+                _track_cache_hit(role, cached_entry.get("usage") or {}, cached_entry.get("model"))
+                return _llm_response_from_cache_entry(cached_entry)
 
         for attempt in range(MAX_RETRIES_API):
             try:
@@ -583,6 +782,8 @@ def _call_api_with_fallback(
                 if p_idx > 0:
                     _log(role, "PROVIDER_FALLBACK_OK",
                          f"succeeded on '{provider.name}' after primary failed")
+                if cache_enabled:
+                    _llm_cache_put(cache_key, _llm_cache_entry_from_response(response))
                 return response
 
             except Exception as exc:
@@ -620,6 +821,19 @@ _SESSION_COSTS: dict = {
     "compaction":   {"prompt_tokens": 0, "completion_tokens": 0, "calls": 0, "cost_usd": 0.0},
 }
 
+# Cache hits are tracked separately from _SESSION_COSTS — a cache hit costs
+# nothing, so folding it into _SESSION_COSTS would make /costs overstate the
+# session's real spend. "savings_usd" is what the same tokens would have
+# cost at the cached response's own model's pricing (see _track_cache_hit).
+_CACHE_STATS: dict = {
+    "leader":       {"hits": 0, "prompt_tokens_saved": 0, "completion_tokens_saved": 0, "savings_usd": 0.0},
+    "spec_writer":  {"hits": 0, "prompt_tokens_saved": 0, "completion_tokens_saved": 0, "savings_usd": 0.0},
+    "implementer":  {"hits": 0, "prompt_tokens_saved": 0, "completion_tokens_saved": 0, "savings_usd": 0.0},
+    "reviewer":     {"hits": 0, "prompt_tokens_saved": 0, "completion_tokens_saved": 0, "savings_usd": 0.0},
+    "e2e_tester":   {"hits": 0, "prompt_tokens_saved": 0, "completion_tokens_saved": 0, "savings_usd": 0.0},
+    "compaction":   {"hits": 0, "prompt_tokens_saved": 0, "completion_tokens_saved": 0, "savings_usd": 0.0},
+}
+
 # ─── CONSOLE UTILITIES ───────────────────────────────────────────────────────
 
 _AGENT_STYLES = {
@@ -638,6 +852,7 @@ _AGENT_STYLES = {
 # are checked as a superset of ROLES rather than an exact match.
 assert set(ROLES) <= set(MODEL_BY_ROLE), f"MODEL_BY_ROLE missing role(s): {set(ROLES) - set(MODEL_BY_ROLE)}"
 assert set(ROLES) <= set(_SESSION_COSTS), f"_SESSION_COSTS missing role(s): {set(ROLES) - set(_SESSION_COSTS)}"
+assert set(ROLES) <= set(_CACHE_STATS), f"_CACHE_STATS missing role(s): {set(ROLES) - set(_CACHE_STATS)}"
 assert set(ROLES) == set(_AGENT_STYLES), f"_AGENT_STYLES out of sync with ROLES: {set(ROLES) ^ set(_AGENT_STYLES)}"
 
 def _phase_header(agent: str, action: str, feature_id: int = None,
@@ -714,15 +929,49 @@ def _track_usage(role: str, usage, model: str = None) -> None:
                 padding=(0, 1)
             ))
 
+def _track_cache_hit(role: str, usage: dict, model: str = None) -> None:
+    """
+    Record an LLM_CACHE hit's token/cost savings in _CACHE_STATS — deliberately
+    NOT _SESSION_COSTS, since a cache hit makes no API call and costs nothing;
+    folding it into _SESSION_COSTS would make /costs overstate real spend.
+
+    `model` is the model that actually generated the cached response (stored
+    in the cache entry itself), so the savings estimate uses that model's own
+    pricing — same rationale as _track_usage's `model` parameter.
+    """
+    if model is None:
+        model = MODEL_BY_ROLE.get(role, MODEL)
+
+    prompt_tokens     = usage.get("prompt_tokens", 0)
+    completion_tokens = usage.get("completion_tokens", 0)
+    pricing        = _price_for_model(model)
+    saved_usd      = prompt_tokens * pricing["input_price"] + completion_tokens * pricing["output_price"]
+
+    bucket = _CACHE_STATS.get(role, _CACHE_STATS["leader"])
+    bucket["hits"]                     += 1
+    bucket["prompt_tokens_saved"]      += prompt_tokens
+    bucket["completion_tokens_saved"]  += completion_tokens
+    bucket["savings_usd"]              += saved_usd
+
 def _session_total_cost_usd() -> float:
     """Sum of accumulated per-call cost (already priced per-model) across all roles."""
     return sum(v["cost_usd"] for v in _SESSION_COSTS.values())
+
+def _session_cache_hits_total() -> int:
+    return sum(v["hits"] for v in _CACHE_STATS.values())
+
+def _session_cache_savings_usd() -> float:
+    """Estimated USD not spent this session thanks to cache hits — informational
+    only, never subtracted from _session_total_cost_usd (that reflects real spend)."""
+    return sum(v["savings_usd"] for v in _CACHE_STATS.values())
 
 def _write_session_costs() -> None:
     """Write session cost summary to progress/session_costs.json."""
     total_prompt     = sum(v["prompt_tokens"]     for v in _SESSION_COSTS.values())
     total_completion = sum(v["completion_tokens"] for v in _SESSION_COSTS.values())
     total_cost_usd   = _session_total_cost_usd()
+    total_cache_hits = _session_cache_hits_total()
+    total_savings    = _session_cache_savings_usd()
 
     summary = {
         "session_start":      _SESSION_START.isoformat(),
@@ -734,16 +983,32 @@ def _write_session_costs() -> None:
             "completion_tokens": total_completion,
             "total_tokens":      total_prompt + total_completion,
             "estimated_usd":     round(total_cost_usd, 6),
-        }
+        },
+        # Cache hits are reported separately from the totals above by design —
+        # they are NOT part of estimated_usd (real spend). See LLM_CACHE_ENABLED
+        # / _track_cache_hit and the README's "LLM response cache" section.
+        "cache": {
+            "enabled":               LLM_CACHE_ENABLED,
+            "by_role":               _CACHE_STATS,
+            "hits":                  total_cache_hits,
+            "estimated_savings_usd": round(total_savings, 6),
+        },
     }
     os.makedirs(PROGRESS_DIR, exist_ok=True)
     path = f"{PROGRESS_DIR}/session_costs.json"
     with open(path, "w", encoding="utf-8") as f:
         json.dump(summary, f, indent=2, ensure_ascii=False)
 
+    cache_line = ""
+    if total_cache_hits > 0:
+        cache_line = (
+            f"\nCache hits: [cyan]{total_cache_hits}[/]  |  "
+            f"Est. savings: [yellow]USD {total_savings:.4f}[/] [dim](not spent, excluded from cost above)[/]"
+        )
+
     console.print(Panel(
         f"Total tokens: [cyan]{total_prompt + total_completion:,}[/]  |  "
-        f"Estimated cost: [yellow]USD {total_cost_usd:.4f}[/]",
+        f"Estimated cost: [yellow]USD {total_cost_usd:.4f}[/]{cache_line}",
         title=f"[dim]Session costs → {path}[/]",
         border_style="dim",
         padding=(0, 1)
@@ -2900,6 +3165,20 @@ def main():
                 else:
                     console.print(
                         f"  [red]Unknown level '{arg}'[/] — choose one of: {', '.join(_VERBOSITY_LEVELS)}"
+                    )
+                continue
+            elif user_input.startswith("/cache"):
+                arg = user_input[len("/cache"):].strip().lower()
+                if arg == "clear":
+                    removed = _clear_llm_cache()
+                    console.print(f"  [green]LLM cache cleared[/] — {removed} entr{'y' if removed == 1 else 'ies'} removed")
+                else:
+                    status = "[green]enabled[/]" if LLM_CACHE_ENABLED else "[dim]disabled[/]"
+                    console.print(
+                        f"  Cache: {status}  |  Entries on disk: [cyan]{_llm_cache_entry_count()}[/]  |  "
+                        f"Hits this session: [cyan]{_session_cache_hits_total()}[/]  |  "
+                        f"Est. savings: [yellow]USD {_session_cache_savings_usd():.4f}[/]\n"
+                        f"  [dim]Use '/cache clear' to delete all entries. Enable with LLM_CACHE_ENABLED=true in .env.[/]"
                     )
                 continue
 
