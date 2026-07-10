@@ -103,6 +103,16 @@ HARD RULES:
   exact response shape (plain array vs paginated wrapper like {{data, total, page, page_size}})
   and the frontend client function's matching return type — never leave this implicit, even if
   it seems obvious from context.
+- RAW SQL REQUIRES A REAL-DATABASE TEST (mandatory, applies whenever this feature's spec includes
+  a raw SQL statement — SQLAlchemy `text(...)` or the equivalent in another stack — that performs
+  an INSERT/UPDATE with an explicit type cast (e.g. `::jsonb`, `::uuid`) or builds SQL dynamically
+  (conditional SET clauses, variable column lists)): the "Tests to write" section MUST include at
+  least one test case for that statement that runs against a real database — use
+  TEST_DATABASE_URL if the project already defines one, or the stack's equivalent mechanism — not
+  only a case with a mocked session. Add a one-line note on that case explaining why: a mocked
+  session never executes real SQL, so it cannot catch a database engine syntax error (e.g. a bind
+  parameter cast like `:param::jsonb` breaking the driver's parameter parser) — that class of bug
+  ships silently past any number of tests run only against a mock.
 - Only write to progress/.
 - Do NOT implement code — only specify.
 - FILE PATH VERIFICATION (mandatory): never infer a file's exact name, extension, or casing from
