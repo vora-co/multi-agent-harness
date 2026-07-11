@@ -1023,6 +1023,66 @@ class TestReviewerAndE2eVerdict:
         assert passed is True
 
 
+class TestSpawnE2eTesterStaleReportCleanup:
+    """
+    spawn_e2e_tester's report path (progress/e2e_<id>.md/.json) carries no
+    attempt number. Regression coverage for the incident where an attempt
+    cut short by max_iter left a prior attempt's report on disk, and
+    _e2e_verdict's JSON-first read silently reused it as if it described the
+    attempt that just ran.
+    """
+
+    def _stub_run_agent(self, h, monkeypatch, result="E2E_PASSED"):
+        calls = []
+
+        def fake_run_agent(*a, **kw):
+            calls.append(kw.get("checkpoint_key"))
+            return result
+
+        monkeypatch.setattr(h, "run_agent", fake_run_agent)
+        return calls
+
+    def test_fresh_attempt_deletes_stale_report_from_earlier_attempt(self, monkeypatch, tmp_path):
+        h = _load_harness(monkeypatch, tmp_path)
+        (tmp_path / "progress").mkdir(exist_ok=True)
+        (tmp_path / "progress" / "e2e_1.md").write_text("stale report from attempt 1")
+        (tmp_path / "progress" / "e2e_1.json").write_text(json.dumps(
+            {"schema_version": 1, "status": "passed", "tests_passed": True, "files_touched": [], "reason": None}
+        ))
+        self._stub_run_agent(h, monkeypatch, result="[ERROR: max_iter 30 reached]")
+
+        h.spawn_e2e_tester(1, attempt=2)
+
+        assert not (tmp_path / "progress" / "e2e_1.md").exists()
+        assert not (tmp_path / "progress" / "e2e_1.json").exists()
+
+    def test_no_stale_report_is_a_no_op(self, monkeypatch, tmp_path):
+        h = _load_harness(monkeypatch, tmp_path)
+        (tmp_path / "progress").mkdir(exist_ok=True)
+        self._stub_run_agent(h, monkeypatch, result="E2E_PASSED")
+
+        h.spawn_e2e_tester(1, attempt=1)  # must not raise on a missing report
+
+        assert not (tmp_path / "progress" / "e2e_1.md").exists()
+
+    def test_pending_same_attempt_resume_preserves_report(self, monkeypatch, tmp_path):
+        # Simulates a harness-process crash mid-attempt: run_agent's own
+        # message-state checkpoint for this exact attempt is still on disk
+        # (never cleared, since a clean return — verdict or max_iter — always
+        # clears it). The resumed conversation may reference the partial
+        # report it already wrote this attempt, so it must survive.
+        h = _load_harness(monkeypatch, tmp_path)
+        (tmp_path / "progress").mkdir(exist_ok=True)
+        (tmp_path / "progress" / "e2e_1.md").write_text("partial report from this same attempt")
+        checkpoint_key = "e2e_tester_1_2"
+        h._save_message_state(checkpoint_key, [{"role": "user", "content": "hi"}])
+        self._stub_run_agent(h, monkeypatch, result="E2E_PASSED")
+
+        h.spawn_e2e_tester(1, attempt=2)
+
+        assert (tmp_path / "progress" / "e2e_1.md").read_text() == "partial report from this same attempt"
+
+
 # ── _file_tree truncation + _validate_spec stack-awareness ─────────────────────
 
 class TestFileTree:

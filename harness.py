@@ -2671,6 +2671,34 @@ def spawn_e2e_tester(feature_id: int, attempt: int = 1) -> str:
     _phase_header("e2e_tester", "Tests E2E", feature_id)
     _log("e2e_tester", "SPAWN", f"feature={feature_id} attempt={attempt}")
 
+    # Clear any e2e report left over from a DIFFERENT attempt/spawn. The
+    # report filename carries no attempt number (always progress/e2e_<id>.md
+    # + .json), so if this attempt is cut short by max_iter before writing
+    # its own report, the file left on disk is whatever an earlier attempt
+    # wrote — possibly hours before, describing a cause that no longer
+    # applies to the current code. _e2e_verdict() (above) prefers that JSON
+    # over the "[ERROR: max_iter reached]" string run_agent actually
+    # returned, so a stale file isn't just a misleading log — it can flip
+    # the real pass/fail verdict (e.g. a prior attempt's "status": "passed"
+    # silently reused for an attempt that was never actually verified).
+    # Real incident, feature #71: the Leader's summary cited a stale
+    # payload-mismatch cause from an e2e_71.md written ~2 hours earlier by a
+    # different spawn.
+    #
+    # Guarded by the resume check below: if the harness process itself
+    # crashed mid-attempt (not a clean max_iter exhaustion — see run_agent,
+    # which clears its own message-state checkpoint on every clean return,
+    # verdict or max_iter), _load_message_state returns non-None only for
+    # that in-flight same-attempt resume. In that case the model's resumed
+    # conversation history may reference a partial report it already wrote
+    # this attempt, so skip the delete — only a fresh (non-resuming) spawn,
+    # which can only see a report from some other attempt, clears it.
+    _checkpoint_key = f"e2e_tester_{feature_id}_{attempt}"
+    if _load_message_state(_checkpoint_key) is None:
+        for stale in (f"{PROGRESS_DIR}/e2e_{feature_id}.md", f"{PROGRESS_DIR}/e2e_{feature_id}.json"):
+            if os.path.exists(stale):
+                os.remove(stale)
+
     cwd = os.getcwd()
     arch_context = _load_project_architecture(cwd)
     layout_context = _layout_context()
@@ -2688,7 +2716,7 @@ def spawn_e2e_tester(feature_id: int, attempt: int = 1) -> str:
                                  task=task, feature_id=feature_id)
     result = run_agent(_agent_ctx["system_prompt"], e2e_cfg.TOOLS, _agent_ctx["task"],
                        role="e2e_tester", color="yellow",
-                       checkpoint_key=f"e2e_tester_{feature_id}_{attempt}")
+                       checkpoint_key=_checkpoint_key)
 
     passed = _verdict_is(result, VERDICT_E2E_PASSED)
     color  = "green" if passed else "red"
