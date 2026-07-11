@@ -1083,6 +1083,88 @@ class TestSpawnE2eTesterStaleReportCleanup:
         assert (tmp_path / "progress" / "e2e_1.md").read_text() == "partial report from this same attempt"
 
 
+class TestSpawnE2eTesterMaxIterRecovery:
+    """
+    Regression coverage for feature #71: the agent correctly diagnosed a
+    real backend 500 in its .md report but ran out of iterations before
+    writing the sibling .json. Without recovery, the harness only sees
+    run_agent's generic "[ERROR: max_iter ... reached]" tool-call-errors
+    message, discarding the correct diagnosis.
+    """
+
+    def _stub_run_agent_writes_md_then_times_out(self, h, monkeypatch, tmp_path, md_content):
+        def fake_run_agent(*a, **kw):
+            (tmp_path / "progress" / "e2e_1.md").write_text(md_content)
+            return "[ERROR: max_iter 50 reached]\nRecent tool-call errors: read_file(...) -> not found"
+        monkeypatch.setattr(h, "run_agent", fake_run_agent)
+
+    def test_recovers_verdict_from_md_when_json_missing_after_max_iter(self, monkeypatch, tmp_path):
+        h = _load_harness(monkeypatch, tmp_path)
+        (tmp_path / "progress").mkdir(exist_ok=True)
+        self._stub_run_agent_writes_md_then_times_out(
+            h, monkeypatch, tmp_path,
+            "## Scenarios\n...\n- Verdict: E2E_FAILED: backend 500 in list_professionals "
+            "(confirmed via page.request)",
+        )
+
+        result = h.spawn_e2e_tester(1, attempt=1)
+
+        assert "backend 500 in list_professionals" in result
+        assert "Recent tool-call errors" not in result
+
+    def test_does_not_recover_when_json_already_exists(self, monkeypatch, tmp_path):
+        # A structured .json means the agent did finish — the generic
+        # max_iter string (if any) should never be second-guessed here;
+        # _e2e_verdict's own JSON-first preference handles this case.
+        h = _load_harness(monkeypatch, tmp_path)
+        (tmp_path / "progress").mkdir(exist_ok=True)
+
+        def fake_run_agent(*a, **kw):
+            (tmp_path / "progress" / "e2e_1.md").write_text("- Verdict: E2E_PASSED")
+            (tmp_path / "progress" / "e2e_1.json").write_text(json.dumps(
+                {"schema_version": 1, "status": "passed", "tests_passed": True,
+                 "files_touched": [], "reason": None}
+            ))
+            return "[ERROR: max_iter 50 reached]"
+        monkeypatch.setattr(h, "run_agent", fake_run_agent)
+
+        result = h.spawn_e2e_tester(1, attempt=1)
+
+        assert result == "[ERROR: max_iter 50 reached]"
+
+    def test_no_recovery_when_md_also_missing(self, monkeypatch, tmp_path):
+        h = _load_harness(monkeypatch, tmp_path)
+        (tmp_path / "progress").mkdir(exist_ok=True)
+
+        def fake_run_agent(*a, **kw):
+            return "[ERROR: max_iter 50 reached]"
+        monkeypatch.setattr(h, "run_agent", fake_run_agent)
+
+        result = h.spawn_e2e_tester(1, attempt=1)
+
+        assert result == "[ERROR: max_iter 50 reached]"
+
+    def test_no_recovery_when_md_has_no_verdict_line(self, monkeypatch, tmp_path):
+        h = _load_harness(monkeypatch, tmp_path)
+        (tmp_path / "progress").mkdir(exist_ok=True)
+        self._stub_run_agent_writes_md_then_times_out(
+            h, monkeypatch, tmp_path, "## Scenarios\nstill exploring, nothing conclusive yet",
+        )
+
+        result = h.spawn_e2e_tester(1, attempt=1)
+
+        assert result == "[ERROR: max_iter 50 reached]\nRecent tool-call errors: read_file(...) -> not found"
+
+    def test_passing_result_is_untouched(self, monkeypatch, tmp_path):
+        h = _load_harness(monkeypatch, tmp_path)
+        (tmp_path / "progress").mkdir(exist_ok=True)
+        monkeypatch.setattr(h, "run_agent", lambda *a, **kw: "E2E_PASSED")
+
+        result = h.spawn_e2e_tester(1, attempt=1)
+
+        assert result == "E2E_PASSED"
+
+
 # ── _file_tree truncation + _validate_spec stack-awareness ─────────────────────
 
 class TestFileTree:

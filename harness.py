@@ -2718,6 +2718,32 @@ def spawn_e2e_tester(feature_id: int, attempt: int = 1) -> str:
                        role="e2e_tester", color="yellow",
                        checkpoint_key=_checkpoint_key)
 
+    # Defensive fallback: if this call ended in the generic max_iter error
+    # and never got to write the structured .json, but DID leave a fresh
+    # .md report on disk (guaranteed fresh — see the cleanup at the top of
+    # this function), pull the real diagnosis out of that .md instead of
+    # discarding it in favor of a handful of unrelated tool-call errors.
+    # Real incident, feature #71: the report correctly named a backend 500
+    # in list_professionals (found via page.request), but the agent ran out
+    # of iterations before writing e2e_71.json — without this fallback the
+    # next implementer attempt and the failure-diagnostician only ever see
+    # "[ERROR: max_iter 50 reached]\nRecent tool-call errors: ...".
+    md_path = f"{PROGRESS_DIR}/e2e_{feature_id}.md"
+    json_path = f"{PROGRESS_DIR}/e2e_{feature_id}.json"
+    if result.startswith("[ERROR: max_iter") and not os.path.exists(json_path) and os.path.exists(md_path):
+        try:
+            with open(md_path, "r", encoding="utf-8") as f:
+                report_text = f.read()
+            verdict_idx = report_text.rfind("Verdict:")
+            if verdict_idx != -1:
+                verdict_section = report_text[verdict_idx:].strip()
+                result = f"{VERDICT_E2E_FAILED}: (recovered from e2e_{feature_id}.md after max_iter)\n{verdict_section}"
+                _log("e2e_tester", "MAX_ITER_REPORT_RECOVERED",
+                     f"feature={feature_id} — used e2e_{feature_id}.md's Verdict section "
+                     f"instead of the generic max_iter message")
+        except OSError:
+            pass
+
     passed = _verdict_is(result, VERDICT_E2E_PASSED)
     color  = "green" if passed else "red"
     _log("e2e_tester", "VERDICT", result[:200], level="info" if passed else "warning")
