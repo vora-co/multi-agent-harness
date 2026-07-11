@@ -1470,6 +1470,20 @@ class TestSandboxLocalEnvSanitization:
         assert env.get("HARNESS_TEST_KEEP_ME") == "keep-me"
 
 
+# ── agents/leader.py: TOOLS surface ────────────────────────────────────────────
+
+class TestLeaderToolsSurface:
+    def test_run_bash_is_not_in_leader_tools(self):
+        # The Leader's own documented PROTOCOL never runs pytest, starts
+        # servers, or shells out — real incident: it used run_bash to try
+        # `docker ps`, start uvicorn manually, and connect to Postgres with
+        # raw asyncpg while chasing a repeated E2E failure, none of which is
+        # part of its coordinator role.
+        import agents.leader as leader
+        names = [t["function"]["name"] for t in leader.TOOLS]
+        assert "run_bash" not in names
+
+
 # ── tools.py ─────────────────────────────────────────────────────────────────
 
 class TestTools:
@@ -1629,6 +1643,65 @@ class TestTools:
             t.execute_tool("update_feature_status", {"featureId": 1, "status": "in_progress"})
         )
         assert "error" not in result or result.get("success")
+
+    # execute_tool: Leader role confined to progress/ for write_file/append_file
+    #
+    # Regression coverage for a real incident: the Leader rewrote
+    # backend/app/api/v1/professionals.py and backend/tests/test_professionals.py
+    # end-to-end while chasing a repeated E2E failure, introducing a real
+    # regression, because write_file() only checked SAFE_WRITE_DIRS (shared by
+    # every role) with nothing role-specific stopping it.
+
+    def test_leader_write_file_inside_progress_succeeds(self, monkeypatch, tmp_path):
+        t = self._load_tools(monkeypatch, tmp_path)
+        result = json.loads(t.execute_tool(
+            "write_file", {"path": "progress/current.md", "content": "plan"}, role="leader"
+        ))
+        assert "error" not in result
+        assert (tmp_path / "progress" / "current.md").read_text() == "plan"
+
+    def test_leader_write_file_outside_progress_is_blocked(self, monkeypatch, tmp_path):
+        t = self._load_tools(monkeypatch, tmp_path)
+        result = json.loads(t.execute_tool(
+            "write_file", {"path": "src/app.py", "content": "malicious rewrite"}, role="leader"
+        ))
+        assert "error" in result
+        assert "Leader" in result["error"]
+        assert not (tmp_path / "src" / "app.py").exists()
+
+    def test_leader_append_file_outside_progress_is_blocked(self, monkeypatch, tmp_path):
+        t = self._load_tools(monkeypatch, tmp_path)
+        result = json.loads(t.execute_tool(
+            "append_file", {"path": "tests/test_app.py", "content": "extra"}, role="leader"
+        ))
+        assert "error" in result
+        assert "Leader" in result["error"]
+        assert not (tmp_path / "tests" / "test_app.py").exists()
+
+    def test_leader_write_file_absolute_path_into_progress_still_allowed(self, monkeypatch, tmp_path):
+        # _normalize_agent_path must convert an absolute-but-inside-cwd path
+        # the same way _is_safe_path already does, so this narrower
+        # progress/-only check doesn't reject a legitimate write just
+        # because it wasn't given as a plain relative path.
+        t = self._load_tools(monkeypatch, tmp_path)
+        abs_path = str(tmp_path / "progress" / "current.md")
+        result = json.loads(t.execute_tool(
+            "write_file", {"path": abs_path, "content": "plan"}, role="leader"
+        ))
+        assert "error" not in result
+
+    def test_non_leader_role_is_not_restricted_to_progress(self, monkeypatch, tmp_path):
+        t = self._load_tools(monkeypatch, tmp_path)
+        result = json.loads(t.execute_tool(
+            "write_file", {"path": "src/app.py", "content": "real impl"}, role="implementer"
+        ))
+        assert "error" not in result
+        assert (tmp_path / "src" / "app.py").read_text() == "real impl"
+
+    def test_no_role_defaults_to_unrestricted(self, monkeypatch, tmp_path):
+        t = self._load_tools(monkeypatch, tmp_path)
+        result = json.loads(t.execute_tool("write_file", {"path": "src/app.py", "content": "x"}))
+        assert "error" not in result
 
 
 # ── tools.py: run_playwright_tests (Python/Node stack branching) ─────────────

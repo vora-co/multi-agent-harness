@@ -91,25 +91,32 @@ def _is_secret_path(path: str) -> bool:
     """True if `path`'s basename looks like a secrets file (.env, .env.local, ...)."""
     return bool(_SECRET_FILENAME_RE.match(os.path.basename(str(path).rstrip("/"))))
 
-def _is_safe_path(path: str) -> bool:
-    """Check that the path is within the allowed directories.
-    Accepts absolute paths by converting them to relative paths from cwd.
+def _normalize_agent_path(path: str) -> str:
+    """Normalize a tool-call path the same way for every caller that needs
+    to compare it against a specific directory: convert an absolute path
+    that points to cwd into a relative one, and strip a "/workspace/" prefix
+    (agents are told that's the project root *inside run_bash*, and some
+    generalize that to these host-side tools too). Shared by _is_safe_path
+    (checked against SAFE_WRITE_DIRS) and execute_tool's Leader-role write
+    restriction (checked against PROGRESS_DIR alone) so neither one
+    incorrectly rejects a path the other would accept.
     """
     normalized = os.path.normpath(path).replace("\\", "/")
-    # Convert absolute path to relative if it points to cwd
     cwd = os.getcwd().replace("\\", "/")
     if normalized.startswith(cwd + "/"):
         normalized = normalized[len(cwd) + 1:]
-    # read_file/write_file/list_files/append_file always run on the host —
-    # never inside the Docker sandbox — but agents are also told "/workspace"
-    # is the project root *inside run_bash*, and sometimes generalize that and
-    # prefix these tools' paths with "/workspace/" too. Strip it here as well
-    # so such a call is still validated against SAFE_WRITE_DIRS correctly
-    # instead of being incorrectly rejected as "outside the allowed directories".
     if normalized == "/workspace":
         normalized = "."
     elif normalized.startswith("/workspace/"):
         normalized = normalized[len("/workspace/"):]
+    return normalized
+
+
+def _is_safe_path(path: str) -> bool:
+    """Check that the path is within the allowed directories.
+    Accepts absolute paths by converting them to relative paths from cwd.
+    """
+    normalized = _normalize_agent_path(path)
     # Block path traversal
     if ".." in normalized:
         return False
@@ -849,9 +856,35 @@ def _edit_alias(tool_name: str, args: dict) -> str:
     })
 
 
-def execute_tool(tool_name: str, args: dict) -> str:
+def execute_tool(tool_name: str, args: dict, role: str = "") -> str:
     fn = TOOLS_FN.get(tool_name)
     if fn:
+        # The Leader coordinates — it never legitimately needs to write
+        # outside progress/. Its own system prompt says "You NEVER write
+        # code in src/ or tests/", but that's prose, not enforcement:
+        # write_file()/append_file() only check the tool-call args against
+        # the global SAFE_WRITE_DIRS (shared by every role, since
+        # implementer/e2e_tester/reviewer DO need backend/frontend/tests
+        # access). Real incident: the Leader rewrote
+        # backend/app/api/v1/professionals.py and
+        # backend/tests/test_professionals.py end-to-end while chasing a
+        # repeated E2E failure, introducing a real regression (called a
+        # password-hashing function that doesn't exist), because nothing in
+        # code stopped it. _normalize_agent_path matches _is_safe_path's own
+        # normalization so an absolute or "/workspace/"-prefixed progress/
+        # path isn't incorrectly rejected here just because this check is
+        # narrower (PROGRESS_DIR alone, not all of SAFE_WRITE_DIRS).
+        if role == "leader" and tool_name in ("write_file", "append_file"):
+            normalized_args = _normalize_args(args)
+            path = normalized_args.get("path") or normalized_args.get("file_path") \
+                or normalized_args.get("file") or normalized_args.get("filename") or ""
+            if not _normalize_agent_path(path).startswith(PROGRESS_DIR.rstrip("/") + "/"):
+                return json.dumps({
+                    "error": f"Path '{path}' is outside what the Leader role may write. "
+                             f"The Leader may only write inside '{PROGRESS_DIR}/' — code and "
+                             f"test changes belong to the implementer/e2e_tester, coordinated "
+                             f"via run_feature_cycle(), never written directly by the Leader."
+                })
         # Most individual tool functions already guard their own bodies and
         # return a json {"error": ...} string on failure, but not all do
         # (e.g. run_bash delegates straight to sandbox.get_runner().run()

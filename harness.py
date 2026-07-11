@@ -1894,7 +1894,7 @@ def run_agent(system_prompt: str, tools: list, task: str,
                 _agent_action(role, fn_name, args_preview, i + 1)
 
             _log(role, "TOOL_CALL", f"{fn_name}({json.dumps(fn_args, ensure_ascii=False)[:100]})")
-            result = _redact(execute_tool(fn_name, fn_args))
+            result = _redact(execute_tool(fn_name, fn_args, role=role))
             _log(role, "TOOL_RESULT", result[:200])
 
             if _is_write_call(fn_name, result):
@@ -3122,7 +3122,7 @@ def run_leader(user_task: str) -> str:
                     }
                 result = json.dumps(cycle_result, ensure_ascii=False)
             else:
-                result = _redact(execute_tool(fn_name, fn_args))
+                result = _redact(execute_tool(fn_name, fn_args, role="leader"))
                 if _verbosity_at_least("verbose"):
                     console.print(Panel(
                         f"[dim]{result[:300]}[/]",

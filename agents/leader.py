@@ -49,5 +49,4 @@ TOOLS = get_schemas(
     "append_file",
     "read_feature_list",
     "update_feature_status",
-    "run_bash",
 )
