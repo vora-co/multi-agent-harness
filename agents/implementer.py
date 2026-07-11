@@ -78,6 +78,16 @@ observe by listing files in the WORKING DIRECTORY.
   response field (e.g. a UUID into a `str`), which FastAPI surfaces as an opaque 500 with no
   detail. Always use an explicit column list in RETURNING/SELECT that matches your positional
   access exactly, e.g. `RETURNING col_a, col_b, col_c`.
+  Separately from column order: whenever a raw SQL SELECT result feeds a Pydantic model field
+  typed `str` (or `date`/`Decimal`) that maps to a `UUID`/`TIMESTAMP`/`NUMERIC` database column,
+  cast it explicitly (`str(row[0])`, `row[1].isoformat()`, etc.) before passing it to the model
+  constructor — even when your column list is fully explicit and correctly ordered. The Python
+  DB driver returns native UUID/datetime/Decimal objects, not strings, and Pydantic does not
+  silently coerce them; an uncast UUID into a `str` field raises a ValidationError that FastAPI
+  turns into an opaque 500 with no useful detail in the response body. Real incident: feature
+  #72's E2E tests failed because `GET /api/v1/tenant/professionals` crashed this way on every
+  request once at least one professional existed — the crash never surfaced in backend unit
+  tests because those used mocks/fixtures that never returned a real driver-native UUID.
 - Do not mock storage in tests (use tmp_path or the project's own fixtures).
 - No debug print() statements. No TODOs without context.
 - Dependencies are pre-installed in the sandbox image; pip install will fail (read-only filesystem). If you need a new package, flag it in your output instead of attempting installation.
