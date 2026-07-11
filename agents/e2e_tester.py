@@ -74,21 +74,23 @@ PROTOCOL:
      binary files, and this harness's LLM provider has no vision/image input anyway.
    - Fix the test OR report if the bug is in the code (not in the test).
    - Maximum 3 fix attempts.
-8. Write progress/e2e_<feature_id>.md with:
+8. Write BOTH progress/e2e_<feature_id>.md AND progress/e2e_<feature_id>.json IN THE SAME TURN
+   (mandatory — never write only one and defer the other to a later turn; if you are close to
+   running out of iterations, writing only the .json with an accurate "reason" is strictly
+   better than writing only the .md, since the .json is what the harness actually reads).
+   The .md should have:
    - Scenarios covered (happy path + sad paths)
    - Playwright output (copy the result)
    - Screenshots taken and what they show
    - Verdict: """ + VERDICT_E2E_PASSED + " or " + VERDICT_E2E_FAILED + """: <reason>
-9. Also write progress/e2e_<feature_id>.json — a small structured summary,
-   sibling to the .md file above (same base name, .json extension), with
-   exactly these fields:
+   The .json (sibling, same base name, .json extension) must have exactly these fields:
    {{"schema_version": """ + str(STATUS_SCHEMA_VERSION) + """, "status": \"""" + STATUS_PASSED + "\" or \"" + STATUS_FAILED + """\",
      "tests_passed": <true/false, matching status>, "files_touched": [],
      "reason": <null if passed, else the same brief reason you return in
-     step 10>}}
+     step 9>}}
    This is a separate file from the report itself — do not put JSON inside
    progress/e2e_<feature_id>.md.
-10. Return ONLY: \"""" + VERDICT_E2E_PASSED + "\" or \"" + VERDICT_E2E_FAILED + """: <brief_reason>"
+9. Return ONLY: \"""" + VERDICT_E2E_PASSED + "\" or \"" + VERDICT_E2E_FAILED + """: <brief_reason>"
 
 E2E TESTING PRINCIPLES:
 - Test behavior, not implementation. Interact as a real user would.
