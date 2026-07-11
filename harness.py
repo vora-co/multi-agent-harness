@@ -2794,6 +2794,28 @@ def _run_feature_cycle_impl(feature_id: int, description: str, e2e: bool = True)
         console.print(f"  [yellow]⚠ skipping feature #{feature_id} — budget exhausted[/]")
         return {"approved": False, "attempts": 0, "final_verdict": msg}
 
+    # ── Dependency gate (mandatory, code-level — do not rely on the Leader's
+    # own judgment) ───────────────────────────────────────────────────────
+    # Real incident: the Leader started feature #72 via run_feature_cycle
+    # while feature #71 (a hard dependency) had status "failed", not "done".
+    # The Leader is told the correct execution order in its injected context
+    # ("Do not start a feature until all its depends_on features are done"),
+    # but that's a prose instruction, not an enforced one — a weaker model
+    # (or one under pressure after repeated failures) can and did ignore it.
+    _all_features = _read_feature_list_raw()  # best-effort — returns [] on any read/parse error
+    _this_feature = next((f for f in _all_features if f["id"] == feature_id), None)
+    if _this_feature:
+        _id_to_status = {f["id"]: f.get("status") for f in _all_features}
+        _unmet = [dep for dep in _this_feature.get("depends_on", [])
+                  if _id_to_status.get(dep) != "done"]
+        if _unmet:
+            msg = (f"[DEPENDENCY_ERROR] Feature #{feature_id} cannot start — "
+                   f"depends_on {_unmet} not yet 'done' "
+                   f"(status: {[_id_to_status.get(d) for d in _unmet]}).")
+            _log("harness", "DEPENDENCY_BLOCKED", msg, level="error")
+            console.print(f"  [bold red]⚠ {msg}[/]")
+            return {"approved": False, "attempts": 0, "final_verdict": msg}
+
     # ── Resumability: load checkpoint from a previous (crashed) run ──────────
     _ckpt = _load_checkpoint(feature_id)
     if _ckpt:

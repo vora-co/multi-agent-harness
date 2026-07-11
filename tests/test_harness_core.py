@@ -748,6 +748,99 @@ class TestAfterReviewerRejectedHook:
         assert len(self._calls_for(fire_mock, "after_feature_approved")) == 1
 
 
+class TestDependencyGate:
+    """
+    Regression coverage for a real incident: the Leader started feature #72
+    via run_feature_cycle while feature #71 (a hard dependency) had status
+    "failed", not "done". The only protection was a prose instruction in the
+    Leader's injected context — nothing in run_feature_cycle() itself
+    stopped it. Same _patch_cycle pattern as TestFeatureCycleVerbosityIntegration.
+    """
+
+    def _patch_cycle(self, h, monkeypatch):
+        spec_called = []
+        monkeypatch.setattr(h, "spawn_spec_writer",
+                             MagicMock(side_effect=lambda *a, **kw: spec_called.append(1) or "progress/spec_1.md"))
+        monkeypatch.setattr(h, "spawn_implementer", MagicMock(return_value="ok"))
+        monkeypatch.setattr(h, "spawn_e2e_tester", MagicMock(return_value="E2E_PASSED"))
+        monkeypatch.setattr(h, "spawn_reviewer", MagicMock(return_value="APPROVED"))
+        monkeypatch.setattr(h, "_fire", MagicMock())
+        monkeypatch.setattr(h, "_fire_gate", MagicMock(return_value=None))
+        monkeypatch.setattr(h, "_track_usage", MagicMock())
+        return spec_called
+
+    def test_blocked_when_dependency_not_done(self, monkeypatch, tmp_path):
+        _write_fl(tmp_path, [
+            {"id": 71, "title": "T71", "description": "d", "status": "failed", "e2e": False, "depends_on": []},
+            {"id": 72, "title": "T72", "description": "d", "status": "pending", "e2e": False, "depends_on": [71]},
+        ])
+        (tmp_path / "progress").mkdir(exist_ok=True)
+        h = _load_harness(monkeypatch, tmp_path)
+        spec_called = self._patch_cycle(h, monkeypatch)
+
+        result = h.run_feature_cycle(72, "desc", e2e=False)
+
+        assert result["approved"] is False
+        assert "DEPENDENCY_ERROR" in result["final_verdict"]
+        assert "71" in result["final_verdict"]
+        assert spec_called == []  # blocked before any sub-agent ran
+
+    def test_proceeds_when_dependency_done(self, monkeypatch, tmp_path):
+        _write_fl(tmp_path, [
+            {"id": 71, "title": "T71", "description": "d", "status": "done", "e2e": False, "depends_on": []},
+            {"id": 72, "title": "T72", "description": "d", "status": "pending", "e2e": False, "depends_on": [71]},
+        ])
+        (tmp_path / "progress").mkdir(exist_ok=True)
+        h = _load_harness(monkeypatch, tmp_path)
+        spec_called = self._patch_cycle(h, monkeypatch)
+
+        result = h.run_feature_cycle(72, "desc", e2e=False)
+
+        assert result["approved"] is True
+        assert spec_called == [1]
+
+    def test_proceeds_when_no_depends_on(self, monkeypatch, tmp_path):
+        _write_fl(tmp_path, [
+            {"id": 1, "title": "T1", "description": "d", "status": "pending", "e2e": False, "depends_on": []},
+        ])
+        (tmp_path / "progress").mkdir(exist_ok=True)
+        h = _load_harness(monkeypatch, tmp_path)
+        spec_called = self._patch_cycle(h, monkeypatch)
+
+        result = h.run_feature_cycle(1, "desc", e2e=False)
+
+        assert result["approved"] is True
+        assert spec_called == [1]
+
+    def test_lists_all_unmet_dependencies(self, monkeypatch, tmp_path):
+        _write_fl(tmp_path, [
+            {"id": 70, "title": "T70", "description": "d", "status": "pending", "e2e": False, "depends_on": []},
+            {"id": 71, "title": "T71", "description": "d", "status": "failed", "e2e": False, "depends_on": []},
+            {"id": 72, "title": "T72", "description": "d", "status": "pending", "e2e": False, "depends_on": [70, 71]},
+        ])
+        (tmp_path / "progress").mkdir(exist_ok=True)
+        h = _load_harness(monkeypatch, tmp_path)
+        self._patch_cycle(h, monkeypatch)
+
+        result = h.run_feature_cycle(72, "desc", e2e=False)
+
+        assert "70" in result["final_verdict"]
+        assert "71" in result["final_verdict"]
+
+    def test_best_effort_proceeds_when_feature_list_missing(self, monkeypatch, tmp_path):
+        # No feature_list.json on disk at all — _read_feature_list_raw()
+        # returns [], so _this_feature is None and the gate is a no-op
+        # rather than blocking every run_feature_cycle call.
+        (tmp_path / "progress").mkdir(exist_ok=True)
+        h = _load_harness(monkeypatch, tmp_path)
+        spec_called = self._patch_cycle(h, monkeypatch)
+
+        result = h.run_feature_cycle(1, "desc", e2e=False)
+
+        assert result["approved"] is True
+        assert spec_called == [1]
+
+
 # ── Structured agent status (progress/<stage>_<id>.json) ───────────────────────
 
 class TestReadStructuredStatus:
