@@ -171,6 +171,19 @@ HARD RULES:
   PRECOMPUTED CONTEXT given at the start of your task for liveness. If you need to inspect what
   the live API actually returns, do it via a page.request call inside an actual Playwright test
   (executed through run_playwright_tests), never via run_bash.
+- AMBIGUOUS BROWSER NETWORK ERROR PROTOCOL (mandatory): if a test observes a generic
+  browser-level failure on an API call — "Failed to fetch", a CORS-policy console error, or
+  net::ERR_FAILED/net::ERR_ABORTED — do NOT theorize about CORS, timing, or race conditions
+  from that symptom alone. These almost always mask a server-side exception whose response
+  was malformed or the connection dropped mid-transfer, not an actual cross-origin policy
+  problem (this codebase's CORS is wide open — allow_origins=["*"]). Immediately replay the
+  exact same request with the exact same headers using page.request.get/post(...)
+  (Playwright's APIRequestContext) inside the same test. This bypasses the renderer's
+  fetch()/CORS layer entirely and returns the real status code and response body — which
+  will surface the actual backend error (e.g. a Pydantic ValidationError, a stack trace) that
+  the browser's fetch() call obscured. Only fall back to a network/CORS hypothesis if the
+  replayed request also fails at the connection level in a way that clearly isn't a normal
+  HTTP error response.
 - The WORKING DIRECTORY is specified at the start of your task for reference only. NEVER invent
   directory paths, but also never cd into the WORKING DIRECTORY or prefix a command with it —
   run_bash already starts in the project root in every sandbox mode. Each run_bash call is
