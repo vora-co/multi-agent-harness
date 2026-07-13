@@ -1781,7 +1781,8 @@ def _is_write_call(fn_name: str, result: str) -> bool:
 def run_agent(system_prompt: str, tools: list, task: str,
               role: str = "agent", color: str = "white",
               max_iter: int = MAX_ITER_AGENT,
-              checkpoint_key: Optional[str] = None) -> str:
+              checkpoint_key: Optional[str] = None,
+              feature_id: Optional[int] = None) -> str:
     # Mid-run resumability: if a previous run with this exact checkpoint_key
     # crashed before reaching a verdict, its message history was snapshotted
     # to disk — resume from it instead of rebuilding system/user from scratch
@@ -1805,6 +1806,11 @@ def run_agent(system_prompt: str, tools: list, task: str,
     _log(role, "START", task[:120])
     tool_call_errors: list = []
     _no_write_streak = 0
+    # e2e_tester only: evidence from the most recent run_playwright_tests
+    # call, kept so a max_iter cutoff with no report at all still leaves a
+    # real traceback for the next retry/diagnostician instead of nothing.
+    # See the synthesis block after the main loop below.
+    _last_playwright_evidence = ""
 
     # Generic, role-agnostic budget-checkpoint enforcement. Previously this
     # was only advisory prompt text in agents/e2e_tester.py's "BUDGET
@@ -1900,6 +1906,23 @@ def run_agent(system_prompt: str, tools: list, task: str,
             if _is_write_call(fn_name, result):
                 made_write_this_iter = True
 
+            # e2e_tester only: keep the most recent run_playwright_tests
+            # evidence (captured post-_redact, same as everything else that
+            # lands in messages/reports). Prefer "output" (pytest/Playwright
+            # stdout+stderr incl. traceback); fall back to "error" (e.g. an
+            # install failure or subprocess timeout, which never produces an
+            # "output" field) so a max_iter cutoff still has something better
+            # than nothing even if the run never got as far as producing test
+            # output.
+            if role == "e2e_tester" and fn_name == "run_playwright_tests":
+                try:
+                    parsed_pw = json.loads(result)
+                    evidence = parsed_pw.get("output") or parsed_pw.get("error")
+                    if evidence:
+                        _last_playwright_evidence = str(evidence)
+                except Exception:
+                    pass
+
             # Best-effort: track tool-call errors so that if this attempt hits
             # max_iter without a verdict, the next retry gets concrete context
             # instead of restarting from scratch with the same generic task.
@@ -1939,6 +1962,47 @@ def run_agent(system_prompt: str, tools: list, task: str,
 
     _log(role, "MAX_ITER", f"Reached iteration limit of {max_iter}", level="warning")
     _clear_message_state(checkpoint_key)
+
+    # e2e_tester only: if this attempt never wrote its own progress/e2e_<id>.json
+    # (the agent may not have written ANY report at all — the case this
+    # covers that the .md-recovery fallback in spawn_e2e_tester cannot, since
+    # that one requires an .md to already exist), synthesize one from the
+    # last captured run_playwright_tests evidence rather than leaving the
+    # next retry / diagnostician with only the generic max_iter message.
+    # Real incident, feature #74: the e2e_tester hit max_iter twice with no
+    # report; the actual cause (a TimeoutError waiting on #prof-name after a
+    # successful login+submit — a redirect() bug in layout.tsx) was sitting
+    # in the tool results the whole time and was thrown away, so the retry
+    # and the diagnostician both started blind.
+    if role == "e2e_tester" and feature_id is not None:
+        json_path = f"{PROGRESS_DIR}/e2e_{feature_id}.json"
+        if not os.path.exists(json_path):
+            tail = (_last_playwright_evidence[-1500:] if _last_playwright_evidence
+                    else "(no run_playwright_tests output was captured this attempt)")
+            try:
+                with open(json_path, "w", encoding="utf-8") as f:
+                    json.dump({
+                        "schema_version": STATUS_SCHEMA_VERSION,
+                        "status": STATUS_FAILED,
+                        "tests_passed": False,
+                        "files_touched": [],
+                        "reason": tail,
+                    }, f, ensure_ascii=False)
+                with open(f"{PROGRESS_DIR}/e2e_{feature_id}.md", "w", encoding="utf-8") as f:
+                    f.write(
+                        f"# E2E report for feature #{feature_id}\n\n"
+                        f"(synthesized by harness after max_iter — the agent never wrote its own report)\n\n"
+                        f"## Last run_playwright_tests evidence (tail)\n```\n{tail}\n```\n\n"
+                        f"- Verdict: {VERDICT_E2E_FAILED}: max_iter {max_iter} reached with no agent-written "
+                        f"report; see the captured Playwright evidence above.\n"
+                    )
+                _log("harness", "E2E_MAX_ITER_REPORT_SYNTHESIZED",
+                     f"feature={feature_id} — wrote a synthetic e2e_{feature_id}.json/.md from the "
+                     f"last captured run_playwright_tests evidence")
+            except OSError as exc:
+                _log("harness", "E2E_MAX_ITER_REPORT_SYNTHESIZE_ERROR",
+                     f"feature={feature_id}: {exc}", level="warning")
+
     if tool_call_errors:
         recent_errors = "\n".join(f"  - {e}" for e in tool_call_errors[-5:])
         return f"[ERROR: max_iter {max_iter} reached]\nRecent tool-call errors:\n{recent_errors}"
@@ -2716,7 +2780,7 @@ def spawn_e2e_tester(feature_id: int, attempt: int = 1) -> str:
                                  task=task, feature_id=feature_id)
     result = run_agent(_agent_ctx["system_prompt"], e2e_cfg.TOOLS, _agent_ctx["task"],
                        role="e2e_tester", color="yellow",
-                       checkpoint_key=_checkpoint_key)
+                       checkpoint_key=_checkpoint_key, feature_id=feature_id)
 
     # Defensive fallback: if this call ended in the generic max_iter error
     # and never got to write the structured .json, but DID leave a fresh

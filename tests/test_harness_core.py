@@ -1421,6 +1421,142 @@ class TestToolResultRedactionInRunAgent:
         assert not any("sk-leaked-secret-value" in p for p in printed)
 
 
+class TestE2eMaxIterReportSynthesis:
+    """
+    Regression coverage for feature #74: the e2e_tester hit max_iter twice
+    with no report written at all — not even a partial .md (unlike feature
+    #71's v1.35.0 case, where a .md existed but the .json didn't). The real
+    cause (a TimeoutError on #prof-name after a successful login+submit) was
+    sitting in the run_playwright_tests tool results and was discarded,
+    leaving the retry and the diagnostician with only the generic
+    "[ERROR: max_iter ... reached]" message. run_agent now captures the last
+    run_playwright_tests evidence and, if e2e_tester hits max_iter with no
+    progress/e2e_<id>.json on disk, synthesizes one (plus a minimal .md)
+    from it.
+    """
+
+    def _fake_tool_call(self, call_id, name, args_json):
+        from types import SimpleNamespace
+        fn = SimpleNamespace(name=name, arguments=args_json)
+        return SimpleNamespace(id=call_id, function=fn)
+
+    def _fake_response(self, tool_calls):
+        from types import SimpleNamespace
+        msg = SimpleNamespace(content=None, tool_calls=tool_calls)
+        usage = SimpleNamespace(prompt_tokens=10, completion_tokens=5)
+        choice = SimpleNamespace(message=msg)
+        return SimpleNamespace(choices=[choice], usage=usage, model="deepseek-v4-pro")
+
+    def _pw_call_response(self, i):
+        return self._fake_response([
+            self._fake_tool_call(f"c{i}", "run_playwright_tests", '{"test_path": "tests/e2e/"}')
+        ])
+
+    def test_synthesizes_report_from_captured_playwright_output_on_max_iter(self, monkeypatch, tmp_path):
+        h = _load_harness(monkeypatch, tmp_path)
+        (tmp_path / "progress").mkdir(exist_ok=True)
+
+        monkeypatch.setattr(h, "_call_api_with_fallback", MagicMock(
+            side_effect=[self._pw_call_response(i) for i in range(4)]
+        ))
+        monkeypatch.setattr(h, "execute_tool", MagicMock(side_effect=[
+            json.dumps({"output": "old evidence, should be overwritten", "returncode": 1, "success": False}),
+            json.dumps({"output": "second call, also overwritten"}),
+            json.dumps({"output": "third call, also overwritten"}),
+            json.dumps({
+                "output": "FAILED tests/e2e/test_feature_74.py::test_create_professional - "
+                          "TimeoutError: waiting for locator(\"#prof-name\") after login+submit",
+                "returncode": 1, "success": False,
+            }),
+        ]))
+
+        result = h.run_agent("sys", [], "task", role="e2e_tester", max_iter=4, feature_id=74)
+
+        assert result.startswith("[ERROR: max_iter 4 reached]")
+        json_path = tmp_path / "progress" / "e2e_74.json"
+        md_path = tmp_path / "progress" / "e2e_74.md"
+        assert json_path.exists()
+        assert md_path.exists()
+
+        payload = json.loads(json_path.read_text())
+        assert payload["status"] == "failed"
+        assert payload["tests_passed"] is False
+        assert payload["files_touched"] == []
+        assert "TimeoutError" in payload["reason"]
+        assert "#prof-name" in payload["reason"]
+        assert "old evidence" not in payload["reason"]  # only the LAST captured call's output
+
+        assert "synthesized by harness after max_iter" in md_path.read_text()
+
+    def test_does_not_overwrite_an_existing_json(self, monkeypatch, tmp_path):
+        h = _load_harness(monkeypatch, tmp_path)
+        (tmp_path / "progress").mkdir(exist_ok=True)
+        json_path = tmp_path / "progress" / "e2e_74.json"
+        json_path.write_text(json.dumps({
+            "schema_version": 1, "status": "failed", "tests_passed": False,
+            "files_touched": [], "reason": "agent's own real reason",
+        }))
+
+        monkeypatch.setattr(h, "_call_api_with_fallback", MagicMock(
+            side_effect=[self._pw_call_response(i) for i in range(2)]
+        ))
+        monkeypatch.setattr(h, "execute_tool", MagicMock(
+            return_value=json.dumps({"output": "some evidence"})
+        ))
+
+        h.run_agent("sys", [], "task", role="e2e_tester", max_iter=2, feature_id=74)
+
+        assert json.loads(json_path.read_text())["reason"] == "agent's own real reason"
+
+    def test_placeholder_when_no_playwright_evidence_captured(self, monkeypatch, tmp_path):
+        h = _load_harness(monkeypatch, tmp_path)
+        (tmp_path / "progress").mkdir(exist_ok=True)
+
+        monkeypatch.setattr(h, "_call_api_with_fallback", MagicMock(
+            side_effect=[self._fake_response([self._fake_tool_call("c1", "read_file", '{"path": "x"}')])] * 2
+        ))
+        monkeypatch.setattr(h, "execute_tool", MagicMock(
+            return_value=json.dumps({"content": "irrelevant file contents"})
+        ))
+
+        h.run_agent("sys", [], "task", role="e2e_tester", max_iter=2, feature_id=74)
+
+        payload = json.loads((tmp_path / "progress" / "e2e_74.json").read_text())
+        assert "no run_playwright_tests output was captured" in payload["reason"]
+
+    def test_no_synthesis_without_feature_id(self, monkeypatch, tmp_path):
+        # Other run_agent callers (spec_writer/implementer/reviewer) don't
+        # pass feature_id — must be a pure no-op for them, not a crash.
+        h = _load_harness(monkeypatch, tmp_path)
+        (tmp_path / "progress").mkdir(exist_ok=True)
+
+        monkeypatch.setattr(h, "_call_api_with_fallback", MagicMock(
+            side_effect=[self._pw_call_response(i) for i in range(2)]
+        ))
+        monkeypatch.setattr(h, "execute_tool", MagicMock(
+            return_value=json.dumps({"output": "some evidence"})
+        ))
+
+        h.run_agent("sys", [], "task", role="e2e_tester", max_iter=2)
+
+        assert list((tmp_path / "progress").iterdir()) == []
+
+    def test_no_synthesis_for_non_e2e_tester_role(self, monkeypatch, tmp_path):
+        h = _load_harness(monkeypatch, tmp_path)
+        (tmp_path / "progress").mkdir(exist_ok=True)
+
+        monkeypatch.setattr(h, "_call_api_with_fallback", MagicMock(
+            side_effect=[self._pw_call_response(i) for i in range(2)]
+        ))
+        monkeypatch.setattr(h, "execute_tool", MagicMock(
+            return_value=json.dumps({"output": "some evidence"})
+        ))
+
+        h.run_agent("sys", [], "task", role="implementer", max_iter=2, feature_id=74)
+
+        assert not (tmp_path / "progress" / "e2e_74.json").exists()
+
+
 class TestIsWriteCall:
     """Unit tests for _is_write_call, the signal behind the convergence
     streak detector: did this tool call actually mutate a file?"""
