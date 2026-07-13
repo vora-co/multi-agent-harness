@@ -199,3 +199,28 @@ def resolve_layout() -> dict:
         )
 
     return layout
+
+
+@functools.lru_cache(maxsize=1)
+def all_e2e_runner_profiles() -> dict:
+    """
+    Every entry in stack_profiles.json's "e2e_runner" map, keyed by profile
+    key (e.g. "playwright", "playwright-node", "none") — not just the single
+    active one resolve_layout() resolves. Lets a caller check a path against
+    every OTHER e2e runner's test_dir/file_ext, to catch e.g. a leftover
+    Node/@playwright/test path (e2e/*.spec.ts) surviving in a project whose
+    active runner is actually Python/pytest-playwright (tests/e2e/*.py) —
+    something the single resolved-profile view in resolve_layout() can't
+    check by itself. Never raises — returns {} on any read/parse error or
+    if stack_profiles.json doesn't exist, same fallback discipline as
+    resolve_layout(). Cached like resolve_layout(); call
+    all_e2e_runner_profiles.cache_clear() in tests that need to re-resolve.
+    """
+    try:
+        if not os.path.exists("stack_profiles.json"):
+            return {}
+        prof = json.load(open("stack_profiles.json", encoding="utf-8"))
+        return prof.get("e2e_runner", {})
+    except Exception as exc:
+        _log.warning("stack_layout: could not read e2e_runner profiles (%s)", exc)
+        return {}

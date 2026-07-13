@@ -1295,6 +1295,114 @@ class TestFileTree:
         assert "file_074.py" not in tree
 
 
+class TestSpecWriterStaleE2eCache:
+    """
+    Regression coverage for a real incident: spec_74.md sent E2E tests to
+    e2e/biovet.spec.ts — the legacy Node/@playwright/test suite from
+    features #27-55 — while this project's resolved e2e runner is Python/
+    pytest-playwright (tests/e2e/*.py). The implementer wrote 4 correct
+    tests there that the real run_cmd never executes, and because the
+    cached spec is injected in full on every retry (and survives any manual
+    reset to "pending"), the poisoned path outlived every attempt. A
+    prompt-only rule can't catch this because the spec_writer agent isn't
+    invoked at all on a cache hit — spawn_spec_writer's own cache check must
+    do it.
+    """
+
+    _STACK_PROFILES = json.dumps({
+        "e2e_runner": {
+            "playwright": {
+                "name": "Playwright (Python / pytest-playwright)",
+                "runtime": "python", "file_ext": ".py", "test_dir": "tests/e2e/",
+                "run_cmd": "python3 -m pytest tests/e2e/ -v --tb=short",
+            },
+            "playwright-node": {
+                "name": "Playwright (Node / @playwright/test)",
+                "runtime": "node", "file_ext": ".spec.ts", "test_dir": "e2e/",
+                "run_cmd": "npx playwright test",
+            },
+        }
+    })
+
+    def _load(self, monkeypatch, tmp_path, extra_env=None):
+        # resolve_layout/all_e2e_runner_profiles are both @lru_cache'd on the
+        # stack_layout module object, which _load_harness doesn't purge from
+        # sys.modules (only "harness"/"harness.*") — same workaround as
+        # TestValidateSpecStackAware.
+        for key in list(sys.modules.keys()):
+            if key in ("tools", "stack_layout"):
+                del sys.modules[key]
+        h = _load_harness(monkeypatch, tmp_path, extra_env)
+        (tmp_path / "stack_profiles.json").write_text(self._STACK_PROFILES)
+        monkeypatch.setattr(h, "_call_api_with_fallback", lambda *a, **kw: None)  # _validate_spec: no-op
+        return h
+
+    def _stub_run_agent(self, h, monkeypatch, spec_path, content="# fresh spec\ntests/e2e/test_feature_74.py"):
+        calls = []
+
+        def fake_run_agent(*a, **kw):
+            calls.append(1)
+            with open(spec_path, "w", encoding="utf-8") as f:
+                f.write(content)
+            return spec_path
+        monkeypatch.setattr(h, "run_agent", fake_run_agent)
+        return calls
+
+    def test_reuses_clean_cached_spec_without_calling_agent(self, monkeypatch, tmp_path):
+        h = self._load(monkeypatch, tmp_path)
+        (tmp_path / "progress").mkdir(exist_ok=True)
+        (tmp_path / "progress" / "spec_74.md").write_text(
+            "## Tests to write\nCreate tests/e2e/test_feature_74.py covering the happy path."
+        )
+        calls = self._stub_run_agent(h, monkeypatch, "progress/spec_74.md")
+
+        result = h.spawn_spec_writer(74, "desc")
+
+        assert result == "progress/spec_74.md"
+        assert calls == []  # cache hit — agent never invoked
+        assert not (tmp_path / "progress" / "spec_74.md.stale").exists()
+
+    def test_quarantines_and_regenerates_when_pointed_at_other_runner_test_dir(self, monkeypatch, tmp_path):
+        h = self._load(monkeypatch, tmp_path)
+        (tmp_path / "progress").mkdir(exist_ok=True)
+        poisoned = "## Tests to write\nAppend a new describe block to e2e/biovet.spec.ts."
+        (tmp_path / "progress" / "spec_74.md").write_text(poisoned)
+        calls = self._stub_run_agent(h, monkeypatch, "progress/spec_74.md")
+
+        result = h.spawn_spec_writer(74, "desc")
+
+        assert result == "progress/spec_74.md"
+        assert calls == [1]  # cache miss — agent was invoked to regenerate
+
+        stale_path = tmp_path / "progress" / "spec_74.md.stale"
+        assert stale_path.exists()
+        assert stale_path.read_text() == poisoned  # original content preserved for debugging
+
+        fresh = (tmp_path / "progress" / "spec_74.md").read_text()
+        assert "e2e/biovet.spec.ts" not in fresh
+        assert "tests/e2e/test_feature_74.py" in fresh
+
+    def test_no_false_positive_when_stack_profiles_missing(self, monkeypatch, tmp_path):
+        # No stack_profiles.json written this time — all_e2e_runner_profiles()
+        # returns {} best-effort, so the gate is a no-op rather than blocking
+        # (or worse, quarantining) every cached spec in a project without one.
+        for key in list(sys.modules.keys()):
+            if key in ("tools", "stack_layout"):
+                del sys.modules[key]
+        h = _load_harness(monkeypatch, tmp_path)
+        monkeypatch.setattr(h, "_call_api_with_fallback", lambda *a, **kw: None)
+        (tmp_path / "progress").mkdir(exist_ok=True)
+        (tmp_path / "progress" / "spec_74.md").write_text(
+            "## Tests to write\nAppend to e2e/biovet.spec.ts."
+        )
+        calls = self._stub_run_agent(h, monkeypatch, "progress/spec_74.md")
+
+        result = h.spawn_spec_writer(74, "desc")
+
+        assert result == "progress/spec_74.md"
+        assert calls == []  # no stack_profiles.json → no other profiles to compare → reused as-is
+
+
 class TestValidateSpecStackAware:
     def test_uses_code_tree_dirs_not_hardcoded_src_tests(self, monkeypatch, tmp_path):
         # _validate_spec previously hardcoded _file_tree("src") / _file_tree("tests")

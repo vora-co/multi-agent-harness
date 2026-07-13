@@ -92,7 +92,7 @@ from tools import (
     STATUS_APPROVED, STATUS_REJECTED, STATUS_PASSED, STATUS_FAILED, STATUS_SCHEMA_VERSION,
     VERDICT_APPROVED, VERDICT_REJECTED, VERDICT_E2E_PASSED, VERDICT_E2E_FAILED,
 )
-from stack_layout import resolve_layout
+from stack_layout import resolve_layout, all_e2e_runner_profiles
 
 print(f"[CONFIG] SAFE_WRITE_DIRS = {SAFE_WRITE_DIRS}")
 
@@ -2599,17 +2599,81 @@ def spawn_implementer(feature_id: int, description: str, attempt: int = 1,
     return result
 
 
+def _spec_references_stale_e2e_test_dir(spec_text: str) -> Optional[str]:
+    """
+    Detect a spec that sends E2E tests to another e2e_runner profile's
+    test_dir/file_ext combo instead of the one actually resolved for this
+    project (e.g. tests/e2e/*.py for Python/pytest-playwright vs e2e/*.spec.ts
+    for Node/@playwright/test).
+
+    Real incident: spec_74.md sent tests to e2e/biovet.spec.ts — the legacy
+    Node suite from features #27-55 — while this project's resolved e2e
+    runner is Python/pytest-playwright (tests/e2e/*.py). The implementer
+    wrote 4 correct tests there that the real e2e run_cmd never executes.
+    spawn_spec_writer's cache check must call this on every reuse (not just
+    at generation time) — the spec_writer agent isn't even invoked on a
+    cache hit, so a prompt-level rule can't catch this once poisoned.
+
+    Returns a human-readable description of the conflicting reference, or
+    None if the spec is clean. Best-effort: any resolution issue (missing
+    stack_profiles.json, an unresolvable active profile) makes this a no-op
+    rather than a false positive.
+    """
+    layout = resolve_layout()
+    active_key = layout.get("e2e_key")
+    for other_key, entry in all_e2e_runner_profiles().items():
+        if other_key == active_key:
+            continue
+        other_dir = entry.get("test_dir")
+        other_ext = entry.get("file_ext")
+        if not other_dir or not other_ext:
+            continue  # e.g. the "none" profile has no test_dir/file_ext
+        match = re.search(re.escape(other_dir) + r"[\w./-]*" + re.escape(other_ext), spec_text)
+        if match:
+            return (
+                f"references '{match.group(0)}', which belongs to the '{other_key}' e2e runner "
+                f"profile ({other_dir}*{other_ext}), but this project's active e2e runner is "
+                f"'{active_key}' ({layout.get('e2e_test_dir')}*{layout.get('e2e_file_ext')})"
+            )
+    return None
+
+
 def spawn_spec_writer(feature_id: int, description: str) -> str:
     """Generate the detailed technical spec before implementing.
     If the spec already exists on disk, reuse it without calling the agent.
     """
     spec_path = f"{PROGRESS_DIR}/spec_{feature_id}.md"
 
-    # Reuse existing spec — avoids spending iterations regenerating
+    # Reuse existing spec — avoids spending iterations regenerating. But
+    # first check it doesn't point E2E tests at another e2e_runner profile's
+    # test_dir/file_ext (see _spec_references_stale_e2e_test_dir above) — a
+    # poisoned cached spec is injected in full on every implementer retry
+    # (and survives any manual reset to "pending"), and the spec_writer
+    # agent's own prompt rules can't catch it because it's never invoked on
+    # a cache hit in the first place.
     if os.path.exists(spec_path):
-        _log("spec_writer", "SKIP", f"Spec already exists: {spec_path}")
-        _vprint("normal", f"  [cyan]📋 SPEC_WRITER[/] [dim]↩ reusing existing spec →[/] {spec_path}")
-        return spec_path
+        try:
+            with open(spec_path, "r", encoding="utf-8") as f:
+                _cached_spec_text = f.read()
+        except OSError:
+            _cached_spec_text = ""
+        _stale_reason = _spec_references_stale_e2e_test_dir(_cached_spec_text)
+        if _stale_reason:
+            _stale_path = f"{spec_path}.stale"
+            try:
+                os.replace(spec_path, _stale_path)
+            except OSError:
+                pass  # best-effort quarantine — regenerate below either way;
+                       # the fresh write overwrites spec_path regardless
+            _log("spec_writer", "SPEC_STALE_E2E_PATH",
+                 f"feature={feature_id}: {_stale_reason} — quarantined to {_stale_path}, regenerating",
+                 level="warning")
+            _vprint("normal", f"  [cyan]📋 SPEC_WRITER[/] [yellow]⚠ cached spec pointed at the wrong "
+                              f"e2e runner's test dir — quarantined, regenerating[/]")
+        else:
+            _log("spec_writer", "SKIP", f"Spec already exists: {spec_path}")
+            _vprint("normal", f"  [cyan]📋 SPEC_WRITER[/] [dim]↩ reusing existing spec →[/] {spec_path}")
+            return spec_path
 
     _phase_header("spec_writer", "Writing spec", feature_id)
     cwd = os.getcwd()
