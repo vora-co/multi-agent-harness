@@ -209,9 +209,11 @@ You → process all pending features
 
 | Command | What it does |
 |---|---|
-| `process all pending features` | Processes all pending features in order |
-| `run only feature 3 and stop` | Processes only feature #3 |
-| `process features 2 and 3` | Processes a specific range |
+| `process all pending features` | Processes all pending features in order (via the Leader-LLM) |
+| `run only feature 3 and stop` | Processes only feature #3 (via the Leader-LLM) |
+| `process features 2 and 3` | Processes a specific range (via the Leader-LLM) |
+| `/auto` | Deterministic, code-level equivalent of "process all pending features" — no LLM orchestration, no `MAX_ITER_LEADER` ceiling. See [Deterministic batch driver](#deterministic-batch-driver) |
+| `/auto <id>` | Runs just feature `<id>` (must be `pending`) the same way |
 | `/features` | Shows the status of all features |
 | `/costs` | Shows token usage and estimated cost for this session |
 | `/budget` | Shows current spend vs. budget limit with a progress bar |
@@ -220,6 +222,16 @@ You → process all pending features
 | `/cache` | Shows LLM response cache status — enabled/disabled, entries on disk, hits and estimated savings this session. See [LLM response cache](#llm-response-cache) |
 | `/cache clear` | Deletes all on-disk cache entries |
 | `/quit` | Exits the harness |
+
+---
+
+## Deterministic batch driver
+
+`run_all_pending()` (the `/auto` REPL command) is a code-level alternative to the Leader-LLM for the one thing it does most often: process every `"pending"` feature in `depends_on` order. It reads `feature_list.json`, sorts with the same `_topological_sort()` used for startup validation, filters down to `"pending"`, and calls `run_feature_cycle()` for each in turn — updating `status` and writing `progress/current.md`/`progress/history.md` with a fixed template instead of Leader-composed prose.
+
+It does not replace the Leader-LLM — natural-language requests ("only run feature 3 and the ones after it", ad-hoc questions) still go through it via the REPL's default input path. `/auto` is a parallel, zero-inference path for the common case, with no `MAX_ITER_LEADER` ceiling forcing a human re-prompt mid-batch.
+
+Stops on: an empty pending queue, the session budget being exhausted (the about-to-run feature is left `"pending"`, not marked `"failed"`, so a later session can pick it up), or structural `feature_list.json` dependency errors. `/auto <id>` runs just one feature (must be `"pending"`). A Human-in-the-loop gate plugin, if one is loaded, already intercepts inside `run_feature_cycle()` itself — nothing `/auto`-specific needed.
 
 ---
 
@@ -659,6 +671,9 @@ Active development continues in the premium edition. See the [⭐ Premium module
 ---
 
 ## Changelog
+
+### v1.40.0
+- **New `/auto` REPL command: `run_all_pending()`, a deterministic code-level driver, as an alternative to the Leader-LLM for the common case of "process every pending feature."** Motivation: the Leader-LLM's own two real incidents this session already forced code-level guards — the dependency gate (v1.37.0) and the write/tool confinement (v1.36.0) — leaving what's essentially deterministic orchestration that an LLM executes slower, more expensively, and under a hard `MAX_ITER_LEADER` ceiling; a pending batch larger than that budget forces a human re-prompt mid-run today, working against unattended/autonomous processing. `run_all_pending()` reads `feature_list.json`, orders every feature with the existing `_topological_sort()` (full-graph order, then filtered to the `"pending"` subset, so a pending feature is only scheduled after everything it transitively depends on regardless of those dependencies' own status), and calls the exact same `run_feature_cycle()` the Leader calls for each in turn — so it benefits for free from both of the guards above. Sets each feature to `"in_progress"` before spawning (same convention `recover_stale_features()` already relies on for crash recovery) and to `"done"`/`"failed"` after, via new `_set_feature_status()` (same shape as `tools.update_feature_status()`, called directly with no LLM/tool-dispatch involved). Writes `progress/current.md`/`progress/history.md` with a new fixed template (`_write_auto_current_md()`/`_append_auto_history_md()`) instead of Leader-composed prose, covering the same fields `agents/leader.py`'s own PROTOCOL instructs the Leader-LLM to write by hand. Stops on: an empty queue (`"empty"`), structural dependency errors caught by the existing `_validate_dependencies()` (`"dependency_errors"`, re-checked here since `/auto` can run mid-session after the file changes), or the session budget being exhausted — checked via `_BUDGET_EXCEEDED` *before* each feature so the about-to-run one is left `"pending"` rather than incorrectly marked `"failed"` (`"budget_exceeded"`). `/auto <id>` (optional `only_feature_id`) runs just one feature, which must currently be `"pending"`. Does not replace the Leader-LLM — natural-language requests still go through `run_leader()` via the REPL's default input path; whether `/auto` eventually covers 100% of real usage is a follow-up decision, not made here. See the new [Deterministic batch driver](#deterministic-batch-driver) section. 8 new tests in `tests/test_harness_core.py::TestRunAllPending`.
 
 ### v1.39.0
 - **`spawn_spec_writer`'s cache-reuse path now detects a spec poisoned with another e2e_runner profile's test dir, and quarantines + regenerates instead of reusing it.** Real incident: `spec_74.md` sent E2E tests to `e2e/biovet.spec.ts` — the legacy Node/@playwright/test suite from features #27-55 — while this project's resolved e2e runner is Python/pytest-playwright (`tests/e2e/*.py`). The implementer wrote 4 correct tests there that the real `run_cmd` never executes; because the cached spec is injected in full on every implementer retry (and survives any manual reset to `"pending"`), the poisoned path outlived every attempt. A prompt-only rule can't catch this because the spec_writer agent is never invoked on a cache hit in the first place — the check has to live in the cache-reuse branch itself. New `stack_layout.all_e2e_runner_profiles()` exposes the *full* `stack_profiles.json` `"e2e_runner"` map (not just the single active profile `resolve_layout()` resolves) — same best-effort discipline (`{}` on any read/parse error), `@lru_cache`'d the same way. New `harness._spec_references_stale_e2e_test_dir()` checks a spec's text against every *other* profile's `test_dir`+`file_ext` combo (e.g. `e2e/*.spec.ts`) and returns a description of the conflicting reference if found. `spawn_spec_writer`'s reuse branch now calls this on every cache hit: a clean spec is reused exactly as before (zero behavior change); a poisoned one is renamed to `spec_<id>.md.stale` (best-effort — if the rename itself fails, generation proceeds anyway since the fresh write overwrites `spec_path` regardless) and falls through to a full regeneration. No `stack_profiles.json` (or any read error) makes this a no-op, never a false positive or a block. 3 new tests in `tests/test_harness_core.py::TestSpecWriterStaleE2eCache`.

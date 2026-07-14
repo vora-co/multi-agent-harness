@@ -3105,6 +3105,201 @@ def _run_feature_cycle_impl(feature_id: int, description: str, e2e: bool = True)
     return {"approved": False, "attempts": MAX_RETRIES_REVIEW, "final_verdict": final_verdict}
 
 
+# ─── DETERMINISTIC BATCH DRIVER (/auto) ──────────────────────────────────────
+#
+# run_all_pending() is a code-level alternative to the Leader-LLM for the one
+# thing it does most often: process every "pending" feature in dependency
+# order. It does not replace run_leader() — natural-language requests
+# ("only run feature 3 and the ones after it", ad-hoc questions about state)
+# still go through the Leader-LLM via the REPL's default input path. This is
+# a parallel, zero-inference path for the common case of "run everything
+# that's ready," which an LLM orchestrator executes slower, more expensively,
+# and under a hard MAX_ITER_LEADER ceiling — a pending batch larger than that
+# budget forces a human re-prompt mid-run today, which works against
+# unattended/autonomous processing. The Leader's own two real incidents this
+# session (starting a feature whose dependency had failed, editing files
+# outside its role) already forced code-level guards — _run_feature_cycle_impl's
+# dependency gate (v1.37.0) and execute_tool's Leader write confinement
+# (v1.36.0) — both of which this driver benefits from for free, since it
+# calls the exact same run_feature_cycle() the Leader calls.
+
+def _set_feature_status(feature_id: int, status: str) -> None:
+    """
+    Directly update a feature's status + updated_at in feature_list.json —
+    same shape tools.update_feature_status() writes when an LLM calls it as
+    a tool, but invoked straight from harness-internal code (no tool-call
+    dispatch, no LLM involved). Best-effort: a missing/malformed
+    feature_list.json is silently a no-op, same discipline as
+    _read_feature_list_raw()/_write_feature_list_raw().
+    """
+    features = _read_feature_list_raw()
+    for feat in features:
+        if feat.get("id") == feature_id:
+            feat["status"] = status
+            feat["updated_at"] = datetime.datetime.now().isoformat()
+            break
+    _write_feature_list_raw(features)
+
+
+def _write_auto_current_md(feature_id: int, title: str, description: str) -> None:
+    """
+    Overwrite progress/current.md with a fixed template — the same fields
+    agents/leader.py's own PROTOCOL step 2b instructs the Leader-LLM to
+    compose freely by hand (chosen feature, timestamp, brief plan).
+    """
+    try:
+        os.makedirs(PROGRESS_DIR, exist_ok=True)
+        with open(f"{PROGRESS_DIR}/current.md", "w", encoding="utf-8") as f:
+            f.write(
+                f"# Current status\n\n"
+                f"**Feature:** #{feature_id} — {title}\n"
+                f"**Started:** {datetime.datetime.now().isoformat()}\n"
+                f"**Plan:** {description[:300]}\n"
+            )
+    except OSError as exc:
+        _log("harness", "AUTO_CURRENT_MD_WRITE_ERROR", f"feature={feature_id}: {exc}", level="warning")
+
+
+def _append_auto_history_md(feature_id: int, title: str, approved: bool,
+                             attempts: int, final_verdict: str) -> None:
+    """
+    Append to progress/history.md with a fixed template — the same fields
+    agents/leader.py's own PROTOCOL step 2d instructs the Leader-LLM to
+    compose freely by hand once run_feature_cycle returns.
+    """
+    status_label = "✅ done" if approved else "❌ failed"
+    try:
+        os.makedirs(PROGRESS_DIR, exist_ok=True)
+        with open(f"{PROGRESS_DIR}/history.md", "a", encoding="utf-8") as f:
+            f.write(
+                f"\n## Feature #{feature_id} — {title}\n"
+                f"- Status: {status_label}\n"
+                f"- Attempts: {attempts}\n"
+                f"- Timestamp: {datetime.datetime.now().isoformat()}\n"
+                f"- Verdict: {final_verdict[:500]}\n"
+            )
+    except OSError as exc:
+        _log("harness", "AUTO_HISTORY_MD_WRITE_ERROR", f"feature={feature_id}: {exc}", level="warning")
+
+
+def run_all_pending(only_feature_id: Optional[int] = None) -> dict:
+    """
+    Deterministic, code-level driver: reads feature_list.json, orders every
+    "pending" feature via _topological_sort (full-graph dependency order,
+    then filtered down to the pending subset — so a pending feature is only
+    scheduled after everything it transitively depends on, whatever those
+    dependencies' own status), and calls run_feature_cycle() for each in
+    turn — updating status and progress/current.md / progress/history.md
+    the same way the Leader's own PROTOCOL does, with no LLM in the loop for
+    the orchestration itself.
+
+    If only_feature_id is given, runs just that one feature (it must
+    currently be "pending" — same contract as the rest of this function)
+    instead of the whole queue.
+
+    Stops when:
+      - the pending queue (after dependency ordering / only_feature_id
+        filtering) is empty — "empty".
+      - the session budget is exhausted (_BUDGET_EXCEEDED, checked BEFORE
+        each feature) — "budget_exceeded". The about-to-run feature is left
+        "pending" (never marked "in_progress"/"failed"), so a future session
+        picks it up rather than losing it to a spurious failure.
+      - feature_list.json has structural dependency errors (self-dep,
+        missing dep, cycle) — "dependency_errors". Same check
+        _validate_dependencies() already runs at startup, re-run here since
+        /auto can be invoked mid-session after the file changes.
+      - only_feature_id was given and that one feature finished —
+        "single_feature_done".
+    A human-in-the-loop gate, if a premium plugin registers one on
+    before_approval_finalized, already intercepts inside run_feature_cycle
+    itself — nothing extra needed here.
+
+    Returns {"results": [{"feature_id", "title", "approved", "attempts",
+    "final_verdict"}, ...], "stopped_reason": str}.
+    """
+    features = _read_feature_list_raw()
+    if not features:
+        console.print("[yellow]No feature_list.json found or it's empty — nothing to run.[/]")
+        return {"results": [], "stopped_reason": "empty"}
+
+    dep_errors = _validate_dependencies(features)
+    if dep_errors:
+        console.print(Panel(
+            "\n".join(f"[red]• {e}[/]" for e in dep_errors),
+            title="[red]⚠ Dependency graph errors — fix feature_list.json before running /auto[/]",
+            border_style="red", padding=(0, 1)
+        ))
+        return {"results": [], "stopped_reason": "dependency_errors"}
+
+    ordered, _ = _topological_sort(features)
+    id_to_feature = {f["id"]: f for f in features}
+    queue = [fid for fid in ordered if id_to_feature[fid].get("status") == "pending"]
+
+    if only_feature_id is not None:
+        if only_feature_id not in id_to_feature:
+            console.print(f"[red]Feature #{only_feature_id} not found in feature_list.json.[/]")
+            return {"results": [], "stopped_reason": "not_found"}
+        if id_to_feature[only_feature_id].get("status") != "pending":
+            console.print(
+                f"[yellow]Feature #{only_feature_id} is not 'pending' "
+                f"(status={id_to_feature[only_feature_id].get('status')!r}) — nothing to run.[/]"
+            )
+            return {"results": [], "stopped_reason": "not_pending"}
+        queue = [only_feature_id]
+
+    if not queue:
+        console.print("[dim]No pending features to run.[/]")
+        return {"results": [], "stopped_reason": "empty"}
+
+    console.print(
+        f"  [bold]▶ /auto[/] processing {len(queue)} pending feature(s) in dependency order: "
+        + " → ".join(f"#{fid}" for fid in queue)
+    )
+
+    results: list = []
+    stopped_reason = "empty"
+    for fid in queue:
+        if _BUDGET_EXCEEDED:
+            console.print(f"  [yellow]⚠ session budget exhausted — stopping before feature #{fid}[/]")
+            stopped_reason = "budget_exceeded"
+            break
+
+        feat = id_to_feature[fid]
+        title = feat.get("title", f"#{fid}")
+        description = feat.get("description", "")
+        e2e = bool(feat.get("e2e", False))
+
+        _set_feature_status(fid, "in_progress")
+        _write_auto_current_md(fid, title, description)
+
+        cycle_result = run_feature_cycle(fid, description, e2e=e2e)
+        approved = bool(cycle_result.get("approved"))
+        attempts = cycle_result.get("attempts", 0)
+        final_verdict = cycle_result.get("final_verdict", "")
+
+        _set_feature_status(fid, "done" if approved else "failed")
+        _append_auto_history_md(fid, title, approved, attempts, final_verdict)
+
+        results.append({
+            "feature_id": fid, "title": title, "approved": approved,
+            "attempts": attempts, "final_verdict": final_verdict,
+        })
+
+        if only_feature_id is not None:
+            stopped_reason = "single_feature_done"
+            break
+    else:
+        stopped_reason = "empty"  # queue exhausted naturally, no break hit
+
+    approved_count = sum(1 for r in results if r["approved"])
+    console.print(
+        f"  [bold]✅ /auto finished[/] — {approved_count} approved, "
+        f"{len(results) - approved_count} failed "
+        f"({len(results)} processed, stopped: {stopped_reason})"
+    )
+    return {"results": results, "stopped_reason": stopped_reason}
+
+
 # ─── LEADER LOOP ─────────────────────────────────────────────────────────────
 
 def _build_leader_task(user_task: str) -> str:
@@ -3349,7 +3544,7 @@ def main():
     console.print(
         f"  Model: [cyan]{MODEL}[/]  |  Orchestrator: {orch_label}  |  Budget: {budget_label}  |  Verbosity: [cyan]{HARNESS_VERBOSITY}[/]\n"
         f"  Flow: [green]👑 Leader[/] → [cyan]📋 Spec[/] → [blue]🔨 Impl[/] → [yellow]🧪 E2E[/] → [magenta]🔍 Reviewer[/]\n"
-        f"  [dim]Commands: /quit | /status | /features | /costs | /budget | /verbosity[/]"
+        f"  [dim]Commands: /quit | /status | /features | /costs | /budget | /verbosity | /auto [id][/]"
     )
     console.rule(style="dim")
 
@@ -3457,6 +3652,16 @@ def main():
                         f"Est. savings: [yellow]USD {_session_cache_savings_usd():.4f}[/]\n"
                         f"  [dim]Use '/cache clear' to delete all entries. Enable with LLM_CACHE_ENABLED=true in .env.[/]"
                     )
+                continue
+            elif user_input == "/auto":
+                run_all_pending()
+                continue
+            elif user_input.startswith("/auto "):
+                arg = user_input[len("/auto "):].strip()
+                if arg.isdigit():
+                    run_all_pending(only_feature_id=int(arg))
+                else:
+                    console.print(f"  [red]Usage: /auto or /auto <feature_id>[/]")
                 continue
 
             result = _run_leader_flow(user_input)

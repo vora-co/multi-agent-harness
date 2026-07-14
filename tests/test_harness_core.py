@@ -748,6 +748,151 @@ class TestAfterReviewerRejectedHook:
         assert len(self._calls_for(fire_mock, "after_feature_approved")) == 1
 
 
+class TestRunAllPending:
+    """
+    /auto's underlying driver: a code-level alternative to the Leader-LLM
+    for the common case of "run every pending feature in dependency order."
+    Mocks run_feature_cycle directly (not the sub-agents) since this is
+    about the driver's own orchestration, not the cycle internals — those
+    are covered by TestDependencyGate and friends.
+    """
+
+    def test_processes_pending_features_in_dependency_order(self, monkeypatch, tmp_path):
+        _write_fl(tmp_path, [
+            {"id": 2, "title": "T2", "description": "d2", "status": "pending", "e2e": False, "depends_on": [1]},
+            {"id": 1, "title": "T1", "description": "d1", "status": "pending", "e2e": False, "depends_on": []},
+        ])
+        (tmp_path / "progress").mkdir(exist_ok=True)
+        h = _load_harness(monkeypatch, tmp_path)
+        calls = []
+        monkeypatch.setattr(h, "run_feature_cycle", lambda fid, desc, e2e=False:
+            calls.append(fid) or {"approved": True, "attempts": 1, "final_verdict": "APPROVED"})
+
+        result = h.run_all_pending()
+
+        assert calls == [1, 2]  # dependency order, not declaration order
+        assert result["stopped_reason"] == "empty"
+        assert [r["feature_id"] for r in result["results"]] == [1, 2]
+        assert all(r["approved"] for r in result["results"])
+
+        features = {f["id"]: f for f in h._read_feature_list_raw()}
+        assert features[1]["status"] == "done"
+        assert features[2]["status"] == "done"
+
+    def test_marks_failed_when_not_approved(self, monkeypatch, tmp_path):
+        _write_fl(tmp_path, [
+            {"id": 1, "title": "T1", "description": "d1", "status": "pending", "e2e": False, "depends_on": []},
+        ])
+        (tmp_path / "progress").mkdir(exist_ok=True)
+        h = _load_harness(monkeypatch, tmp_path)
+        monkeypatch.setattr(h, "run_feature_cycle", lambda fid, desc, e2e=False:
+            {"approved": False, "attempts": 3, "final_verdict": "REJECTED: bad code"})
+
+        h.run_all_pending()
+
+        features = {f["id"]: f for f in h._read_feature_list_raw()}
+        assert features[1]["status"] == "failed"
+
+    def test_stops_on_budget_exceeded_leaves_feature_pending(self, monkeypatch, tmp_path):
+        _write_fl(tmp_path, [
+            {"id": 1, "title": "T1", "description": "d1", "status": "pending", "e2e": False, "depends_on": []},
+            {"id": 2, "title": "T2", "description": "d2", "status": "pending", "e2e": False, "depends_on": []},
+        ])
+        (tmp_path / "progress").mkdir(exist_ok=True)
+        h = _load_harness(monkeypatch, tmp_path)
+        calls = []
+
+        def fake_cycle(fid, desc, e2e=False):
+            calls.append(fid)
+            h._BUDGET_EXCEEDED = True  # simulate budget breach mid-run, like _track_usage would
+            return {"approved": True, "attempts": 1, "final_verdict": "APPROVED"}
+        monkeypatch.setattr(h, "run_feature_cycle", fake_cycle)
+
+        result = h.run_all_pending()
+
+        assert calls == [1]  # never even attempted #2
+        assert result["stopped_reason"] == "budget_exceeded"
+        features = {f["id"]: f for f in h._read_feature_list_raw()}
+        assert features[1]["status"] == "done"
+        assert features[2]["status"] == "pending"  # left untouched, not "failed"
+
+    def test_only_feature_id_runs_just_that_one(self, monkeypatch, tmp_path):
+        _write_fl(tmp_path, [
+            {"id": 1, "title": "T1", "description": "d1", "status": "pending", "e2e": False, "depends_on": []},
+            {"id": 2, "title": "T2", "description": "d2", "status": "pending", "e2e": False, "depends_on": []},
+        ])
+        (tmp_path / "progress").mkdir(exist_ok=True)
+        h = _load_harness(monkeypatch, tmp_path)
+        calls = []
+        monkeypatch.setattr(h, "run_feature_cycle", lambda fid, desc, e2e=False:
+            calls.append(fid) or {"approved": True, "attempts": 1, "final_verdict": "APPROVED"})
+
+        result = h.run_all_pending(only_feature_id=2)
+
+        assert calls == [2]
+        assert result["stopped_reason"] == "single_feature_done"
+        features = {f["id"]: f for f in h._read_feature_list_raw()}
+        assert features[1]["status"] == "pending"  # untouched
+        assert features[2]["status"] == "done"
+
+    def test_only_feature_id_requires_pending_status(self, monkeypatch, tmp_path):
+        _write_fl(tmp_path, [
+            {"id": 1, "title": "T1", "description": "d1", "status": "done", "e2e": False, "depends_on": []},
+        ])
+        (tmp_path / "progress").mkdir(exist_ok=True)
+        h = _load_harness(monkeypatch, tmp_path)
+        calls = []
+        monkeypatch.setattr(h, "run_feature_cycle", lambda fid, desc, e2e=False: calls.append(fid))
+
+        result = h.run_all_pending(only_feature_id=1)
+
+        assert calls == []
+        assert result["stopped_reason"] == "not_pending"
+
+    def test_dependency_errors_abort_without_running_anything(self, monkeypatch, tmp_path):
+        _write_fl(tmp_path, [
+            {"id": 1, "title": "T1", "description": "d1", "status": "pending", "e2e": False, "depends_on": [1]},
+        ])
+        (tmp_path / "progress").mkdir(exist_ok=True)
+        h = _load_harness(monkeypatch, tmp_path)
+        calls = []
+        monkeypatch.setattr(h, "run_feature_cycle", lambda fid, desc, e2e=False: calls.append(fid))
+
+        result = h.run_all_pending()
+
+        assert calls == []
+        assert result["stopped_reason"] == "dependency_errors"
+
+    def test_empty_when_nothing_pending(self, monkeypatch, tmp_path):
+        _write_fl(tmp_path, [
+            {"id": 1, "title": "T1", "description": "d1", "status": "done", "e2e": False, "depends_on": []},
+        ])
+        (tmp_path / "progress").mkdir(exist_ok=True)
+        h = _load_harness(monkeypatch, tmp_path)
+
+        result = h.run_all_pending()
+
+        assert result == {"results": [], "stopped_reason": "empty"}
+
+    def test_writes_current_and_history_md(self, monkeypatch, tmp_path):
+        _write_fl(tmp_path, [
+            {"id": 1, "title": "Add login", "description": "d1", "status": "pending", "e2e": False, "depends_on": []},
+        ])
+        (tmp_path / "progress").mkdir(exist_ok=True)
+        h = _load_harness(monkeypatch, tmp_path)
+        monkeypatch.setattr(h, "run_feature_cycle", lambda fid, desc, e2e=False:
+            {"approved": True, "attempts": 1, "final_verdict": "APPROVED"})
+
+        h.run_all_pending()
+
+        current = (tmp_path / "progress" / "current.md").read_text()
+        assert "#1" in current and "Add login" in current
+
+        history = (tmp_path / "progress" / "history.md").read_text()
+        assert "#1" in history and "Add login" in history
+        assert "done" in history
+
+
 class TestDependencyGate:
     """
     Regression coverage for a real incident: the Leader started feature #72
