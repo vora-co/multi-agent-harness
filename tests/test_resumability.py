@@ -337,3 +337,62 @@ class TestRunFeatureCycleResume:
 
         feat = _read_fl(tmp_path)[0]
         assert "_checkpoint" not in feat
+
+
+# ── Status "done" written at the code level, before governance ───────────────
+
+class TestStatusDoneBeforeGovernance:
+    """
+    On approval the cycle itself flips the feature to "done" in
+    feature_list.json BEFORE after_feature_approved fires. The governance
+    hook synchronously snapshots the working tree onto the feature branch,
+    so relying on the Leader's later update_feature_status tool call let the
+    branch/PR capture a stale status and the late flip get discarded by the
+    next feature's checkout (feature #75 incident, biovet-harness).
+    """
+
+    def _patch_cycle(self, h, monkeypatch):
+        monkeypatch.setattr(h, "spawn_spec_writer",
+                            MagicMock(return_value="progress/spec_1.md"))
+        monkeypatch.setattr(h, "spawn_implementer", MagicMock(return_value="ok"))
+        monkeypatch.setattr(h, "spawn_reviewer", MagicMock(return_value="APPROVED"))
+        monkeypatch.setattr(h, "spawn_e2e_tester",
+                            MagicMock(return_value="E2E_PASSED"))
+        monkeypatch.setattr(h, "_fire_gate", MagicMock(return_value=None))
+        monkeypatch.setattr(h, "_track_usage", MagicMock())
+        h.console = MagicMock()
+
+    def test_status_is_done_when_after_feature_approved_fires(self, monkeypatch, tmp_path):
+        _make_feature_list(tmp_path, extra_fields={"status": "in_progress"})
+        h = _load_harness(monkeypatch, tmp_path)
+        self._patch_cycle(h, monkeypatch)
+
+        status_at_hook_time = {}
+
+        def recording_fire(event, **kwargs):
+            if event == "after_feature_approved":
+                status_at_hook_time["status"] = _read_fl(tmp_path)[0]["status"]
+
+        monkeypatch.setattr(h, "_fire", MagicMock(side_effect=recording_fire))
+
+        result = h.run_feature_cycle(1, "desc", e2e=False)
+
+        assert result["approved"] is True
+        # Already "done" at the moment the governance hook snapshots the
+        # branch — not a turn later via the Leader's tool call.
+        assert status_at_hook_time == {"status": "done"}
+
+    def test_status_is_done_on_disk_after_approved_return(self, monkeypatch, tmp_path):
+        _make_feature_list(tmp_path, extra_fields={"status": "in_progress"})
+        h = _load_harness(monkeypatch, tmp_path)
+        self._patch_cycle(h, monkeypatch)
+        monkeypatch.setattr(h, "_fire", MagicMock())
+
+        result = h.run_feature_cycle(1, "desc", e2e=False)
+
+        assert result["approved"] is True
+        # No update_feature_status tool call has happened — the cycle
+        # itself persisted the final status.
+        feat = _read_fl(tmp_path)[0]
+        assert feat["status"] == "done"
+        assert "updated_at" in feat

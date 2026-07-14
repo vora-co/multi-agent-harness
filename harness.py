@@ -3347,6 +3347,19 @@ def _run_feature_cycle_impl(feature_id: int, description: str, e2e: bool = True)
             attempt=attempt, review_result=review_result,
         )
         if not gate_block:
+            # Flip the status to "done" HERE, before after_feature_approved
+            # fires: sdlc_governance's hook synchronously snapshots the
+            # working tree onto the feature branch (and then checks the base
+            # branch back out), while the Leader's own update_feature_status
+            # tool call only lands a full LLM turn later — so the branch/PR
+            # captured the stale status and the late flip sat uncommitted on
+            # the base branch, discarded by the next feature's checkout.
+            # Same for /auto's post-cycle _set_feature_status(fid, "done").
+            # Both callers' later writes become harmless no-ops; the Leader
+            # tool still owns "failed" and every other status. Done before
+            # _clear_checkpoint so a crash in between can't resurrect an
+            # already-shipped feature as stale (recovery skips "done").
+            _set_feature_status(feature_id, "done")
             _clear_checkpoint(feature_id)
             _fire("after_feature_approved",
                   feature_id=feature_id, description=description, attempts=attempt)
