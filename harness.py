@@ -1199,11 +1199,15 @@ def _validate_feature_schema(features: list) -> list[str]:
 # The checkpoint is stored as a "_checkpoint" field inside the feature's entry
 # in feature_list.json — same file, no extra dependencies.
 #
-# Step progression:
-#   (none)      fresh start — run all steps
-#   spec_done   spec written; next restart skips spawn_spec_writer
-#   impl_done   impl written for attempt N; next restart skips spawn_implementer
-#   e2e_done    e2e passed for attempt N; next restart skips spawn_e2e_tester
+# Step progression (impl -> review -> E2E, see ARCHITECTURE_REVIEW §8.C: E2E
+# is the most expensive step — force-recreate + cold compile + browser — so
+# it runs last, after the cheap review check has already approved):
+#   (none)       fresh start — run all steps
+#   spec_done    spec written; next restart skips spawn_spec_writer
+#   impl_done    impl written for attempt N; next restart skips spawn_implementer
+#   review_done  review approved attempt N; next restart skips spawn_reviewer
+#   e2e_done     e2e passed attempt N (review already approved too); next
+#                restart skips straight to the before_approval_finalized gate
 #
 # On approval or final failure the checkpoint is cleared so the field does not
 # persist in the completed feature entry.
@@ -1236,13 +1240,14 @@ def _write_feature_list_raw(features: list) -> None:
 # prompt), unlike the STATUS_*/VERDICT_* constants in tools.py.
 CKPT_SPEC_DONE = "spec_done"
 CKPT_IMPL_DONE = "impl_done"
+CKPT_REVIEW_DONE = "review_done"
 CKPT_E2E_DONE = "e2e_done"
 
 
 def _save_checkpoint(feature_id: int, step: str, attempt: int = 1) -> None:
     """
     Write a checkpoint for feature_id after completing `step`.
-    step must be one of: CKPT_SPEC_DONE, CKPT_IMPL_DONE, CKPT_E2E_DONE.
+    step must be one of: CKPT_SPEC_DONE, CKPT_IMPL_DONE, CKPT_REVIEW_DONE, CKPT_E2E_DONE.
     """
     features = _read_feature_list_raw()
     for feat in features:
@@ -3018,7 +3023,7 @@ def _run_feature_cycle_impl(feature_id: int, description: str, e2e: bool = True)
 
     # ── Step 1: Spec ─────────────────────────────────────────────────────────
     # Skip if spec was already written in a previous run.
-    if _ckpt_step in (CKPT_SPEC_DONE, CKPT_IMPL_DONE, CKPT_E2E_DONE):
+    if _ckpt_step in (CKPT_SPEC_DONE, CKPT_IMPL_DONE, CKPT_REVIEW_DONE, CKPT_E2E_DONE):
         spec_path = f"{PROGRESS_DIR}/spec_{feature_id}.md"
         _vprint("normal", f"  [dim]↺ skipping spec (already done)[/]")
     else:
@@ -3028,14 +3033,16 @@ def _run_feature_cycle_impl(feature_id: int, description: str, e2e: bool = True)
 
     rejection_reason = ""
     # Resume from the attempt that was in progress when the crash happened.
-    start_attempt = _ckpt_attempt if _ckpt_step in (CKPT_IMPL_DONE, CKPT_E2E_DONE) else 1
+    start_attempt = (
+        _ckpt_attempt if _ckpt_step in (CKPT_IMPL_DONE, CKPT_REVIEW_DONE, CKPT_E2E_DONE) else 1
+    )
 
     for attempt in range(start_attempt, MAX_RETRIES_REVIEW + 1):
 
         # ── Step 2: Implement ─────────────────────────────────────────────────
         # Skip if impl was already done for this attempt in a previous run.
         _skip_impl = (
-            _ckpt_step in (CKPT_IMPL_DONE, CKPT_E2E_DONE)
+            _ckpt_step in (CKPT_IMPL_DONE, CKPT_REVIEW_DONE, CKPT_E2E_DONE)
             and _ckpt_attempt == attempt
         )
         if _skip_impl:
@@ -3060,8 +3067,50 @@ def _run_feature_cycle_impl(feature_id: int, description: str, e2e: bool = True)
                 continue
             _save_checkpoint(feature_id, CKPT_IMPL_DONE, attempt=attempt)
 
-        # ── Step 3: E2E Testing ───────────────────────────────────────────────
-        # Skip if e2e was already done for this attempt in a previous run.
+        # ── Step 3: Review ────────────────────────────────────────────────────
+        # Moved ahead of E2E (was step 4) — ARCHITECTURE_REVIEW §8.C: E2E is
+        # by far the most expensive step in the cycle (force-recreate + cold
+        # compile + browser), but used to run BEFORE this cheap, purely-static
+        # check — every ordinary reviewer rejection wasted a full Playwright
+        # cycle it never needed. Skip if review already approved this attempt
+        # in a previous run.
+        _skip_review = (
+            _ckpt_step in (CKPT_REVIEW_DONE, CKPT_E2E_DONE)
+            and _ckpt_attempt == attempt
+        )
+        if _skip_review:
+            _vprint("normal", f"  [dim]↺ skipping review attempt {attempt} (already done)[/]")
+            approved, review_result = True, VERDICT_APPROVED
+        else:
+            # _reviewer_verdict prefers the structured progress/review_<id>.json
+            # written alongside the report, falling back to parsing the returned
+            # chat string (_verdict_is + stripping "REJECTED:") when absent.
+            review_result = spawn_reviewer(feature_id, e2e=e2e, attempt=attempt)
+            approved, rejection_reason = _reviewer_verdict(review_result, f"{PROGRESS_DIR}/review_{feature_id}.md")
+
+        if not approved:
+            # rejection_reason was already set above by _reviewer_verdict()
+            _log("harness", "CYCLE_RETRY",
+                 f"feature={feature_id} attempt={attempt}/{MAX_RETRIES_REVIEW} reason={rejection_reason[:100]}",
+                 level="warning")
+            _fire("after_reviewer_rejected",
+                  feature_id=feature_id, description=description,
+                  attempt=attempt, max_attempts=MAX_RETRIES_REVIEW,
+                  rejection_reason=rejection_reason)
+            if attempt < MAX_RETRIES_REVIEW:
+                _vprint("normal", Panel(
+                    f"[yellow]Reviewer rejected — retry {attempt+1}/{MAX_RETRIES_REVIEW}[/]\n"
+                    f"[dim]{rejection_reason[:200]}[/]",
+                    title=f"[yellow]↻ impl→review cycle — feature #{feature_id}[/]",
+                    border_style="yellow", padding=(0, 1)
+                ))
+            continue
+        _save_checkpoint(feature_id, CKPT_REVIEW_DONE, attempt=attempt)
+
+        # ── Step 4: E2E Testing ───────────────────────────────────────────────
+        # Now runs only after the cheap review check has already approved —
+        # a rejected review never pays for a Playwright cycle. Skip if e2e
+        # was already done for this attempt in a previous run.
         _skip_e2e = (
             _ckpt_step == CKPT_E2E_DONE
             and _ckpt_attempt == attempt
@@ -3079,16 +3128,17 @@ def _run_feature_cycle_impl(feature_id: int, description: str, e2e: bool = True)
         # malformed/empty output, etc. — is treated as a failure. Previously
         # this only rejected strings starting with "E2E_FAILED", so a timeout
         # or any other unexpected verdict silently fell through as an
-        # implicit pass and reached the Reviewer with no real E2E evidence.
-        # _e2e_verdict prefers the structured progress/e2e_<id>.json written
-        # alongside the report, falling back to this same string parsing.
+        # implicit pass. _e2e_verdict prefers the structured
+        # progress/e2e_<id>.json written alongside the report, falling back
+        # to this same string parsing.
         e2e_passed, e2e_reason = _e2e_verdict(e2e_result, f"{PROGRESS_DIR}/e2e_{feature_id}.md")
-        if e2e_passed:
-            _save_checkpoint(feature_id, CKPT_E2E_DONE, attempt=attempt)
-        else:
+        if not e2e_passed:
             _log("harness", "E2E_FAILED",
                  f"feature={feature_id} attempt={attempt} reason={e2e_reason[:100]}", level="warning")
-            # E2E failure counts as rejection — implementer fixes it on next attempt
+            # E2E failure counts as rejection — implementer fixes it on the
+            # next attempt, which re-pays review too (a code change made in
+            # response to an E2E failure can itself introduce something
+            # review would have caught, so re-running it is deliberate).
             rejection_reason = f"E2E failed: {e2e_reason}"
             if attempt < MAX_RETRIES_REVIEW:
                 _vprint("normal", Panel(
@@ -3098,58 +3148,39 @@ def _run_feature_cycle_impl(feature_id: int, description: str, e2e: bool = True)
                     border_style="red", padding=(0, 1)
                 ))
             continue
+        _save_checkpoint(feature_id, CKPT_E2E_DONE, attempt=attempt)
 
-        # ── Step 4: Review ───────────────────────────────────────────────────
-        # _reviewer_verdict prefers the structured progress/review_<id>.json
-        # written alongside the report, falling back to parsing the returned
-        # chat string (_verdict_is + stripping "REJECTED:") when absent.
-        review_result = spawn_reviewer(feature_id, e2e=e2e, attempt=attempt)
-        approved, rejection_reason = _reviewer_verdict(review_result, f"{PROGRESS_DIR}/review_{feature_id}.md")
-        if approved:
-            gate_block = _fire_gate(
-                "before_approval_finalized",
-                feature_id=feature_id, description=description,
-                attempt=attempt, review_result=review_result,
-            )
-            if not gate_block:
-                _clear_checkpoint(feature_id)
-                _fire("after_feature_approved",
-                      feature_id=feature_id, description=description, attempts=attempt)
-                console.print(f"[green]✅ Feature #{feature_id} approved[/] ({attempt} attempt(s))")
-                return {"approved": True, "attempts": attempt, "final_verdict": review_result}
+        # ── Gate: finalize only after BOTH review and E2E have passed ─────────
+        # Moved from immediately after review (its old position, step 4) to
+        # here — so a governance plugin (e.g. the premium Human-in-the-loop
+        # gates module) never finalizes a feature whose E2E never ran.
+        gate_block = _fire_gate(
+            "before_approval_finalized",
+            feature_id=feature_id, description=description,
+            attempt=attempt, review_result=review_result,
+        )
+        if not gate_block:
+            _clear_checkpoint(feature_id)
+            _fire("after_feature_approved",
+                  feature_id=feature_id, description=description, attempts=attempt)
+            console.print(f"[green]✅ Feature #{feature_id} approved[/] ({attempt} attempt(s))")
+            return {"approved": True, "attempts": attempt, "final_verdict": review_result}
 
-            # A plugin vetoed the approval. Fold it into the existing
-            # rejection/retry handling below — same loop, same eventual
-            # after_feature_failed if retries run out — so no new states
-            # or failure paths are introduced for this to work.
-            rejection_reason = gate_block.get("reason") or "Approval blocked by a governance plugin."
-            _log("harness", "VERDICT_GATE_BLOCKED",
-                 f"feature={feature_id} attempt={attempt}/{MAX_RETRIES_REVIEW} "
-                 f"plugin={gate_block.get('plugin', '?')} reason={rejection_reason[:150]}",
-                 level="warning")
-            if attempt < MAX_RETRIES_REVIEW:
-                _vprint("normal", Panel(
-                    f"[red]Approval blocked by a governance plugin — retry {attempt+1}/{MAX_RETRIES_REVIEW}[/]\n"
-                    f"[dim]{rejection_reason[:200]}[/]",
-                    title=f"[red]🚧 gate vetoed verdict — feature #{feature_id}[/]",
-                    border_style="red", padding=(0, 1)
-                ))
-            continue
-
-        # rejection_reason was already set above by _reviewer_verdict()
-        _log("harness", "CYCLE_RETRY",
-             f"feature={feature_id} attempt={attempt}/{MAX_RETRIES_REVIEW} reason={rejection_reason[:100]}",
+        # A plugin vetoed the approval. Fold it into the existing
+        # rejection/retry handling below — same loop, same eventual
+        # after_feature_failed if retries run out — so no new states
+        # or failure paths are introduced for this to work.
+        rejection_reason = gate_block.get("reason") or "Approval blocked by a governance plugin."
+        _log("harness", "VERDICT_GATE_BLOCKED",
+             f"feature={feature_id} attempt={attempt}/{MAX_RETRIES_REVIEW} "
+             f"plugin={gate_block.get('plugin', '?')} reason={rejection_reason[:150]}",
              level="warning")
-        _fire("after_reviewer_rejected",
-              feature_id=feature_id, description=description,
-              attempt=attempt, max_attempts=MAX_RETRIES_REVIEW,
-              rejection_reason=rejection_reason)
         if attempt < MAX_RETRIES_REVIEW:
             _vprint("normal", Panel(
-                f"[yellow]Reviewer rejected — retry {attempt+1}/{MAX_RETRIES_REVIEW}[/]\n"
+                f"[red]Approval blocked by a governance plugin — retry {attempt+1}/{MAX_RETRIES_REVIEW}[/]\n"
                 f"[dim]{rejection_reason[:200]}[/]",
-                title=f"[yellow]↻ impl→e2e→review cycle — feature #{feature_id}[/]",
-                border_style="yellow", padding=(0, 1)
+                title=f"[red]🚧 gate vetoed verdict — feature #{feature_id}[/]",
+                border_style="red", padding=(0, 1)
             ))
 
     final_verdict = f"{VERDICT_REJECTED} after {MAX_RETRIES_REVIEW} attempts: {rejection_reason}"
@@ -3599,7 +3630,7 @@ def main():
     budget_label = f"[yellow]USD {COST_BUDGET_USD:.2f} limit[/]" if COST_BUDGET_USD > 0 else "[dim]no limit[/]"
     console.print(
         f"  Model: [cyan]{MODEL}[/]  |  Orchestrator: {orch_label}  |  Budget: {budget_label}  |  Verbosity: [cyan]{HARNESS_VERBOSITY}[/]\n"
-        f"  Flow: [green]👑 Leader[/] → [cyan]📋 Spec[/] → [blue]🔨 Impl[/] → [yellow]🧪 E2E[/] → [magenta]🔍 Reviewer[/]\n"
+        f"  Flow: [green]👑 Leader[/] → [cyan]📋 Spec[/] → [blue]🔨 Impl[/] → [magenta]🔍 Reviewer[/] → [yellow]🧪 E2E[/]\n"
         f"  [dim]Commands: /quit | /status | /features | /costs | /budget | /verbosity | /auto [id][/]"
     )
     console.rule(style="dim")

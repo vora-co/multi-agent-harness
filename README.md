@@ -43,14 +43,16 @@ You → define features in feature_list.json
          ↓
     🔨 Implementer   — writes the code and tests following the spec
          ↓
-    🧪 E2E Tester    — runs Playwright browser tests (only if e2e: true)
-         ↓
     🔍 Reviewer      — validates tests pass and approves or rejects
+         ↓
+    🧪 E2E Tester    — runs Playwright browser tests (only if e2e: true)
          ↓
     ✅ Feature marked done — Leader moves to the next one
 ```
 
-If the Reviewer rejects, the Implementer retries with the rejection reason injected. The harness retries up to `MAX_RETRIES_REVIEW` times before marking a feature as `failed`.
+Review runs before E2E — the cheap, purely-static check happens before the most expensive step in the cycle (E2E force-recreates the environment, does a cold compile, and drives a real browser), so an ordinary reviewer rejection never wastes a full Playwright cycle it never needed.
+
+If the Reviewer rejects, the Implementer retries with the rejection reason injected. If E2E fails after an approved review, the Implementer also retries — and the fix is re-reviewed before E2E runs again. The harness retries up to `MAX_RETRIES_REVIEW` times before marking a feature as `failed`.
 
 ---
 
@@ -671,6 +673,9 @@ Active development continues in the premium edition. See the [⭐ Premium module
 ---
 
 ## Changelog
+
+### v1.42.0
+- **Reordered the feature cycle: impl → review → E2E (was impl → E2E → review), closing ARCHITECTURE_REVIEW §8.C.** E2E is by far the most expensive step in the cycle (force-recreate + cold compile + real browser), but it used to run *before* the cheap, purely-static review check — every ordinary reviewer rejection wasted a full Playwright cycle it never needed. `_run_feature_cycle_impl` now runs the Reviewer right after the Implementer; only once review approves does E2E run at all. New checkpoint step `CKPT_REVIEW_DONE` ("review_done") sits between `impl_done` and `e2e_done` in the resumability progression (`_save_checkpoint`'s `_CheckpointSchema.step` is a bare `str`, so no schema change needed) — resuming from `review_done` skips straight to E2E; resuming from `e2e_done` now means *both* review and E2E already passed this attempt (E2E moved to last), so it skips everything and goes straight to finalizing, unlike the old order where `e2e_done` meant "run the reviewer next." The `before_approval_finalized` gate (used by the premium Human-in-the-loop-gates plugin) moved from firing right after review to firing only after E2E also passes, so a governance plugin can never finalize a feature whose E2E never ran. An E2E failure still retries the Implementer, and — new behavior, deliberate — the fix gets re-reviewed before E2E runs again, since a change made in response to an E2E failure can itself introduce something review would have caught. Updated the `tests/test_resumability.py` cases that encoded the old order's checkpoint semantics (`e2e_done` used to mean "run the reviewer next"; now means "everything already passed") and added `tests/test_harness_core.py::TestImplReviewE2eOrder` (4 new tests, e2e=True throughout — the only way to observe step order) proving a review rejection never reaches `spawn_e2e_tester`, the gate fires only post-E2E, a gate veto happens after E2E already ran (so the Playwright cost isn't "saved" by a later veto), and an E2E failure re-pays review on retry. Also updated the REPL banner, `README.md`'s "How it works" diagram, and `CLAUDE.md`'s architecture summary to reflect the new order.
 
 ### v1.41.0
 - **`spawn_e2e_tester` injects previous-attempt evidence into a retry's task — the E2E-side counterpart to `spawn_implementer`'s own `RETRY #{attempt}` block.** Real incident, feature #74: attempt 2's log showed the same 3 files re-read and the same test re-run 3 times before hitting `max_iter` again, because the retry task was byte-for-byte identical to attempt 1's — `CONVERGENCE_RULE` already tells the agent to apply an injected diagnosis directly instead of re-deriving it, but nothing on the E2E side was actually injecting one. New `_e2e_retry_evidence_block(feature_id)`, called on `attempt > 1` and — critically — *before* the existing stale-report cleanup (v1.31.0) deletes `progress/e2e_<id>.json`, since at that point whatever's on disk is guaranteed to be the previous attempt's real evidence (or the harness-synthesized one from the v1.38.0 max_iter fallback). Builds a bounded, deterministic `⚠️ PREVIOUS E2E ATTEMPT FAILED — evidence:` block from that report's `"reason"` field, plus a `WHAT THE IMPLEMENTER CHANGED IN RESPONSE:` block combining `files_touched` from the retry's own `impl_<id>.json` (structured, reliable) with a bounded tail (last 1200 chars) of `impl_<id>.md`'s prose (design decisions, written last per the implementer's own PROTOCOL) — closing with "Start by re-running the exact failing test — do not re-derive context the evidence above already gives you." Returns `""` when neither source has anything (first real attempt, or truly nothing on disk), so task-building is never blocked. 5 new tests in `tests/test_harness_core.py::TestE2eRetryEvidenceBlock`, including one asserting the evidence survives being read before the cleanup step that deletes its source file.

@@ -260,6 +260,8 @@ class TestRunFeatureCycleResume:
         h.spawn_implementer.assert_called_once()
 
     def test_impl_done_checkpoint_skips_spec_and_impl(self, monkeypatch, tmp_path):
+        # Cycle order is impl -> review -> E2E (v1.42.0) — impl_done's next
+        # step is review, same adjacency this test already exercised.
         _make_feature_list(tmp_path, extra_fields={
             "_checkpoint": {"step": "impl_done", "attempt": 1, "saved_at": "x"}
         })
@@ -275,7 +277,30 @@ class TestRunFeatureCycleResume:
         h.spawn_implementer.assert_not_called()
         h.spawn_reviewer.assert_called_once()
 
-    def test_e2e_done_checkpoint_skips_to_reviewer(self, monkeypatch, tmp_path):
+    def test_review_done_checkpoint_skips_to_e2e(self, monkeypatch, tmp_path):
+        # New checkpoint step (v1.42.0): review already approved this
+        # attempt, only E2E (now the last validation) remains.
+        _make_feature_list(tmp_path, extra_fields={
+            "_checkpoint": {"step": "review_done", "attempt": 1, "saved_at": "x"}
+        })
+        (tmp_path / "progress").mkdir(exist_ok=True)
+        (tmp_path / "progress" / "spec_1.md").write_text("spec")
+
+        h = _load_harness(monkeypatch, tmp_path)
+        self._patch_cycle(h, monkeypatch)
+
+        result = h.run_feature_cycle(1, "desc", e2e=True)
+
+        h.spawn_spec_writer.assert_not_called()
+        h.spawn_implementer.assert_not_called()
+        h.spawn_reviewer.assert_not_called()
+        h.spawn_e2e_tester.assert_called_once()
+        assert result["approved"] is True
+
+    def test_e2e_done_checkpoint_skips_everything_and_finalizes(self, monkeypatch, tmp_path):
+        # e2e_done now means BOTH review and E2E already passed this attempt
+        # (E2E moved to run last, v1.42.0) — resuming from it must not
+        # re-run the reviewer, unlike the old impl -> E2E -> review order.
         _make_feature_list(tmp_path, extra_fields={
             "_checkpoint": {"step": "e2e_done", "attempt": 1, "saved_at": "x"}
         })
@@ -285,12 +310,13 @@ class TestRunFeatureCycleResume:
         h = _load_harness(monkeypatch, tmp_path)
         self._patch_cycle(h, monkeypatch)
 
-        h.run_feature_cycle(1, "desc", e2e=True)
+        result = h.run_feature_cycle(1, "desc", e2e=True)
 
         h.spawn_spec_writer.assert_not_called()
         h.spawn_implementer.assert_not_called()
+        h.spawn_reviewer.assert_not_called()
         h.spawn_e2e_tester.assert_not_called()
-        h.spawn_reviewer.assert_called_once()
+        assert result["approved"] is True
 
     def test_checkpoint_cleared_on_approval(self, monkeypatch, tmp_path):
         _make_feature_list(tmp_path)

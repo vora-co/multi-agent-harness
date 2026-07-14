@@ -1,7 +1,7 @@
 # CLAUDE.md — Project Context
 
 ## What this is
-A multi-agent harness built on DeepSeek API that automatically builds web applications feature by feature. Five agents: Leader → Spec Writer → Implementer → E2E Tester → Reviewer.
+A multi-agent harness built on DeepSeek API that automatically builds web applications feature by feature. Five agents: Leader → Spec Writer → Implementer → Reviewer → E2E Tester. (Review runs before E2E — the cheap, purely-static check happens before the most expensive step in the cycle, so an ordinary reviewer rejection never wastes a full Playwright cycle.)
 
 ## Key commands
 ```bash
@@ -31,8 +31,10 @@ progress/           # Reports per feature (spec_N.md, impl_N.md, review_N.md)
 ## How to use the harness
 ```
 python3 harness.py
-You → process all pending features     # process all in order
-You → run only feature 2 and stop      # run a specific feature
+You → process all pending features     # process all in order (via the Leader-LLM)
+You → run only feature 2 and stop      # run a specific feature (via the Leader-LLM)
+/auto       # deterministic equivalent of "process all pending features" — no LLM orchestration
+/auto 2     # deterministic equivalent of running just feature 2
 /features   # view status
 /costs      # token costs
 ```

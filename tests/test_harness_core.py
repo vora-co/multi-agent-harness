@@ -748,6 +748,78 @@ class TestAfterReviewerRejectedHook:
         assert len(self._calls_for(fire_mock, "after_feature_approved")) == 1
 
 
+class TestImplReviewE2eOrder:
+    """
+    ARCHITECTURE_REVIEW §8.C: the cycle used to run impl -> E2E -> review,
+    so every ordinary reviewer rejection wasted a full Playwright cycle
+    (force-recreate + cold compile + browser) it never needed. Now
+    impl -> review -> E2E, with the before_approval_finalized gate moved to
+    fire only after BOTH have passed. All tests here use e2e=True — the
+    only way to observe step order — unlike most other cycle tests in this
+    file, which use e2e=False and are therefore order-agnostic.
+    """
+
+    def _patch_cycle(self, h, monkeypatch, *, review_results, e2e_results=None, gate_result=None):
+        monkeypatch.setattr(h, "spawn_spec_writer", MagicMock(return_value="progress/spec_1.md"))
+        monkeypatch.setattr(h, "spawn_implementer", MagicMock(return_value="ok"))
+        monkeypatch.setattr(h, "spawn_e2e_tester",
+                             MagicMock(side_effect=e2e_results or ["E2E_PASSED"] * len(review_results)))
+        monkeypatch.setattr(h, "spawn_reviewer", MagicMock(side_effect=review_results))
+        monkeypatch.setattr(h, "_fire", MagicMock())
+        monkeypatch.setattr(h, "_fire_gate", MagicMock(return_value=gate_result))
+        monkeypatch.setattr(h, "_track_usage", MagicMock())
+
+    def test_review_rejection_never_calls_e2e_tester(self, monkeypatch, tmp_path):
+        (tmp_path / "progress").mkdir(exist_ok=True)
+        h = _load_harness(monkeypatch, tmp_path, {"MAX_RETRIES_REVIEW": "2"})
+        self._patch_cycle(h, monkeypatch, review_results=["REJECTED: bad code", "APPROVED"])
+
+        result = h.run_feature_cycle(1, "desc", e2e=True)
+
+        assert result["approved"] is True
+        assert h.spawn_reviewer.call_count == 2
+        # E2E only ran once — for the attempt whose review actually passed.
+        assert h.spawn_e2e_tester.call_count == 1
+
+    def test_gate_fires_only_after_e2e_passes(self, monkeypatch, tmp_path):
+        (tmp_path / "progress").mkdir(exist_ok=True)
+        h = _load_harness(monkeypatch, tmp_path)
+        self._patch_cycle(h, monkeypatch, review_results=["APPROVED"])
+
+        result = h.run_feature_cycle(1, "desc", e2e=True)
+
+        assert result["approved"] is True
+        h.spawn_e2e_tester.assert_called_once()  # E2E ran before the gate could finalize
+        h._fire_gate.assert_called_once()
+        assert h._fire_gate.call_args.kwargs["review_result"] == "APPROVED"
+
+    def test_gate_veto_happens_after_e2e_already_ran(self, monkeypatch, tmp_path):
+        (tmp_path / "progress").mkdir(exist_ok=True)
+        h = _load_harness(monkeypatch, tmp_path, {"MAX_RETRIES_REVIEW": "1"})
+        self._patch_cycle(h, monkeypatch, review_results=["APPROVED"],
+                           gate_result={"plugin": "governance", "reason": "policy block"})
+
+        result = h.run_feature_cycle(1, "desc", e2e=True)
+
+        assert result["approved"] is False
+        h.spawn_e2e_tester.assert_called_once()  # already paid for by the time the gate vetoed
+
+    def test_e2e_failure_retries_and_repays_review(self, monkeypatch, tmp_path):
+        (tmp_path / "progress").mkdir(exist_ok=True)
+        h = _load_harness(monkeypatch, tmp_path, {"MAX_RETRIES_REVIEW": "2"})
+        self._patch_cycle(
+            h, monkeypatch,
+            review_results=["APPROVED", "APPROVED"],
+            e2e_results=["E2E_FAILED: timeout", "E2E_PASSED"],
+        )
+
+        result = h.run_feature_cycle(1, "desc", e2e=True)
+
+        assert result["approved"] is True
+        assert h.spawn_reviewer.call_count == 2  # re-reviewed after the E2E-driven retry
+        assert h.spawn_e2e_tester.call_count == 2
+
+
 class TestRunAllPending:
     """
     /auto's underlying driver: a code-level alternative to the Leader-LLM
