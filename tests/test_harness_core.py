@@ -1841,7 +1841,68 @@ class TestSpecWriterStaleE2eCache:
         assert calls == []  # no stack_profiles.json → no other profiles to compare → reused as-is
 
 
+class TestTruncateHeadTail:
+    """
+    Regression coverage: _validate_spec used to send only spec_content[:3000]
+    to the review call, cutting the tests/notes section out of any
+    non-trivial spec entirely — spec_74.md's wrong E2E test directory lived
+    exactly there, in the section the flat head-only truncation discarded.
+    """
+
+    def test_short_text_is_returned_unchanged(self, monkeypatch, tmp_path):
+        h = _load_harness(monkeypatch, tmp_path)
+        text = "short spec content"
+        assert h._truncate_head_tail(text) == text
+
+    def test_text_at_exact_combined_limit_is_unchanged(self, monkeypatch, tmp_path):
+        h = _load_harness(monkeypatch, tmp_path)
+        text = "x" * 12000
+        assert h._truncate_head_tail(text, head_chars=6000, tail_chars=6000) == text
+
+    def test_long_text_keeps_head_and_tail_with_marker(self, monkeypatch, tmp_path):
+        h = _load_harness(monkeypatch, tmp_path)
+        text = "HEAD_MARKER" + ("m" * 20000) + "TAIL_MARKER"
+
+        result = h._truncate_head_tail(text, head_chars=6000, tail_chars=6000)
+
+        assert result.startswith("HEAD_MARKER")
+        assert result.endswith("TAIL_MARKER")
+        assert "[...middle truncated...]" in result
+        assert len(result) < len(text)
+
+    def test_custom_bounds_are_respected(self, monkeypatch, tmp_path):
+        h = _load_harness(monkeypatch, tmp_path)
+        text = "a" * 100 + "b" * 100
+        result = h._truncate_head_tail(text, head_chars=10, tail_chars=10)
+        assert result.startswith("a" * 10)
+        assert result.endswith("b" * 10)
+        assert "aaaaaaaaaaa" not in result.split("[...middle truncated...]")[0]
+
+
 class TestValidateSpecStackAware:
+    def test_sends_head_and_tail_of_long_spec(self, monkeypatch, tmp_path):
+        # Regression: the old spec_content[:3000] cutoff would have dropped
+        # the "## Tests" section of any spec longer than 3000 chars entirely.
+        h = _load_harness(monkeypatch, tmp_path)
+        (tmp_path / "progress").mkdir(exist_ok=True)
+        spec_path = tmp_path / "progress" / "spec_1.md"
+        long_body = "x" * 20000
+        spec_path.write_text(f"## Files to touch\nHEADER_SECTION\n{long_body}\n## Tests\nTAIL_SECTION")
+
+        captured = {}
+
+        def fake_call(model, messages, tools, role):
+            captured["messages"] = messages
+            return None
+        monkeypatch.setattr(h, "_call_api_with_fallback", fake_call)
+
+        h._validate_spec(str(spec_path))
+
+        user_msg = captured["messages"][1]["content"]
+        assert "HEADER_SECTION" in user_msg
+        assert "TAIL_SECTION" in user_msg
+        assert "[...middle truncated...]" in user_msg
+
     def test_uses_code_tree_dirs_not_hardcoded_src_tests(self, monkeypatch, tmp_path):
         # _validate_spec previously hardcoded _file_tree("src") / _file_tree("tests")
         # instead of the stack-resolved CODE_TREE_DIRS every other spawn_*

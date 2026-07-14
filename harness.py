@@ -2404,6 +2404,25 @@ def _load_plugins() -> None:
 
 # ─── SPEC VALIDATION ─────────────────────────────────────────────────────────
 
+def _truncate_head_tail(text: str, head_chars: int = 6000, tail_chars: int = 6000) -> str:
+    """
+    Truncate text to its first head_chars + last tail_chars, joined by a
+    "[...middle truncated...]" marker, when it exceeds head_chars + tail_chars
+    combined. Returns text unchanged otherwise (never inserts the marker into
+    text short enough to not need truncating).
+
+    Used by _validate_spec on the spec content it sends for review: a bare
+    head-only [:3000] truncation cut the tests/notes section out of any
+    non-trivial spec entirely — spec_74.md's wrong E2E test directory lived
+    exactly there. The header (files to touch) and the tail (tests, notes)
+    are the sections with the most detectable issues, so keeping both ends
+    catches far more than extending a single head-only cutoff would.
+    """
+    if len(text) <= head_chars + tail_chars:
+        return text
+    return f"{text[:head_chars]}\n\n[...middle truncated...]\n\n{text[-tail_chars:]}"
+
+
 def _validate_spec(spec_path: str) -> str:
     """
     Cross-check a freshly generated spec against the existing codebase using a
@@ -2460,7 +2479,7 @@ def _validate_spec(spec_path: str) -> str:
                 {
                     "role": "user",
                     "content": (
-                        f"Spec to review:\n{spec_content[:3000]}\n\n"
+                        f"Spec to review:\n{_truncate_head_tail(spec_content)}\n\n"
                         f"{tree_sections}\n\n"
                         "List only concrete issues: wrong file paths, conflicting interfaces, "
                         "duplicate responsibilities, or missing prerequisite files. "
