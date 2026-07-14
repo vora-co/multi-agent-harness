@@ -1459,6 +1459,16 @@ def _tool_call_name_args(tc):
     return tc.function.name, tc.function.arguments
 
 
+def _msg_tool_call_id(tc) -> Optional[str]:
+    """Uniformly read a tool_call's id off a call that can be dict or pydantic."""
+    if isinstance(tc, dict):
+        return tc.get("id")
+    return getattr(tc, "id", None)
+
+
+_DIGEST_MAX_CHARS = 4000  # hard cap on the whole digest string — see _build_deterministic_digest
+
+
 def _build_deterministic_digest(middle: list) -> str:
     """
     Build a digest of the middle message block by extracting facts directly
@@ -1471,10 +1481,32 @@ def _build_deterministic_digest(middle: list) -> str:
     covered, burning iterations until max_iter was hit without ever reaching
     a verdict. A deterministic list of tool calls/errors/decisions can't lose
     that information the way a lossy rewrite can.
+
+    That first fix (calls-only) turned out to have the same failure mode one
+    level down: it told the agent "don't repeat these calls" but discarded
+    every result, so there was nothing to act on except repeating them
+    anyway — confirmed on feature 74's log, where every compaction was
+    followed by re-reading the same 3 files. This version keeps bounded,
+    deterministic content per result alongside the call list: the most
+    recent read_file excerpt per unique path (a re-read of the same path
+    overwrites the earlier excerpt — only the latest content matters), the
+    tail of the last run_playwright_tests output, and the head of any
+    grep-shaped run_bash output. Still no LLM call, still nothing
+    paraphrased — just more of the real bytes survive compaction. The whole
+    digest is capped at _DIGEST_MAX_CHARS regardless, since a richer digest
+    still has to fit the context window it was built to protect.
     """
     decisions: list = []
     calls: list = []
     errors: list = []
+    file_excerpts: dict = {}   # path -> most recent read_file content excerpt
+    playwright_tail = ""       # tail of the last run_playwright_tests output
+    grep_heads: list = []      # (command preview, first ~5 stdout lines) per grep-shaped run_bash call
+
+    # tool_call_id -> (fn_name, fn_args) from the assistant message that made
+    # the call, so the "tool" result message that follows (correlated via its
+    # own tool_call_id) can be attributed back to what actually produced it.
+    call_by_id: dict = {}
 
     for m in middle:
         role = (_msg_field(m, "role", "") or "").lower()
@@ -1486,6 +1518,9 @@ def _build_deterministic_digest(middle: list) -> str:
             for tc in _msg_tool_calls(m):
                 name, args = _tool_call_name_args(tc)
                 calls.append(f"{name}({str(args)[:120]})")
+                tc_id = _msg_tool_call_id(tc)
+                if tc_id:
+                    call_by_id[tc_id] = (name, args)
 
         elif role == "tool":
             content = _msg_field(m, "content", "") or ""
@@ -1493,6 +1528,7 @@ def _build_deterministic_digest(middle: list) -> str:
                 content = json.dumps(content, ensure_ascii=False)
             content = str(content)
             flagged = False
+            parsed = None
             try:
                 parsed = json.loads(content)
                 if isinstance(parsed, dict) and "error" in parsed:
@@ -1502,6 +1538,29 @@ def _build_deterministic_digest(middle: list) -> str:
                 pass
             if not flagged and ("traceback" in content.lower() or "exception" in content.lower()):
                 errors.append(content[:200])
+
+            fn_name, fn_args = call_by_id.get(_msg_field(m, "tool_call_id", None), (None, None))
+            if flagged or fn_name is None:
+                continue
+            try:
+                parsed_args = json.loads(fn_args) if isinstance(fn_args, str) else (fn_args or {})
+            except Exception:
+                parsed_args = {}
+
+            if fn_name == "read_file" and isinstance(parsed, dict) and "content" in parsed:
+                path = (parsed_args.get("path") or parsed_args.get("file_path")
+                        or parsed_args.get("file") or parsed_args.get("filename") or parsed.get("path"))
+                if path:
+                    file_excerpts[path] = str(parsed["content"])[:300]
+
+            elif fn_name == "run_playwright_tests" and isinstance(parsed, dict) and "output" in parsed:
+                playwright_tail = str(parsed["output"])[-500:]
+
+            elif fn_name == "run_bash" and "grep" in str(parsed_args.get("command", "")):
+                stdout = parsed.get("stdout", "") if isinstance(parsed, dict) else ""
+                head = "\n".join(str(stdout).splitlines()[:5])
+                if head:
+                    grep_heads.append((str(parsed_args.get("command", ""))[:80], head))
 
     lines = ["## Previous context summary (deterministic — extracted directly from messages, not LLM-rewritten)"]
     lines.append(f"- {len(calls)} tool call(s) already executed in this block, {len(errors)} returned an error.")
@@ -1524,7 +1583,24 @@ def _build_deterministic_digest(middle: list) -> str:
         for d in decisions[-10:]:
             lines.append(f"  - {d}")
 
-    return "\n".join(lines)
+    if file_excerpts:
+        lines.append("### Key file contents already seen (most recent read per path — do NOT re-read unless the file may have changed):")
+        for path, excerpt in file_excerpts.items():
+            lines.append(f"  - {path}:\n    {excerpt}")
+
+    if playwright_tail:
+        lines.append("### Last run_playwright_tests output (tail):")
+        lines.append(f"  {playwright_tail}")
+
+    if grep_heads:
+        lines.append("### Recent run_bash grep results (first lines):")
+        for cmd, head in grep_heads[-5:]:
+            lines.append(f"  - {cmd}:\n    {head}")
+
+    digest = "\n".join(lines)
+    if len(digest) > _DIGEST_MAX_CHARS:
+        digest = digest[:_DIGEST_MAX_CHARS] + "\n... [digest truncated at ~4KB cap] ..."
+    return digest
 
 
 def _compact_messages(messages: list, role: str) -> list:

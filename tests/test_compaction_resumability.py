@@ -130,6 +130,121 @@ class TestBuildDeterministicDigest:
         assert "step0" not in digest        # oldest dropped once over the cap
 
 
+class TestDigestRetainsBoundedContent:
+    """
+    Regression coverage for feature 74: the digest listed call signatures
+    ("read_file(...)") but discarded every result, so "don't repeat this
+    call" left the agent nothing to act on except repeating it — confirmed
+    on the feature 74 log, where every compaction was followed by re-reading
+    the same 3 files. This version keeps bounded, deterministic content per
+    result alongside the call list.
+    """
+
+    def _read_pair(self, call_id, path, content):
+        return [
+            SimpleNamespace(
+                role="assistant", content="",
+                tool_calls=[self._call(call_id, "read_file", json.dumps({"path": path}))],
+            ),
+            {"role": "tool", "tool_call_id": call_id,
+             "content": json.dumps({"content": content, "path": path})},
+        ]
+
+    def _call(self, call_id, name, args_json):
+        return _fake_tool_call(call_id, name, args_json)
+
+    def test_read_file_excerpt_is_kept(self, monkeypatch, tmp_path):
+        harness = _load_harness(monkeypatch, tmp_path)
+        middle = self._read_pair("c1", "src/models/user.py", "class User:\n    id: int\n")
+
+        digest = harness._build_deterministic_digest(middle)
+
+        assert "Key file contents already seen" in digest
+        assert "src/models/user.py" in digest
+        assert "class User" in digest
+
+    def test_only_most_recent_read_of_a_path_is_kept(self, monkeypatch, tmp_path):
+        harness = _load_harness(monkeypatch, tmp_path)
+        middle = (
+            self._read_pair("c1", "src/models/user.py", "OLD CONTENT before edit")
+            + self._read_pair("c2", "src/models/user.py", "NEW CONTENT after edit")
+        )
+
+        digest = harness._build_deterministic_digest(middle)
+
+        assert "NEW CONTENT after edit" in digest
+        assert "OLD CONTENT before edit" not in digest
+
+    def test_read_file_excerpt_is_bounded_to_300_chars(self, monkeypatch, tmp_path):
+        harness = _load_harness(monkeypatch, tmp_path)
+        middle = self._read_pair("c1", "src/big.py", "x" * 5000)
+
+        digest = harness._build_deterministic_digest(middle)
+
+        assert "x" * 300 in digest
+        assert "x" * 301 not in digest
+
+    def test_playwright_output_tail_is_kept(self, monkeypatch, tmp_path):
+        harness = _load_harness(monkeypatch, tmp_path)
+        middle = [
+            SimpleNamespace(
+                role="assistant", content="",
+                tool_calls=[self._call("c1", "run_playwright_tests", '{"test_path": "tests/e2e/"}')],
+            ),
+            {"role": "tool", "tool_call_id": "c1",
+             "content": json.dumps({"output": "old irrelevant stuff " + "y" * 600 + "TimeoutError: #prof-name"})},
+        ]
+
+        digest = harness._build_deterministic_digest(middle)
+
+        assert "Last run_playwright_tests output" in digest
+        assert "TimeoutError: #prof-name" in digest  # tail survives
+        assert "old irrelevant stuff" not in digest   # head was truncated away
+
+    def test_grep_run_bash_head_lines_are_kept(self, monkeypatch, tmp_path):
+        harness = _load_harness(monkeypatch, tmp_path)
+        stdout = "\n".join([f"match{i}" for i in range(20)])
+        middle = [
+            SimpleNamespace(
+                role="assistant", content="",
+                tool_calls=[self._call("c1", "run_bash", json.dumps({"command": "grep -rn foo src/"}))],
+            ),
+            {"role": "tool", "tool_call_id": "c1",
+             "content": json.dumps({"stdout": stdout, "returncode": 0})},
+        ]
+
+        digest = harness._build_deterministic_digest(middle)
+
+        assert "match0" in digest and "match4" in digest
+        assert "match5" not in digest  # only first ~5 lines kept
+
+    def test_non_grep_run_bash_is_not_captured(self, monkeypatch, tmp_path):
+        harness = _load_harness(monkeypatch, tmp_path)
+        middle = [
+            SimpleNamespace(
+                role="assistant", content="",
+                tool_calls=[self._call("c1", "run_bash", json.dumps({"command": "python3 -m pytest tests/"}))],
+            ),
+            {"role": "tool", "tool_call_id": "c1",
+             "content": json.dumps({"stdout": "2 passed", "returncode": 0})},
+        ]
+
+        digest = harness._build_deterministic_digest(middle)
+
+        assert "Recent run_bash grep results" not in digest
+
+    def test_digest_is_capped_at_roughly_4kb(self, monkeypatch, tmp_path):
+        harness = _load_harness(monkeypatch, tmp_path)
+        middle = []
+        for i in range(30):
+            middle += self._read_pair(f"c{i}", f"src/file_{i}.py", "z" * 300)
+
+        digest = harness._build_deterministic_digest(middle)
+
+        assert len(digest) <= harness._DIGEST_MAX_CHARS + len("\n... [digest truncated at ~4KB cap] ...")
+        assert "truncated at ~4KB cap" in digest
+
+
 # ── _compact_messages no longer calls the LLM ────────────────────────────────
 
 class TestCompactMessagesIsDeterministic:
