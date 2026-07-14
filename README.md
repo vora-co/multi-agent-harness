@@ -217,7 +217,7 @@ You → process all pending features
 | `/auto` | Deterministic, code-level equivalent of "process all pending features" — no LLM orchestration, no `MAX_ITER_LEADER` ceiling. See [Deterministic batch driver](#deterministic-batch-driver) |
 | `/auto <id>` | Runs just feature `<id>` (must be `pending`) the same way |
 | `/features` | Shows the status of all features |
-| `/costs` | Shows token usage and estimated cost for this session |
+| `/costs` | Shows token usage and estimated cost for this session, plus a per-feature cost breakdown table (highest-spend first) |
 | `/budget` | Shows current spend vs. budget limit with a progress bar |
 | `/status` | Shows the current state (progress/current.md) |
 | `/verbosity [summary\|normal\|verbose]` | Shows or changes the active console verbosity tier for the rest of the session. See [Console verbosity](#console-verbosity) |
@@ -291,6 +291,7 @@ Key settings in `harness.py`:
 | `MODEL_BY_ROLE` | see below | Per-agent model overrides — edit to tune cost vs. quality |
 | `ORCHESTRATOR` | `local` | Execution mode: `local` (plain Python) or `prefect` (dashboard + scheduling) |
 | `COST_BUDGET_USD` | `0` | Max USD spend per session. `0` disables enforcement. Example: `COST_BUDGET_USD=2.00` |
+| `FEATURE_BUDGET_USD` | `0` | Max USD spend on a *single* feature (across all its retries), independent of `COST_BUDGET_USD`. `0` disables enforcement. Example: `FEATURE_BUDGET_USD=0.50` |
 | `MAX_ITER_LEADER` | `30` | Max iterations for the Leader agent |
 | `MAX_ITER_IMPL` | `50` | Max iterations for the Implementer |
 | `MAX_ITER_REVIEWER` | `40` | Max iterations for the Reviewer |
@@ -673,6 +674,9 @@ Active development continues in the premium edition. See the [⭐ Premium module
 ---
 
 ## Changelog
+
+### v1.44.0
+- **Per-feature cost tracking, plus an optional `FEATURE_BUDGET_USD` cutoff.** `COST_BUDGET_USD` is a global session limit — one pathological feature (feature #74's 2 full 50-iteration E2E cycles) can consume the entire session's budget with no mechanism ever noticing at the per-feature level. `_track_usage` now also accumulates into a new `_FEATURE_COSTS` dict, keyed by `_CURRENT_FEATURE_ID.get()` (the same contextvar already set for the duration of `run_feature_cycle` for structured logging — see the v1.20.0-ish structured-logging entry) whenever it's not `None`; calls made outside a feature cycle (Leader coordination turns, `_validate_spec`) aren't attributed to any feature, same as they already weren't in the by-role breakdown. New `_feature_cost_usd(feature_id)` helper. `progress/session_costs.json` gains a `per_feature` key (keyed by feature_id as a string, JSON-object-key convention) alongside the existing `by_role`/`totals`/`cache`. `/costs` now also prints a `Cost by feature` table (ID, title, calls, tokens, cost — sorted highest-spend first, red-highlighted once a feature crosses `FEATURE_BUDGET_USD`) via new `_print_per_feature_costs()`, which no-ops if no feature has made a tracked call yet. Optional extension in the same change: new `FEATURE_BUDGET_USD` env var (`0` disables, same convention as `COST_BUDGET_USD`) — checked at the top of every retry attempt in `_run_feature_cycle_impl` (not just once per cycle, since the point is cutting a feature off mid-retry the moment it crosses the line, not after paying for one more full impl→review→E2E attempt); once a feature's accumulated cost meets or exceeds it, the cycle stops immediately with a `[FEATURE_BUDGET_EXCEEDED]` `final_verdict`, clears the checkpoint, and fires `after_feature_failed` — same pattern the existing session-level budget guard already uses. 8 new tests (`TestPerFeatureCostTracking`, `TestFeatureBudgetCutoff`).
 
 ### v1.43.0
 - **`_build_deterministic_digest` now keeps bounded content per result, not just the call list.** The v1.19.0-ish deterministic-digest fix (see the compaction-resumability section) replaced an LLM-summarized compaction with a factual list of "tool calls already made" — but the list only ever recorded call *signatures*, discarding every result. The digest told the agent "don't repeat these calls," then removed the only thing that would let it act on that instruction, forcing exactly the repetition it prohibited — confirmed on feature 74's log, where every compaction was followed by re-reading the same 3 files. Now correlates each `"tool"` result message back to the assistant call that produced it (via `tool_call_id`, a new `call_by_id` map built while walking the block) and retains, deterministically and boundedly: (a) the most recent `read_file` excerpt per unique path (~300 chars, head-truncated; a re-read of the same path overwrites the earlier excerpt — only the latest content survives) under a new "Key file contents already seen" section; (b) the tail (~500 chars) of the last `run_playwright_tests` `"output"`, since the traceback that matters is usually at the end; (c) the first ~5 stdout lines of any grep-shaped `run_bash` call (`"grep"` in the command string). Still no LLM call and nothing paraphrased — just more of the real bytes survive compaction. The whole digest is capped at a new `_DIGEST_MAX_CHARS = 4000` regardless of how much bounded content accumulates, since a richer digest still has to fit the context window it exists to protect. 7 new tests in `tests/test_compaction_resumability.py::TestDigestRetainsBoundedContent`.

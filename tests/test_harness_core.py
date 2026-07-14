@@ -361,6 +361,131 @@ class TestBudgetEnforcement:
         assert h._BUDGET_EXCEEDED is False
 
 
+class TestPerFeatureCostTracking:
+    """
+    COST_BUDGET_USD is global — one pathological feature (feature #74's 2
+    full 50-iteration E2E cycles) can consume the whole session budget with
+    nothing per-feature ever noticing. _track_usage now also accumulates
+    into _FEATURE_COSTS, keyed by _CURRENT_FEATURE_ID (the same contextvar
+    already set for the duration of run_feature_cycle for structured
+    logging).
+    """
+
+    def _make_usage(self, prompt_tokens=0, completion_tokens=0):
+        from types import SimpleNamespace
+        return SimpleNamespace(prompt_tokens=prompt_tokens, completion_tokens=completion_tokens)
+
+    def test_accumulates_under_current_feature_id(self, monkeypatch, tmp_path):
+        h = _load_harness(monkeypatch, tmp_path)
+        token = h._CURRENT_FEATURE_ID.set(74)
+        try:
+            h._track_usage("e2e_tester", self._make_usage(1000, 500))
+        finally:
+            h._CURRENT_FEATURE_ID.reset(token)
+
+        assert h._FEATURE_COSTS["74"]["calls"] == 1
+        assert h._FEATURE_COSTS["74"]["prompt_tokens"] == 1000
+        assert h._FEATURE_COSTS["74"]["completion_tokens"] == 500
+        assert h._FEATURE_COSTS["74"]["cost_usd"] > 0
+
+    def test_multiple_calls_for_the_same_feature_accumulate(self, monkeypatch, tmp_path):
+        h = _load_harness(monkeypatch, tmp_path)
+        token = h._CURRENT_FEATURE_ID.set(74)
+        try:
+            h._track_usage("implementer", self._make_usage(100, 50))
+            h._track_usage("e2e_tester", self._make_usage(200, 100))
+        finally:
+            h._CURRENT_FEATURE_ID.reset(token)
+
+        assert h._FEATURE_COSTS["74"]["calls"] == 2
+        assert h._FEATURE_COSTS["74"]["prompt_tokens"] == 300
+
+    def test_no_current_feature_id_does_not_populate(self, monkeypatch, tmp_path):
+        h = _load_harness(monkeypatch, tmp_path)
+        h._track_usage("leader", self._make_usage(100, 50))
+        assert h._FEATURE_COSTS == {}
+
+    def test_feature_cost_usd_helper(self, monkeypatch, tmp_path):
+        h = _load_harness(monkeypatch, tmp_path)
+        assert h._feature_cost_usd(999) == 0.0
+        token = h._CURRENT_FEATURE_ID.set(5)
+        try:
+            h._track_usage("implementer", self._make_usage(1000, 1000))
+        finally:
+            h._CURRENT_FEATURE_ID.reset(token)
+        assert h._feature_cost_usd(5) > 0
+        assert h._feature_cost_usd(5) == h._FEATURE_COSTS["5"]["cost_usd"]
+
+    def test_write_session_costs_includes_per_feature(self, monkeypatch, tmp_path):
+        h = _load_harness(monkeypatch, tmp_path)
+        (tmp_path / "progress").mkdir(exist_ok=True)
+        token = h._CURRENT_FEATURE_ID.set(74)
+        try:
+            h._track_usage("e2e_tester", self._make_usage(1000, 500))
+        finally:
+            h._CURRENT_FEATURE_ID.reset(token)
+
+        h._write_session_costs()
+
+        summary = json.loads((tmp_path / "progress" / "session_costs.json").read_text())
+        assert "per_feature" in summary
+        assert summary["per_feature"]["74"]["calls"] == 1
+
+
+class TestFeatureBudgetCutoff:
+    """
+    FEATURE_BUDGET_USD (optional, disabled by default): once a single
+    feature's accumulated cost crosses this limit, run_feature_cycle stops
+    its remaining retries instead of paying for another full
+    impl -> review -> E2E attempt, independent of the global session budget.
+    """
+
+    def _patch_cycle(self, h, monkeypatch):
+        calls = []
+        monkeypatch.setattr(h, "spawn_spec_writer", MagicMock(return_value="progress/spec_1.md"))
+        monkeypatch.setattr(h, "spawn_implementer",
+                             MagicMock(side_effect=lambda *a, **kw: calls.append(1) or "ok"))
+        monkeypatch.setattr(h, "spawn_e2e_tester", MagicMock(return_value="E2E_PASSED"))
+        monkeypatch.setattr(h, "spawn_reviewer", MagicMock(return_value="APPROVED"))
+        monkeypatch.setattr(h, "_fire", MagicMock())
+        monkeypatch.setattr(h, "_fire_gate", MagicMock(return_value=None))
+        return calls
+
+    def test_stops_remaining_retries_once_over_budget(self, monkeypatch, tmp_path):
+        h = _load_harness(monkeypatch, tmp_path, {"FEATURE_BUDGET_USD": "0.01"})
+        (tmp_path / "progress").mkdir(exist_ok=True)
+        impl_calls = self._patch_cycle(h, monkeypatch)
+        h._FEATURE_COSTS["1"] = {"prompt_tokens": 0, "completion_tokens": 0, "calls": 3, "cost_usd": 0.05}
+
+        result = h.run_feature_cycle(1, "desc", e2e=False)
+
+        assert result["approved"] is False
+        assert "FEATURE_BUDGET_EXCEEDED" in result["final_verdict"]
+        assert impl_calls == []  # never even attempted
+
+    def test_disabled_by_default(self, monkeypatch, tmp_path):
+        h = _load_harness(monkeypatch, tmp_path)  # FEATURE_BUDGET_USD unset -> 0 -> disabled
+        (tmp_path / "progress").mkdir(exist_ok=True)
+        impl_calls = self._patch_cycle(h, monkeypatch)
+        h._FEATURE_COSTS["1"] = {"prompt_tokens": 0, "completion_tokens": 0, "calls": 3, "cost_usd": 999.0}
+
+        result = h.run_feature_cycle(1, "desc", e2e=False)
+
+        assert result["approved"] is True
+        assert impl_calls == [1]
+
+    def test_below_threshold_proceeds_normally(self, monkeypatch, tmp_path):
+        h = _load_harness(monkeypatch, tmp_path, {"FEATURE_BUDGET_USD": "10.00"})
+        (tmp_path / "progress").mkdir(exist_ok=True)
+        impl_calls = self._patch_cycle(h, monkeypatch)
+        h._FEATURE_COSTS["1"] = {"prompt_tokens": 0, "completion_tokens": 0, "calls": 1, "cost_usd": 0.001}
+
+        result = h.run_feature_cycle(1, "desc", e2e=False)
+
+        assert result["approved"] is True
+        assert impl_calls == [1]
+
+
 # ── Per-model pricing ──────────────────────────────────────────────────────────
 
 class TestPerModelPricing:

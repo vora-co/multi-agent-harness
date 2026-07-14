@@ -187,6 +187,13 @@ COST_BUDGET_USD = float(os.getenv("COST_BUDGET_USD", "0"))
 # Checked at the start of run_feature_cycle to skip new work without raising exceptions.
 _BUDGET_EXCEEDED: bool = False
 
+# Maximum USD spend on a SINGLE feature (across all its retries), independent
+# of COST_BUDGET_USD above. The session budget is global — one pathological
+# feature (e.g. one that burns 2 full 50-iteration E2E cycles) can consume
+# the entire session's budget with nothing per-feature ever noticing. Set in
+# .env as FEATURE_BUDGET_USD=0.50. Set to 0 (default) to disable.
+FEATURE_BUDGET_USD = float(os.getenv("FEATURE_BUDGET_USD", "0"))
+
 if ORCHESTRATOR == "prefect":
     from prefect import task, flow
 else:
@@ -821,6 +828,20 @@ _SESSION_COSTS: dict = {
     "compaction":   {"prompt_tokens": 0, "completion_tokens": 0, "calls": 0, "cost_usd": 0.0},
 }
 
+# Per-feature cost accumulation, keyed by feature_id (str, since JSON object
+# keys are always strings — see _write_session_costs). Populated by
+# _track_usage from _CURRENT_FEATURE_ID (set for the duration of each
+# feature's cycle — see run_feature_cycle), so any call made while a feature
+# is being processed — including nested agent calls — is attributed to it.
+# Calls made outside a feature cycle (e.g. the Leader's own coordination
+# turns, or _validate_spec) have _CURRENT_FEATURE_ID unset and are not
+# attributed to any feature, same as they're not attributed to one in the
+# by-role breakdown either. Real motivation: COST_BUDGET_USD is global — one
+# pathological feature (e.g. one that burns 2 full 50-iteration E2E cycles)
+# can consume the entire session's budget with no per-feature mechanism ever
+# noticing. See also FEATURE_BUDGET_USD above.
+_FEATURE_COSTS: dict = {}
+
 # Cache hits are tracked separately from _SESSION_COSTS — a cache hit costs
 # nothing, so folding it into _SESSION_COSTS would make /costs overstate the
 # session's real spend. "savings_usd" is what the same tokens would have
@@ -915,6 +936,22 @@ def _track_usage(role: str, usage, model: str = None) -> None:
     bucket["calls"]             += 1
     bucket["cost_usd"]          += call_cost_usd
 
+    feature_id = _CURRENT_FEATURE_ID.get()
+    if feature_id is not None:
+        # JSON object keys are always strings — keyed as str here (not int)
+        # so _write_session_costs can json.dump _FEATURE_COSTS directly
+        # without a str(k) conversion pass, and so a lookup with either an
+        # int or str feature_id (e.g. from feature_list.json vs. a REPL arg)
+        # finds the same bucket after going through str() once, consistently.
+        fid_key = str(feature_id)
+        feat_bucket = _FEATURE_COSTS.setdefault(
+            fid_key, {"prompt_tokens": 0, "completion_tokens": 0, "calls": 0, "cost_usd": 0.0}
+        )
+        feat_bucket["prompt_tokens"]     += prompt_tokens
+        feat_bucket["completion_tokens"] += completion_tokens
+        feat_bucket["calls"]             += 1
+        feat_bucket["cost_usd"]          += call_cost_usd
+
     if COST_BUDGET_USD > 0 and not _BUDGET_EXCEEDED:
         current_usd = _session_total_cost_usd()
         if current_usd >= COST_BUDGET_USD:
@@ -957,6 +994,10 @@ def _session_total_cost_usd() -> float:
     """Sum of accumulated per-call cost (already priced per-model) across all roles."""
     return sum(v["cost_usd"] for v in _SESSION_COSTS.values())
 
+def _feature_cost_usd(feature_id: int) -> float:
+    """Accumulated cost for one feature this session (0.0 if it hasn't made any tracked calls yet)."""
+    return _FEATURE_COSTS.get(str(feature_id), {}).get("cost_usd", 0.0)
+
 def _session_cache_hits_total() -> int:
     return sum(v["hits"] for v in _CACHE_STATS.values())
 
@@ -978,6 +1019,9 @@ def _write_session_costs() -> None:
         "session_end":        datetime.datetime.now().isoformat(),
         "model":              MODEL,
         "by_role":            _SESSION_COSTS,
+        # Per-feature breakdown (see _FEATURE_COSTS / FEATURE_BUDGET_USD above)
+        # — keyed by feature_id as a string, JSON-object-key convention.
+        "per_feature":        _FEATURE_COSTS,
         "totals": {
             "prompt_tokens":     total_prompt,
             "completion_tokens": total_completion,
@@ -1013,6 +1057,32 @@ def _write_session_costs() -> None:
         border_style="dim",
         padding=(0, 1)
     ))
+
+def _print_per_feature_costs() -> None:
+    """
+    /costs helper: a per-feature cost breakdown, sorted highest-spend first —
+    the view that would have made feature #74 (2 full 50-iteration E2E
+    cycles) visibly stand out mid-session instead of only being noticeable
+    after it had already consumed the whole session budget. No-op (prints
+    nothing) if no feature has made a tracked call yet this session.
+    """
+    if not _FEATURE_COSTS:
+        return
+    titles = {str(f.get("id")): f.get("title", "") for f in _read_feature_list_raw()}
+    table = Table(show_header=True, header_style="bold", title="Cost by feature")
+    table.add_column("ID",     style="dim", width=4)
+    table.add_column("Title")
+    table.add_column("Calls",  justify="right", width=6)
+    table.add_column("Tokens", justify="right", width=10)
+    table.add_column("Cost (USD)", justify="right", width=12)
+    for fid, bucket in sorted(_FEATURE_COSTS.items(), key=lambda kv: kv[1]["cost_usd"], reverse=True):
+        tokens = bucket["prompt_tokens"] + bucket["completion_tokens"]
+        cost_style = "red" if (FEATURE_BUDGET_USD > 0 and bucket["cost_usd"] >= FEATURE_BUDGET_USD) else "yellow"
+        table.add_row(
+            fid, titles.get(fid, "(unknown)"), str(bucket["calls"]),
+            f"{tokens:,}", f"[{cost_style}]{bucket['cost_usd']:.4f}[/]"
+        )
+    console.print(table)
 
 # ─── FEATURE DEPENDENCY GRAPH ────────────────────────────────────────────────
 
@@ -3115,6 +3185,28 @@ def _run_feature_cycle_impl(feature_id: int, description: str, e2e: bool = True)
 
     for attempt in range(start_attempt, MAX_RETRIES_REVIEW + 1):
 
+        # ── Per-feature budget guard ─────────────────────────────────────────
+        # COST_BUDGET_USD is global — one pathological feature (e.g. one that
+        # burns 2 full 50-iteration E2E cycles) can consume the entire
+        # session's budget with no per-feature mechanism ever noticing.
+        # Checked at the top of each attempt (not just once, the way the
+        # session guard is checked at the top of the whole cycle) so a
+        # feature that blows the budget mid-retry is cut immediately instead
+        # of paying for one more full impl->review->E2E attempt first.
+        if FEATURE_BUDGET_USD > 0 and _feature_cost_usd(feature_id) >= FEATURE_BUDGET_USD:
+            completed_attempts = attempt - 1
+            final_verdict = (
+                f"[FEATURE_BUDGET_EXCEEDED] Feature #{feature_id} stopped after {completed_attempts} "
+                f"attempt(s) — spent USD {_feature_cost_usd(feature_id):.4f} >= per-feature limit "
+                f"USD {FEATURE_BUDGET_USD:.2f}."
+            )
+            _log("harness", "FEATURE_BUDGET_EXCEEDED", final_verdict, level="warning")
+            console.print(f"  [yellow]⚠ {final_verdict}[/]")
+            _clear_checkpoint(feature_id)
+            _fire("after_feature_failed", feature_id=feature_id, description=description,
+                  attempts=completed_attempts, final_verdict=final_verdict)
+            return {"approved": False, "attempts": completed_attempts, "final_verdict": final_verdict}
+
         # ── Step 2: Implement ─────────────────────────────────────────────────
         # Skip if impl was already done for this attempt in a previous run.
         _skip_impl = (
@@ -3773,6 +3865,7 @@ def main():
                 continue
             elif user_input in ("/costs", "/costos"):
                 _write_session_costs()
+                _print_per_feature_costs()
                 continue
             elif user_input == "/budget":
                 current_usd = _session_total_cost_usd()
