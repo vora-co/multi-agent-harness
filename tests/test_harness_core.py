@@ -1403,6 +1403,102 @@ class TestSpawnE2eTesterMaxIterRecovery:
         assert result == "E2E_PASSED"
 
 
+class TestE2eRetryEvidenceBlock:
+    """
+    Regression coverage for feature #74: attempt 2's e2e_tester log showed
+    the same 3 files re-read and the same test re-run 3 times before hitting
+    max_iter again, because the retry task was identical to attempt 1's —
+    the previous failure's evidence (already on disk right up until the
+    stale-report cleanup deletes it) was never injected. E2E-side
+    counterpart to spawn_implementer's own RETRY #{attempt} block.
+    """
+
+    def test_includes_previous_reason_and_files_touched(self, monkeypatch, tmp_path):
+        h = _load_harness(monkeypatch, tmp_path)
+        (tmp_path / "progress").mkdir(exist_ok=True)
+        (tmp_path / "progress" / "e2e_74.json").write_text(json.dumps({
+            "schema_version": 1, "status": "failed", "tests_passed": False,
+            "files_touched": [], "reason": "TimeoutError waiting for #prof-name after login+submit",
+        }))
+        (tmp_path / "progress" / "impl_74.md").write_text("# Impl report\nSwitched redirect() call site.")
+        (tmp_path / "progress" / "impl_74.json").write_text(json.dumps({
+            "schema_version": 1, "status": "done", "tests_passed": True,
+            "files_touched": ["frontend/src/app/(dashboard)/layout.tsx"],
+        }))
+
+        block = h._e2e_retry_evidence_block(74)
+
+        assert "PREVIOUS E2E ATTEMPT FAILED" in block
+        assert "TimeoutError waiting for #prof-name" in block
+        assert "WHAT THE IMPLEMENTER CHANGED IN RESPONSE" in block
+        assert "layout.tsx" in block
+        assert "Switched redirect() call site" in block
+        assert "Start by re-running the exact failing test" in block
+
+    def test_empty_when_nothing_on_disk(self, monkeypatch, tmp_path):
+        h = _load_harness(monkeypatch, tmp_path)
+        (tmp_path / "progress").mkdir(exist_ok=True)
+
+        assert h._e2e_retry_evidence_block(74) == ""
+
+    def test_falls_back_gracefully_without_structured_json(self, monkeypatch, tmp_path):
+        # No sibling .json files (legacy progress/ dir) — still returns
+        # something useful from the .md prose alone rather than "".
+        h = _load_harness(monkeypatch, tmp_path)
+        (tmp_path / "progress").mkdir(exist_ok=True)
+        (tmp_path / "progress" / "impl_74.md").write_text("# Impl report\nFixed the redirect bug.")
+
+        block = h._e2e_retry_evidence_block(74)
+
+        assert "Fixed the redirect bug" in block
+
+    def test_spawn_e2e_tester_injects_block_only_on_retry(self, monkeypatch, tmp_path):
+        h = _load_harness(monkeypatch, tmp_path)
+        (tmp_path / "progress").mkdir(exist_ok=True)
+        (tmp_path / "progress" / "e2e_74.json").write_text(json.dumps({
+            "schema_version": 1, "status": "failed", "tests_passed": False,
+            "files_touched": [], "reason": "TimeoutError waiting for #prof-name",
+        }))
+        captured_tasks = []
+
+        def fake_run_agent(system_prompt, tools, task, **kw):
+            captured_tasks.append(task)
+            return "E2E_PASSED"
+        monkeypatch.setattr(h, "run_agent", fake_run_agent)
+
+        h.spawn_e2e_tester(74, attempt=1)
+        assert "PREVIOUS E2E ATTEMPT FAILED" not in captured_tasks[0]
+
+        # Re-seed the report attempt 1's own cleanup would have removed —
+        # simulates attempt 1 actually having failed and left evidence.
+        (tmp_path / "progress" / "e2e_74.json").write_text(json.dumps({
+            "schema_version": 1, "status": "failed", "tests_passed": False,
+            "files_touched": [], "reason": "TimeoutError waiting for #prof-name",
+        }))
+        h.spawn_e2e_tester(74, attempt=2)
+        assert "PREVIOUS E2E ATTEMPT FAILED" in captured_tasks[1]
+        assert "TimeoutError waiting for #prof-name" in captured_tasks[1]
+
+    def test_evidence_captured_before_stale_cleanup_deletes_it(self, monkeypatch, tmp_path):
+        # The whole point: on attempt > 1, the "stale" report the cleanup
+        # step is about to delete IS the previous attempt's evidence — it
+        # must be read first, not lost.
+        h = _load_harness(monkeypatch, tmp_path)
+        (tmp_path / "progress").mkdir(exist_ok=True)
+        (tmp_path / "progress" / "e2e_74.json").write_text(json.dumps({
+            "schema_version": 1, "status": "failed", "tests_passed": False,
+            "files_touched": [], "reason": "synthesized-by-harness evidence from max_iter",
+        }))
+        captured_tasks = []
+        monkeypatch.setattr(h, "run_agent", lambda system_prompt, tools, task, **kw:
+            captured_tasks.append(task) or "E2E_PASSED")
+
+        h.spawn_e2e_tester(74, attempt=2)
+
+        assert not (tmp_path / "progress" / "e2e_74.json").exists()  # cleanup still ran
+        assert "synthesized-by-harness evidence from max_iter" in captured_tasks[0]  # but was captured first
+
+
 # ── _file_tree truncation + _validate_spec stack-awareness ─────────────────────
 
 class TestFileTree:
