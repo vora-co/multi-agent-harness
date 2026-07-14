@@ -673,7 +673,7 @@ _NO_EDIT_TOOL_HINT = (
 
 # Hallucinated edit-tool names agents commonly reach for (Cursor/Claude Code
 # style) instead of read_file + write_file.
-_EDIT_TOOL_ALIASES = {"edit_file", "str_replace_editor", "str_replace"}
+_EDIT_TOOL_ALIASES = {"edit_file", "str_replace_editor", "str_replace", "edit"}
 
 # Filename-search aliases (look for matching paths) vs content-search aliases
 # (look for matching lines inside files).
@@ -786,21 +786,26 @@ def _edit_alias(tool_name: str, args: dict) -> str:
     """
     Best-effort fix for the same failure mode _search_alias addresses, but for
     edit-style tools. Agents (especially ones trained on Cursor/Claude Code
-    tool conventions) reach for an `edit_file`/`str_replace_editor`/`str_replace`
-    tool that doesn't exist in this harness — which only exposes read_file/
-    write_file/append_file. Returning a bare "tool not found" burns iterations,
-    because the agent retries name variants instead of switching strategy
-    (observed: 25 occurrences of this in a single implementer run, exhausting
-    MAX_ITER_IMPL without writing anything). So translate the call's intent
-    into a real read_file + write_file pair and return real results.
+    tool conventions) reach for an `edit_file`/`str_replace_editor`/`str_replace`/
+    `edit` tool that doesn't exist in this harness — which only exposes
+    read_file/write_file/append_file. Returning a bare "tool not found" burns
+    iterations, because the agent retries name variants instead of switching
+    strategy (observed: 25 occurrences of this in a single implementer run,
+    exhausting MAX_ITER_IMPL without writing anything; also feature 77,
+    2026-07-14 — one attempt called the bare `edit` tool name, a second used
+    `edit_file` with a `search`/`replace` argument pair instead of
+    old_string/new_string, and both burned max_iter with no fix written). So
+    translate the call's intent into a real read_file + write_file pair and
+    return real results.
 
     Falls back to the old hint-only error if the args don't carry enough to
     act on (no path, or no old_string/new_string/content), so it's never a
     hard dependency — same spirit as _search_alias's pattern-less fallback.
     """
     path = args.get("path") or args.get("file_path") or args.get("file") or args.get("filename")
-    old_string = args.get("old_string") or args.get("old_str") or args.get("old_text")
-    new_string = args.get("new_string") or args.get("new_str") or args.get("new_text")
+    old_string = args.get("old_string") or args.get("old_str") or args.get("old_text") or args.get("search")
+    new_string = (args.get("new_string") or args.get("new_str") or args.get("new_text")
+                  or args.get("replace") or args.get("replacement"))
     full_content = args.get("content")
 
     if not path:

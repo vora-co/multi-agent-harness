@@ -2450,6 +2450,43 @@ class TestTools:
         assert any("test_feature_26.py" in m for m in result["matches"])
         assert not any("other.py" in m and "test_feature_26.py" not in m for m in result["matches"])
 
+    # Edit-tool aliases (feature 77 incident, 2026-07-14): an agent called the
+    # bare tool name "edit" (not in _EDIT_TOOL_ALIASES at the time) and, on a
+    # separate attempt, called "edit_file" with a "search"/"replace" argument
+    # pair instead of old_string/new_string — neither translated, so both
+    # attempts errored with a generic "Tool not found" and burned max_iter
+    # without ever writing the fix.
+
+    def test_execute_tool_bare_edit_tool_name_translates(self, monkeypatch, tmp_path):
+        t = self._load_tools(monkeypatch, tmp_path)
+        (tmp_path / "src").mkdir()
+        (tmp_path / "src" / "api.ts").write_text("export function old() {}\n")
+        result = json.loads(t.execute_tool("edit", {
+            "path": "src/api.ts", "old_string": "old", "new_string": "new",
+        }))
+        assert "error" not in result
+        assert (tmp_path / "src" / "api.ts").read_text() == "export function new() {}\n"
+
+    def test_execute_tool_edit_file_search_replace_args_translate(self, monkeypatch, tmp_path):
+        t = self._load_tools(monkeypatch, tmp_path)
+        (tmp_path / "src").mkdir()
+        (tmp_path / "src" / "api.ts").write_text("export function old() {}\n")
+        result = json.loads(t.execute_tool("edit_file", {
+            "path": "src/api.ts", "search": "old", "replace": "new",
+        }))
+        assert "error" not in result
+        assert (tmp_path / "src" / "api.ts").read_text() == "export function new() {}\n"
+
+    def test_execute_tool_edit_file_search_replacement_args_translate(self, monkeypatch, tmp_path):
+        t = self._load_tools(monkeypatch, tmp_path)
+        (tmp_path / "src").mkdir()
+        (tmp_path / "src" / "api.ts").write_text("export function old() {}\n")
+        result = json.loads(t.execute_tool("edit_file", {
+            "path": "src/api.ts", "search": "old", "replacement": "new",
+        }))
+        assert "error" not in result
+        assert (tmp_path / "src" / "api.ts").read_text() == "export function new() {}\n"
+
     def test_execute_tool_grep_hallucination_without_pattern_falls_back_to_hint(self, monkeypatch, tmp_path):
         # No pattern arg means there's nothing to translate — fall back to the
         # old hint-only error rather than guessing.
