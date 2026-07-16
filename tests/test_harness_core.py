@@ -2081,6 +2081,148 @@ class TestBugfixReproEnforcement:
         assert "auto-downgraded" not in captured["task"]
 
 
+class TestRefutedPremiseSpecCache:
+    """
+    Regression coverage for the second half of the feature #77 incident: the
+    poisoned spec (confidently asserting a backend persistence bug that
+    attempt 1's own passing tests had already refuted) was reinjected
+    verbatim on every retry and re-run — verified in the log, the round-2
+    implementer spawned 2 seconds after run_feature_cycle and the spec_writer
+    was never re-invoked. spawn_spec_writer's cache branch now quarantines a
+    spec whose diagnosis was refuted by direct verification, using the same
+    .stale mechanism as the stale-e2e-path check, and injects the refutation
+    evidence into the regeneration task.
+    """
+
+    def _setup(self, monkeypatch, tmp_path):
+        h = _load_harness(monkeypatch, tmp_path)
+        monkeypatch.setattr(h, "_call_api_with_fallback", lambda *a, **kw: None)
+        (tmp_path / "progress").mkdir(exist_ok=True)
+        (tmp_path / "progress" / "spec_77.md").write_text(
+            "# cached spec\nRoot cause: the backend does not persist is_active.")
+        calls = {"tasks": []}
+
+        def fake_run_agent(system_prompt, tools, task, **kw):
+            calls["tasks"].append(task)
+            with open("progress/spec_77.md", "w", encoding="utf-8") as f:
+                f.write("# fresh spec")
+            return "progress/spec_77.md"
+        monkeypatch.setattr(h, "run_agent", fake_run_agent)
+        return h, calls
+
+    def test_diagnosis_wrong_premise_quarantines_and_regenerates(self, monkeypatch, tmp_path):
+        h, calls = self._setup(monkeypatch, tmp_path)
+        (tmp_path / "progress" / "diagnosis_77.json").write_text(json.dumps({
+            "cause": "wrong_premise",
+            "explanation": "pytest tests/test_branches.py passed on attempt 1 — is_active DOES persist",
+        }))
+
+        result = h.spawn_spec_writer(77, "some feature")
+
+        assert result == "progress/spec_77.md"
+        assert len(calls["tasks"]) == 1  # cache miss — regenerated
+        stale = tmp_path / "progress" / "spec_77.md.stale"
+        assert stale.exists()
+        assert "does not persist is_active" in stale.read_text()  # original preserved
+        # The regeneration task carries the refutation as a constraint.
+        assert "REFUTED" in calls["tasks"][0]
+        assert "is_active DOES persist" in calls["tasks"][0]
+        assert "Do NOT reassert that premise" in calls["tasks"][0]
+
+    def test_impl_json_premise_check_failed_regenerates(self, monkeypatch, tmp_path):
+        h, calls = self._setup(monkeypatch, tmp_path)
+        (tmp_path / "progress" / "impl_77.json").write_text(json.dumps({
+            "schema_version": 1, "status": "done", "tests_passed": True,
+            "files_touched": [], "premise_check": "failed",
+        }))
+        (tmp_path / "progress" / "impl_77.md").write_text(
+            "# Impl report\n\nPREMISE_CHECK: FAILED\nSpec claimed the backend drops "
+            "is_active; ran pytest tests/test_branches.py — 14 passed.")
+
+        h.spawn_spec_writer(77, "some feature")
+
+        assert len(calls["tasks"]) == 1
+        assert (tmp_path / "progress" / "spec_77.md.stale").exists()
+        # Evidence is the PREMISE_CHECK section from the .md, not a generic line.
+        assert "14 passed" in calls["tasks"][0]
+
+    def test_md_fallback_for_reports_without_structured_field(self, monkeypatch, tmp_path):
+        h, calls = self._setup(monkeypatch, tmp_path)
+        # Pre-schema report: no premise_check in the .json, only the .md marker.
+        (tmp_path / "progress" / "impl_77.json").write_text(json.dumps({
+            "schema_version": 1, "status": "done", "tests_passed": True, "files_touched": [],
+        }))
+        (tmp_path / "progress" / "impl_77.md").write_text(
+            "# Impl report\n\nPREMISE_CHECK: FAILED\nDirect curl to the endpoint "
+            "returned the persisted value.")
+
+        h.spawn_spec_writer(77, "some feature")
+
+        assert len(calls["tasks"]) == 1
+        assert "Direct curl to the endpoint" in calls["tasks"][0]
+
+    def test_other_diagnosis_cause_reuses_cache(self, monkeypatch, tmp_path):
+        h, calls = self._setup(monkeypatch, tmp_path)
+        (tmp_path / "progress" / "diagnosis_77.json").write_text(json.dumps({
+            "cause": "flaky_e2e", "explanation": "timeout on wait_for_url",
+        }))
+
+        result = h.spawn_spec_writer(77, "some feature")
+
+        assert result == "progress/spec_77.md"
+        assert calls["tasks"] == []  # cache hit — agent never invoked
+        assert "does not persist is_active" in (tmp_path / "progress" / "spec_77.md").read_text()
+
+    def test_absent_files_reuse_cache(self, monkeypatch, tmp_path):
+        h, calls = self._setup(monkeypatch, tmp_path)
+
+        result = h.spawn_spec_writer(77, "some feature")
+
+        assert result == "progress/spec_77.md"
+        assert calls["tasks"] == []
+        assert not (tmp_path / "progress" / "spec_77.md.stale").exists()
+
+    def test_corrupt_diagnosis_reuses_cache(self, monkeypatch, tmp_path):
+        h, calls = self._setup(monkeypatch, tmp_path)
+        (tmp_path / "progress" / "diagnosis_77.json").write_text("{not valid json[[")
+
+        h.spawn_spec_writer(77, "some feature")
+
+        assert calls["tasks"] == []  # best-effort: corrupt file = no-op, never a block
+
+    def test_impl_cache_never_reuses_a_premise_check_exit(self, monkeypatch, tmp_path):
+        # A PREMISE CHECK EXIT report can carry tests_passed=true — the passing
+        # tests ARE the refutation evidence — but it is not a completed
+        # implementation and must never be reused as one.
+        h, _ = self._setup(monkeypatch, tmp_path)
+        (tmp_path / "progress" / "impl_1.md").write_text("PREMISE_CHECK: FAILED\n14 passed")
+        (tmp_path / "progress" / "impl_1.json").write_text(json.dumps({
+            "schema_version": 1, "status": "done", "tests_passed": True,
+            "files_touched": [], "premise_check": "failed",
+        }))
+        calls = []
+
+        def fake_run_agent(*a, **kw):
+            calls.append(1)
+            return "progress/impl_1.md"
+        monkeypatch.setattr(h, "run_agent", fake_run_agent)
+
+        h.spawn_implementer(1, "desc")
+
+        assert calls == [1]  # cache miss — agent was invoked despite tests_passed=true
+
+    def test_read_structured_status_accepts_premise_check_field(self, monkeypatch, tmp_path):
+        h, _ = self._setup(monkeypatch, tmp_path)
+        (tmp_path / "progress" / "impl_1.md").write_text("report")
+        (tmp_path / "progress" / "impl_1.json").write_text(json.dumps({
+            "schema_version": 1, "status": "done", "tests_passed": True,
+            "files_touched": [], "premise_check": "failed",
+        }))
+        status = h._read_structured_status("progress/impl_1.md")
+        assert status is not None  # extra="forbid" schema knows the new field
+        assert status.get("premise_check") == "failed"
+
+
 class TestTruncateHeadTail:
     """
     Regression coverage: _validate_spec used to send only spec_content[:3000]

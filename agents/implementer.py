@@ -117,6 +117,22 @@ PROTOCOL (follow these steps in order):
      read in step 1 unless the traceback names a file you haven't seen yet. Make the fix and
      re-run immediately; don't insert a round of general re-exploration between a failure and
      the retry. Maximum 3 attempts. If you can't get them to pass, document and continue.
+4b. PREMISE CHECK EXIT (sanctioned verdict — this is NOT an implementer failure): if your
+   direct verification contradicts the diagnosis the spec asserts about the EXISTING code —
+   the reproduction script does not fail where the spec says it must fail, or the tests of
+   the exact layer the spec blames all pass — do NOT spend your remaining budget hunting in
+   the refuted location. Instead:
+   (a) write a "PREMISE_CHECK: FAILED" section in progress/impl_<feature_id>.md quoting the
+       spec's exact claim that was refuted and the concrete evidence (the command you ran +
+       the relevant output);
+   (b) include "premise_check": "failed" in progress/impl_<feature_id>.json (see step 6);
+   (c) end the attempt right there and return the report path as usual (step 7).
+   Ending this way is the correct outcome when the spec's premise is false: the harness uses
+   it to quarantine and regenerate the spec instead of burning another attempt on the same
+   false diagnosis. Real incident (feature #77): attempt 1 ran the exact test suite the spec
+   blamed and everything PASSED — direct evidence the premise was false — but with no
+   sanctioned exit, the only available behavior was to keep searching until iterations ran
+   out.
 5. Write progress/impl_<feature_id>.md with:
    - Files created/modified
    - Full pytest output
@@ -132,6 +148,10 @@ PROTOCOL (follow these steps in order):
    of your last test run, even if you ran out of attempts and are
    documenting a failure — the harness uses this field to decide whether a
    future run can safely reuse your work without regenerating it.
+   If (and ONLY if) you ended via the PREMISE CHECK EXIT (step 4b), add one
+   extra field to this JSON: "premise_check": "failed" — structured, so the
+   harness detects the refuted premise without grepping markdown. Omit the
+   field entirely in every other case.
 7. Return ONLY the path: progress/impl_<feature_id>.md
 
 HARD RULES:

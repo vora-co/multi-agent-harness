@@ -1808,12 +1808,23 @@ class AgentStatusSchema(BaseModel):
     tests_passed:   Optional[bool] = None
     files_touched:  Optional[list[str]] = None
     reason:         Optional[str] = None
+    # Implementer-only, optional: "failed" when the implementer ended via the
+    # sanctioned PREMISE CHECK EXIT (its direct verification refuted the
+    # spec's diagnosis). Omitted entirely when not applicable.
+    premise_check:  Optional[str] = None
 
     @field_validator("status")
     @classmethod
     def _status_must_be_known(cls, v: str) -> str:
         if v not in _AGENT_STATUS_VALUES:
             raise ValueError(f"must be one of {sorted(_AGENT_STATUS_VALUES)}, got '{v}'")
+        return v
+
+    @field_validator("premise_check")
+    @classmethod
+    def _premise_check_must_be_known(cls, v: Optional[str]) -> Optional[str]:
+        if v is not None and v not in ("failed", "passed"):
+            raise ValueError(f"must be 'failed' or 'passed' when present, got '{v}'")
         return v
 
 
@@ -2703,7 +2714,12 @@ def spawn_implementer(feature_id: int, description: str, attempt: int = 1,
     if attempt == 1 and os.path.exists(impl_path):
         status = _read_structured_status(impl_path)
         if status is not None:
-            if status.get("tests_passed") and status.get("status") != "error":
+            # premise_check == "failed" means the report is a sanctioned
+            # PREMISE CHECK EXIT, not a completed implementation — and its
+            # tests_passed can legitimately be True (the passing tests ARE
+            # the evidence that refuted the spec). Never reuse it as an impl.
+            if (status.get("tests_passed") and status.get("status") != "error"
+                    and status.get("premise_check") != "failed"):
                 _log("implementer", "SKIP", f"Existing impl with passing tests: {impl_path}")
                 _vprint("normal", f"  [blue]🔨 IMPLEMENTER[/] [dim]↩ reusing existing impl →[/] {impl_path}")
                 return impl_path
@@ -2915,6 +2931,66 @@ def _downgrade_unbacked_confirmed(spec_text: str, feature_id: int) -> str:
     )
 
 
+def _refuted_premise_evidence(feature_id: int) -> Optional[str]:
+    """
+    Best-effort: evidence that the cached spec's diagnosis was refuted by
+    direct verification, or None. Real incident (feature #77): a cached spec
+    confidently blamed backend persistence; attempt 1 ran the exact suite the
+    spec pointed at and everything PASSED — but the poisoned spec was
+    reinjected verbatim on every retry and re-run (the spec_writer is never
+    invoked on a cache hit), so nothing could act on that refutation.
+
+    Sources, in priority order:
+      1. progress/diagnosis_<id>.json with "cause": "wrong_premise" — written
+         by an external plugin (e.g. the premium failure_diagnostician) after
+         a feature's definitive failure. Absent/corrupt = no-op: base ships
+         the consumer and waits for its feeder, the same pattern
+         CONVERGENCE_RULE followed in agents/shared_rules.py.
+      2. progress/impl_<id>.json with "premise_check": "failed" — the
+         implementer's own sanctioned PREMISE CHECK EXIT verdict (read raw,
+         not via _read_structured_status, so it still counts even if some
+         other field in that file wouldn't validate).
+      3. Fallback for reports written before the structured field existed:
+         the literal "PREMISE_CHECK: FAILED" in progress/impl_<id>.md.
+
+    Returns a bounded, human-readable evidence string for injection into the
+    regenerated spec_writer's task.
+    """
+    try:
+        with open(f"{PROGRESS_DIR}/diagnosis_{feature_id}.json", "r", encoding="utf-8") as f:
+            diag = json.load(f)
+        if isinstance(diag, dict) and diag.get("cause") == "wrong_premise":
+            explanation = diag.get("explanation")
+            if explanation:
+                return str(explanation)[:800]
+            return (f"a failure diagnosis recorded cause=wrong_premise for feature "
+                    f"{feature_id} (no explanation field)")
+    except Exception:
+        pass
+
+    premise_failed = False
+    try:
+        with open(f"{PROGRESS_DIR}/impl_{feature_id}.json", "r", encoding="utf-8") as f:
+            impl_status = json.load(f)
+        premise_failed = isinstance(impl_status, dict) and impl_status.get("premise_check") == "failed"
+    except Exception:
+        pass
+
+    md_text = ""
+    try:
+        with open(f"{PROGRESS_DIR}/impl_{feature_id}.md", "r", encoding="utf-8") as f:
+            md_text = f.read()
+    except Exception:
+        pass
+    if not premise_failed and "PREMISE_CHECK: FAILED" not in md_text:
+        return None
+    idx = md_text.find("PREMISE_CHECK")
+    if idx != -1:
+        return md_text[idx:idx + 800]
+    return (f"the implementer's premise check failed: its direct verification contradicted "
+            f"the spec's diagnosis (see progress/impl_{feature_id}.md)")
+
+
 def spawn_spec_writer(feature_id: int, description: str) -> str:
     """Generate the detailed technical spec before implementing.
     If the spec already exists on disk, reuse it without calling the agent.
@@ -2928,6 +3004,7 @@ def spawn_spec_writer(feature_id: int, description: str) -> str:
     # (and survives any manual reset to "pending"), and the spec_writer
     # agent's own prompt rules can't catch it because it's never invoked on
     # a cache hit in the first place.
+    _refuted_evidence: Optional[str] = None
     if os.path.exists(spec_path):
         try:
             with open(spec_path, "r", encoding="utf-8") as f:
@@ -2935,6 +3012,12 @@ def spawn_spec_writer(feature_id: int, description: str) -> str:
         except OSError:
             _cached_spec_text = ""
         _stale_reason = _spec_references_stale_e2e_test_dir(_cached_spec_text)
+        # Second anti-poisoning check, same spirit: a cached spec whose
+        # diagnosis was refuted by direct verification (see
+        # _refuted_premise_evidence) must not be reinjected verbatim into
+        # every retry. Computed even when _stale_reason already fired, so the
+        # regeneration task below carries the evidence either way.
+        _refuted_evidence = _refuted_premise_evidence(feature_id)
         if _stale_reason:
             _stale_path = f"{spec_path}.stale"
             try:
@@ -2947,6 +3030,18 @@ def spawn_spec_writer(feature_id: int, description: str) -> str:
                  level="warning")
             _vprint("normal", f"  [cyan]📋 SPEC_WRITER[/] [yellow]⚠ cached spec pointed at the wrong "
                               f"e2e runner's test dir — quarantined, regenerating[/]")
+        elif _refuted_evidence:
+            _stale_path = f"{spec_path}.stale"
+            try:
+                os.replace(spec_path, _stale_path)
+            except OSError:
+                pass  # best-effort quarantine — same rationale as above
+            _log("spec_writer", "SPEC_PREMISE_REFUTED",
+                 f"feature={feature_id}: cached spec's diagnosis was refuted by direct "
+                 f"verification — quarantined to {_stale_path}, regenerating",
+                 level="warning")
+            _vprint("normal", "  [cyan]📋 SPEC_WRITER[/] [yellow]⚠ cached spec's diagnosis was "
+                              "refuted by direct verification — quarantined, regenerating[/]")
         else:
             _log("spec_writer", "SKIP", f"Spec already exists: {spec_path}")
             _vprint("normal", f"  [cyan]📋 SPEC_WRITER[/] [dim]↩ reusing existing spec →[/] {spec_path}")
@@ -2967,10 +3062,19 @@ def spawn_spec_writer(feature_id: int, description: str) -> str:
             f"(or .sh) that fails while the bug exists and passes once fixed, and label "
             f"every root-cause claim in the spec CONFIRMED or HYPOTHESIS.\n"
         )
+    refuted_context = ""
+    if _refuted_evidence:
+        refuted_context = (
+            f"IMPORTANT: the previous spec's diagnosis for this feature was REFUTED by "
+            f"direct verification. Evidence: {_refuted_evidence}\n"
+            f"Do NOT reassert that premise; verify the actual behavior before asserting "
+            f"where the defect is.\n"
+        )
     task = (
         f"{_workdir_banner(cwd)}"
         f"{arch_context}"
         f"{layout_context}"
+        f"{refuted_context}"
         f"{repro_hint}"
         f"Write the technical specification for feature #{feature_id}: {description}\n"
         f"Save the spec to {spec_path}\n"
