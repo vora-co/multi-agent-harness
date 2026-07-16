@@ -158,7 +158,12 @@ HARD RULES:
 - REPRO SCRIPT PROTOCOL (mandatory whenever your task or spec includes a reproduction
   script — progress/repro_<feature_id>.py/.sh or equivalent): your FIRST action is to run
   it and confirm the failure mode it claims, establishing the baseline; your LAST action
-  before writing your report is to run it again and confirm it now passes. If the baseline
+  before writing your report is to run it again and confirm it now passes. If a
+  run_repro_script tool is present in your toolset, that is HOW you run it: it executes
+  on the host, with real network access to the running app and a browser available —
+  run_bash's sandbox has neither, so a browser-based or live-app repro run through
+  run_bash fails for reasons that have nothing to do with the bug. Only fall back to
+  run_bash for a repro that needs neither a browser nor the live app. If the baseline
   run does NOT fail the way the spec claims, STOP hunting the bug where the spec points —
   the premise is broken, and no amount of correct work at the wrong location fixes it.
   Report a PREMISE DISCREPANCY prominently at the top of progress/impl_<feature_id>.md

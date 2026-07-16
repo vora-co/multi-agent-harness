@@ -87,7 +87,7 @@ import agents.reviewer as reviewer_cfg
 import agents.e2e_tester as e2e_cfg
 import agents.spec_writer as spec_cfg
 from tools import (
-    execute_tool, SAFE_WRITE_DIRS, VALID_FEATURE_STATUSES,
+    execute_tool, get_schemas, SAFE_WRITE_DIRS, VALID_FEATURE_STATUSES,
     FEATURE_LIST_PATH, PROGRESS_DIR, ROLES,
     STATUS_APPROVED, STATUS_REJECTED, STATUS_PASSED, STATUS_FAILED, STATUS_SCHEMA_VERSION,
     VERDICT_APPROVED, VERDICT_REJECTED, VERDICT_E2E_PASSED, VERDICT_E2E_FAILED,
@@ -2881,10 +2881,13 @@ def _workdir_banner(cwd: str) -> str:
 
 
 def spawn_implementer(feature_id: int, description: str, attempt: int = 1,
-                      rejection_reason: str = "", spec_path: str = None) -> str:
+                      rejection_reason: str = "", spec_path: str = None,
+                      e2e: bool = True) -> str:
     """
     Launch the implementer. On first attempt, reuses existing impl if tests passed.
     On retry, injects the rejection reason so the agent doesn't repeat the same mistake.
+    For e2e-enabled bug-fix features, additionally exposes the run_repro_script tool
+    (host-side repro runner) — see the tool-exposure block below.
     """
     impl_path = f"{PROGRESS_DIR}/impl_{feature_id}.md"
 
@@ -2961,19 +2964,39 @@ def spawn_implementer(feature_id: int, description: str, attempt: int = 1,
         except Exception:
             spec_content = f"\nRead the technical specification at {spec_path} BEFORE writing code.\n"
 
+    # Scoped tool exposure: e2e-enabled bug-fix features get run_repro_script
+    # — a host-side runner for progress/repro_<id>.py/.sh (same mechanism as
+    # run_playwright_tests: harness interpreter, outside the docker sandbox).
+    # Real incident (feature #77): the symptom was browser-only; run_bash's
+    # sandbox has no route to the host network and no browser, so the
+    # implementer was structurally unable to observe the bug it had to fix.
+    # The path is derived from feature_id inside the tool — this grants no
+    # general Playwright/host access.
+    _impl_tools = impl_cfg.TOOLS
+    _repro_tool_exposed = False
+    if e2e and _is_bugfix_feature(description):
+        _impl_tools = list(_impl_tools) + get_schemas("run_repro_script")
+        _repro_tool_exposed = True
+
     # If a reproduction script exists for this feature, surface it explicitly —
     # the REPRO SCRIPT PROTOCOL hard rule (agents/implementer.py) triggers off
     # "your task includes a repro script", so the harness must actually say so.
     repro_context = ""
     _repro = _existing_repro_script(feature_id)
     if _repro:
+        _how_to_run = (
+            f"Run it with run_repro_script(feature_id={feature_id}) — it executes on the "
+            f"HOST, with real network access to the running app and a browser available; "
+            f"run_bash's sandbox has neither. "
+            if _repro_tool_exposed else ""
+        )
         repro_context = (
             f"\n## Reproduction script (mandatory protocol)\n"
             f"An executable reproduction script exists at {_repro}. Per your REPRO SCRIPT "
             f"PROTOCOL hard rule: run it FIRST to confirm the baseline failure, and run it "
-            f"again LAST to confirm the fix before writing your report. If it does NOT fail "
-            f"the way the spec claims, report a PREMISE DISCREPANCY at the top of your "
-            f"report instead of hunting the bug where the spec points.\n"
+            f"again LAST to confirm the fix before writing your report. {_how_to_run}"
+            f"If it does NOT fail the way the spec claims, report a PREMISE DISCREPANCY at "
+            f"the top of your report instead of hunting the bug where the spec points.\n"
         )
 
     # If an earlier attempt hit max_iter, its investigation digest (files
@@ -3010,7 +3033,7 @@ def spawn_implementer(feature_id: int, description: str, attempt: int = 1,
     _agent_ctx = _fire_transform("before_spawn_agent", role="implementer",
                                  system_prompt=impl_cfg.SYSTEM_PROMPT,
                                  task=task, feature_id=feature_id)
-    result = run_agent(_agent_ctx["system_prompt"], impl_cfg.TOOLS, _agent_ctx["task"],
+    result = run_agent(_agent_ctx["system_prompt"], _impl_tools, _agent_ctx["task"],
                        role="implementer", color="blue", max_iter=MAX_ITER_IMPL,
                        checkpoint_key=f"implementer_{feature_id}_{attempt}",
                        feature_id=feature_id)
@@ -3753,7 +3776,8 @@ def _run_feature_cycle_impl(feature_id: int, description: str, e2e: bool = True)
                 feature_id, description,
                 attempt=attempt,
                 rejection_reason=rejection_reason,
-                spec_path=spec_path
+                spec_path=spec_path,
+                e2e=e2e
             )
             if "[ERROR" in impl_result.upper():
                 err_type = _classify_error(impl_result)

@@ -151,6 +151,14 @@ indicates a bug fix — "Fix:", "bug", "doesn't persist"/"no persiste",
   symptom is UI-only and cannot be observed at the API layer. Never reproduce
   through more layers than the symptom requires — every extra layer widens
   the set of components the repro implicates.
+- When the symptom is browser-only, the Playwright repro MUST also capture and
+  print the network trace of the failing action — what the browser actually
+  sent and received (page.on("request")/page.on("response") filtered to the
+  relevant endpoint, or a page.request replay of the same call). That trace is
+  usually the decisive evidence: in feature #77 it showed the value coming
+  back CORRECT from the backend but at a different array position, which no
+  amount of UI observation alone could distinguish from a persistence bug.
+  Quote the observed trace in the spec's root-cause section.
 - Every root-cause claim in the spec MUST be labeled either CONFIRMED (state
   exactly how it was reproduced — which script/command, what output) or
   HYPOTHESIS (inferred from reading code, not verified). An unlabeled claim

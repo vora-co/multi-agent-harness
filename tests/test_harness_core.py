@@ -1856,11 +1856,13 @@ class TestBugfixReproEnforcement:
     """
 
     def _capture_run_agent(self, h, monkeypatch, result_path, spec_body=None, on_call=None):
+        h.impl_cfg.TOOLS = []  # real list — spawn_implementer's tool-exposure path iterates it
         captured = {"tasks": []}
 
         def fake_run_agent(system_prompt, tools, task, **kw):
             captured["tasks"].append(task)
             captured["task"] = task
+            captured["tools"] = tools
             if spec_body is not None:
                 with open(result_path, "w", encoding="utf-8") as f:
                     f.write(spec_body)
@@ -2649,6 +2651,7 @@ class TestImplMaxIterInvestigationDigest:
 
     def test_spawn_implementer_injects_digest_into_task(self, monkeypatch, tmp_path):
         h = _load_harness(monkeypatch, tmp_path)
+        h.impl_cfg.TOOLS = []
         (tmp_path / "progress").mkdir(exist_ok=True)
         (tmp_path / "progress" / "_investigation_impl_9.md").write_text(
             "## Commands already run → last output line\n"
@@ -2667,6 +2670,7 @@ class TestImplMaxIterInvestigationDigest:
 
     def test_spawn_implementer_without_digest_has_no_header(self, monkeypatch, tmp_path):
         h = _load_harness(monkeypatch, tmp_path)
+        h.impl_cfg.TOOLS = []
         (tmp_path / "progress").mkdir(exist_ok=True)
         captured = {}
 
@@ -3415,6 +3419,147 @@ class TestDestructiveRewriteWarning:
         assert "content you read earlier this run" in warning
         assert "If the file already existed in the last commit" in warning
         assert "not committed yet" in warning
+
+
+# ── tools.py: run_repro_script (host-side repro runner) ──────────────────────
+
+class TestRunReproScript:
+    """
+    Regression coverage for feature #77's structural gap: the symptom was
+    browser-only, run_bash's sandbox has no route to the host network and no
+    browser, and run_playwright_tests/take_screenshot are e2e_tester-only —
+    the implementer could not observe the bug it had to fix. run_repro_script
+    executes progress/repro_<id>.py/.sh on the HOST (same mechanism as
+    run_playwright_tests: sys.executable, outside the sandbox), with the path
+    derived from feature_id alone — no general host execution granted.
+    """
+
+    def _load_tools(self, monkeypatch, tmp_path: Path):
+        monkeypatch.chdir(tmp_path)
+        for mod in ["sandbox"]:
+            monkeypatch.setitem(sys.modules, mod, MagicMock())
+        for key in list(sys.modules.keys()):
+            if key == "tools":
+                del sys.modules[key]
+        root = Path(__file__).parent.parent
+        if str(root) not in sys.path:
+            sys.path.insert(0, str(root))
+        return importlib.import_module("tools")
+
+    def test_failing_repro_is_the_expected_baseline(self, monkeypatch, tmp_path):
+        t = self._load_tools(monkeypatch, tmp_path)
+        (tmp_path / "progress").mkdir()
+        (tmp_path / "progress" / "repro_77.py").write_text(
+            "import sys\nprint('switch reverted to true after save')\nsys.exit(1)\n")
+
+        result = json.loads(t.run_repro_script(feature_id=77))
+
+        assert result["passed"] is False
+        assert result["returncode"] == 1
+        assert "switch reverted to true after save" in result["output"]
+        assert result["script"] == "progress/repro_77.py"
+        assert "PREMISE CHECK EXIT" in result["tip"]
+
+    def test_passing_repro_confirms_the_fix(self, monkeypatch, tmp_path):
+        t = self._load_tools(monkeypatch, tmp_path)
+        (tmp_path / "progress").mkdir()
+        (tmp_path / "progress" / "repro_77.py").write_text("print('is_active persisted')\n")
+
+        result = json.loads(t.run_repro_script(feature_id=77))
+
+        assert result["passed"] is True
+        assert "is_active persisted" in result["output"]
+
+    def test_sh_repro_supported(self, monkeypatch, tmp_path):
+        t = self._load_tools(monkeypatch, tmp_path)
+        (tmp_path / "progress").mkdir()
+        (tmp_path / "progress" / "repro_5.sh").write_text("echo from-bash; exit 1\n")
+
+        result = json.loads(t.run_repro_script(feature_id=5))
+
+        assert result["passed"] is False
+        assert "from-bash" in result["output"]
+        assert result["script"] == "progress/repro_5.sh"
+
+    def test_missing_script_errors_with_hint(self, monkeypatch, tmp_path):
+        t = self._load_tools(monkeypatch, tmp_path)
+        (tmp_path / "progress").mkdir()
+        result = json.loads(t.run_repro_script(feature_id=42))
+        assert "error" in result
+        assert "NOT_FEASIBLE" in result["hint"]
+
+    def test_feature_id_must_be_an_integer(self, monkeypatch, tmp_path):
+        # The executed path is derived from feature_id — int() validation is
+        # what keeps this from becoming general host execution.
+        t = self._load_tools(monkeypatch, tmp_path)
+        result = json.loads(t.run_repro_script(feature_id="5; rm -rf /"))
+        assert "error" in result
+        result = json.loads(t.run_repro_script())
+        assert "error" in result
+
+    def test_registered_in_schema_and_dispatch(self, monkeypatch, tmp_path):
+        t = self._load_tools(monkeypatch, tmp_path)
+        schemas = t.get_schemas("run_repro_script")
+        assert len(schemas) == 1
+        assert schemas[0]["function"]["name"] == "run_repro_script"
+        (tmp_path / "progress").mkdir()
+        (tmp_path / "progress" / "repro_3.py").write_text("print('via dispatch')\n")
+        result = json.loads(t.execute_tool("run_repro_script", {"feature_id": 3}))
+        assert result["passed"] is True
+
+
+# ── harness.py: scoped exposure of run_repro_script to the implementer ───────
+
+class TestReproToolExposure:
+    def _spawn(self, h, monkeypatch, feature_id, description, **spawn_kw):
+        h.impl_cfg.TOOLS = []  # real list — the exposure path extends it
+        captured = {}
+
+        def fake_run_agent(system_prompt, tools, task, **kw):
+            captured["tools"] = tools
+            captured["task"] = task
+            return f"progress/impl_{feature_id}.md"
+        monkeypatch.setattr(h, "run_agent", fake_run_agent)
+        h.spawn_implementer(feature_id, description, **spawn_kw)
+        return captured
+
+    def _tool_names(self, tools):
+        return [s["function"]["name"] for s in tools]
+
+    def test_exposed_for_e2e_bugfix_features(self, monkeypatch, tmp_path):
+        h = _load_harness(monkeypatch, tmp_path)
+        (tmp_path / "progress").mkdir(exist_ok=True)
+        captured = self._spawn(h, monkeypatch, 9, "Fix: is_active no persiste al togglear la sede")
+        assert "run_repro_script" in self._tool_names(captured["tools"])
+
+    def test_not_exposed_when_e2e_false(self, monkeypatch, tmp_path):
+        h = _load_harness(monkeypatch, tmp_path)
+        (tmp_path / "progress").mkdir(exist_ok=True)
+        captured = self._spawn(h, monkeypatch, 9, "Fix: is_active no persiste", e2e=False)
+        assert "run_repro_script" not in self._tool_names(captured["tools"])
+
+    def test_not_exposed_for_regular_features(self, monkeypatch, tmp_path):
+        h = _load_harness(monkeypatch, tmp_path)
+        (tmp_path / "progress").mkdir(exist_ok=True)
+        captured = self._spawn(h, monkeypatch, 9, "Add CSV export to the reports page")
+        assert "run_repro_script" not in self._tool_names(captured["tools"])
+
+    def test_repro_context_names_the_tool_when_exposed(self, monkeypatch, tmp_path):
+        h = _load_harness(monkeypatch, tmp_path)
+        (tmp_path / "progress").mkdir(exist_ok=True)
+        (tmp_path / "progress" / "repro_9.py").write_text("assert False")
+        captured = self._spawn(h, monkeypatch, 9, "Fix: is_active no persiste al togglear la sede")
+        assert "run_repro_script(feature_id=9)" in captured["task"]
+
+    def test_repro_context_omits_the_tool_when_not_exposed(self, monkeypatch, tmp_path):
+        # Script on disk but e2e=False (backend-only bug): the protocol block
+        # still appears, but must not point at a tool that isn't in the set.
+        h = _load_harness(monkeypatch, tmp_path)
+        (tmp_path / "progress").mkdir(exist_ok=True)
+        (tmp_path / "progress" / "repro_9.py").write_text("assert False")
+        captured = self._spawn(h, monkeypatch, 9, "Fix: is_active no persiste", e2e=False)
+        assert "Reproduction script (mandatory protocol)" in captured["task"]
+        assert "run_repro_script" not in captured["task"]
 
 
 # ── agents/shared_rules.py: MINIMAL_DELTA_RULE shared across writer roles ────

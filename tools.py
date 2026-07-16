@@ -78,6 +78,13 @@ SCREENSHOTS_DIR = "tests/screenshots"
 # need to diverge later. The user-facing "N minutes" messages are built from
 # these so the number and the message can never drift apart.
 E2E_SUBPROCESS_TIMEOUT_S = 300
+
+# Ceiling for run_repro_script (host-side repro runner) — also the cap for any
+# caller-supplied timeout. Env-overridable.
+try:
+    REPRO_SCRIPT_TIMEOUT_S = int(os.getenv("REPRO_SCRIPT_TIMEOUT_S", "180"))
+except ValueError:
+    REPRO_SCRIPT_TIMEOUT_S = 180
 MUTATION_TEST_TIMEOUT_S = 300
 
 # Secret-holding files agents must never read, regardless of SAFE_WRITE_DIRS —
@@ -688,6 +695,65 @@ runner = "python3 -m pytest {tests_dir} -x -q"
     except Exception as e:
         return json.dumps({"error": str(e), "status": "error"})
 
+def run_repro_script(feature_id: int = None, timeout: int = None, **kwargs) -> str:
+    """
+    Execute this feature's reproduction script — progress/repro_<feature_id>.py
+    (harness interpreter, sys.executable) or .sh (bash) — ON THE HOST, outside
+    the docker sandbox. Same mechanism run_playwright_tests already uses.
+
+    Why host-side (real incident, feature #77): the symptom was observable
+    only in the browser ("the switch flips back to true after save"). The
+    implementer's run_bash executes in a sandbox container on an internal
+    Docker network with NO route to the host — it cannot reach the running
+    app, and no browser is installed there (nor should one be). The decisive
+    evidence (the browser's actual request/response) was structurally
+    unobservable by the agent that had to fix the bug. This runner closes
+    that gap without granting general host execution: the path is derived
+    from feature_id alone (validated as an integer), never caller-supplied.
+    """
+    if feature_id is None:
+        return json.dumps({"error": "Required argument 'feature_id' is missing"})
+    try:
+        fid = int(feature_id)
+    except (TypeError, ValueError):
+        return json.dumps({"error": f"feature_id must be an integer, got {feature_id!r}"})
+    py_path = f"{PROGRESS_DIR}/repro_{fid}.py"
+    sh_path = f"{PROGRESS_DIR}/repro_{fid}.sh"
+    if os.path.isfile(py_path):
+        script, cmd = py_path, f'"{sys.executable}" {py_path}'
+    elif os.path.isfile(sh_path):
+        script, cmd = sh_path, f"bash {sh_path}"
+    else:
+        return json.dumps({
+            "error": f"No reproduction script found at {py_path} or {sh_path}.",
+            "hint": ("The spec_writer writes it for bug-fix features. If the spec declares "
+                     "'REPRO: NOT_FEASIBLE', there is nothing to run — fall back to your "
+                     "LAYER ISOLATION rule instead."),
+        })
+    try:
+        timeout_s = REPRO_SCRIPT_TIMEOUT_S if timeout is None else min(int(timeout), REPRO_SCRIPT_TIMEOUT_S)
+    except (TypeError, ValueError):
+        timeout_s = REPRO_SCRIPT_TIMEOUT_S
+    try:
+        result = subprocess.run(cmd, shell=True, capture_output=True, text=True,
+                                timeout=timeout_s, cwd=os.getcwd())
+    except subprocess.TimeoutExpired:
+        return json.dumps({"error": f"Repro script timed out after {timeout_s}s.", "script": script})
+    except Exception as e:
+        return json.dumps({"error": str(e), "script": script})
+    output = result.stdout + result.stderr
+    return json.dumps({
+        "script": script,
+        "returncode": result.returncode,
+        "passed": result.returncode == 0,
+        "output": output[-3000:],
+        "tip": ("passed=false while the bug exists is the EXPECTED baseline; passed=true after "
+                "your fix is the confirmation. If the baseline run passes BEFORE you changed "
+                "anything, the spec's premise is refuted — follow your PREMISE CHECK EXIT "
+                "protocol instead of hunting where the spec points."),
+    })
+
+
 # ─── SCHEMA REGISTRY ────────────────────────────────────────────────────────
 
 def _schema(name, desc, props, required):
@@ -711,6 +777,7 @@ TOOLS_FN = {
     "run_mutation_tests": run_mutation_tests,
     "run_playwright_tests": run_playwright_tests,
     "take_screenshot": take_screenshot,
+    "run_repro_script": run_repro_script,
 }
 
 TOOLS_SCHEMA = {
@@ -762,6 +829,18 @@ TOOLS_SCHEMA = {
             "url":         {"type": "string", "description": "URL to capture"},
             "output_path": {"type": "string", "description": f"Output .png path. Default: '{SCREENSHOTS_DIR}/manual.png'"}
         }, ["url"]),
+
+    "run_repro_script": _schema(
+        "run_repro_script",
+        "Run this feature's reproduction script (progress/repro_<feature_id>.py or .sh) ON THE "
+        "HOST, outside the sandbox — it has real network access to the running app and a browser "
+        "available, which run_bash does NOT (its sandbox has no route to the host). Per your "
+        "REPRO SCRIPT PROTOCOL: run it FIRST to confirm the baseline failure, and LAST to "
+        "confirm your fix. Returns passed (exit 0), returncode, and the script's output.",
+        {
+            "feature_id": {"type": "integer", "description": "The feature whose repro script to run"},
+            "timeout":    {"type": "integer", "description": f"Optional timeout in seconds (capped at {REPRO_SCRIPT_TIMEOUT_S})"}
+        }, ["feature_id"]),
 
     "run_mutation_tests": _schema(
         "run_mutation_tests",
