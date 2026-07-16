@@ -223,6 +223,16 @@ RETRY_BACKOFF      = [2, 4, 8]  # seconds between API retries
 # Fires every CONVERGENCE_STREAK_LIMIT-th iteration of the streak (7, 14, 21,
 # ...) rather than once, in case the first nudge doesn't land. 0 disables it.
 CONVERGENCE_STREAK_LIMIT = int(os.getenv("CONVERGENCE_STREAK_LIMIT", "7"))
+# Hard companion to the soft streak nudge above. Real incident (feature #77,
+# round 2, attempt 1): the nudge mechanism fired ~11 times (streak checkpoints
+# + the 60%/85% budget checkpoints) and the agent kept reading until iteration
+# 80 without writing anything — the watchdog existed; it had no teeth. If an
+# attempt reaches this many total iterations with ZERO writes, it is aborted
+# early with a message distinct from a normal max_iter cutoff. Combined with
+# the investigation digest (v1.53.0), dying at 40 with findings handed to the
+# retry is strictly better than dying at 80 just as empty: it leaves half the
+# budget for an informed retry. 0 disables the hard cut.
+MAX_ITER_WITHOUT_WRITE = int(os.getenv("MAX_ITER_WITHOUT_WRITE", "40"))
 _WRITE_TOOL_NAMES = {"write_file", "append_file", "update_feature_status"}
 
 # ─── FEATURE DESIGN RULE ─────────────────────────────────────────────────────
@@ -1919,7 +1929,7 @@ def _classify_error(error_msg: str) -> str:
     if any(k in msg for k in ("401", "403", "529", "authentication", "unauthorized",
                                "invalid api key", "overloaded", "capacity")):
         return "PROVIDER_FAILURE"
-    if any(k in msg for k in ("max_iter", "blocked", "assertion", "error:")):
+    if any(k in msg for k in ("max_iter", "zero writes", "blocked", "assertion", "error:")):
         return "LOGICAL"
     return "FATAL"
 
@@ -1984,16 +1994,17 @@ def _bash_outcome_line(result: str) -> str:
 
 
 def _build_investigation_digest(files_read: list, bash_outcomes: dict,
-                                last_assistant_text: str, max_iter: int) -> str:
+                                last_assistant_text: str, cutoff_note: str) -> str:
     """
     Short, deterministic context block handed to the next implementer attempt
-    when this one hit max_iter without a verdict: (a) deduplicated files
-    already read, (b) commands already run with their one-line outcome,
-    (c) the last assistant reasoning text before the cutoff (usually contains
-    the active hypothesis). Bounded so it informs the retry without eating
-    the budget it exists to protect.
+    when this one was cut off without a verdict (max_iter, or the
+    MAX_ITER_WITHOUT_WRITE zero-write abort — cutoff_note says which):
+    (a) deduplicated files already read, (b) commands already run with their
+    one-line outcome, (c) the last assistant reasoning text before the cutoff
+    (usually contains the active hypothesis). Bounded so it informs the retry
+    without eating the budget it exists to protect.
     """
-    parts = [f"(previous attempt hit max_iter {max_iter} without finishing; "
+    parts = [f"(previous attempt was cut off — {cutoff_note} — without finishing; "
              f"its investigation so far:)"]
     if files_read:
         shown = files_read[:_INVESTIGATION_MAX_FILES]
@@ -2058,6 +2069,11 @@ def run_agent(system_prompt: str, tools: list, task: str,
     _impl_files_read: list = []
     _impl_bash_outcomes: dict = {}
     _impl_last_assistant_text = ""
+    # Zero-write hard cut (MAX_ITER_WITHOUT_WRITE): _no_write_streak resets on
+    # every write, so it can't answer "has this attempt written ANYTHING yet";
+    # this flag can. Set once, never reset.
+    _any_write_this_attempt = False
+    _zero_write_abort_iters: Optional[int] = None
 
     # Generic, role-agnostic budget-checkpoint enforcement. Previously this
     # was only advisory prompt text in agents/e2e_tester.py's "BUDGET
@@ -2083,9 +2099,26 @@ def run_agent(system_prompt: str, tools: list, task: str,
                 )
             })
         if CONVERGENCE_STREAK_LIMIT and _no_write_streak and _no_write_streak % CONVERGENCE_STREAK_LIMIT == 0:
-            messages.append({
-                "role": "user",
-                "content": (
+            # Escalate from the second firing on. Real incident (feature #77,
+            # round 2, attempt 1): ~11 identical soft nudges fired and the
+            # agent kept reading until iteration 80 without writing — the
+            # same polite text repeated is easy to under-attend to.
+            _nudge_number = _no_write_streak // CONVERGENCE_STREAK_LIMIT
+            if _nudge_number >= 2:
+                _nudge_text = (
+                    f"⚠️ CONVERGENCE CHECKPOINT #{_nudge_number} — ESCALATED: you have now gone "
+                    f"{_no_write_streak} iterations without writing anything, ignoring at least "
+                    "one previous checkpoint. Your NEXT tool call MUST be write_file — your best "
+                    "partial fix, or a reproduction script capturing what you have verified so "
+                    "far. Anything else counts as a protocol violation."
+                )
+                if MAX_ITER_WITHOUT_WRITE > 0 and not _any_write_this_attempt:
+                    _nudge_text += (
+                        f" The harness will abort this attempt outright at "
+                        f"{MAX_ITER_WITHOUT_WRITE} total iterations with zero writes."
+                    )
+            else:
+                _nudge_text = (
                     f"⚠️ CONVERGENCE CHECKPOINT: you have gone {_no_write_streak} tool call "
                     "iteration(s) without writing or editing anything. If you already know "
                     "what to change and where, stop exploring and make the edit now — do not "
@@ -2093,7 +2126,7 @@ def run_agent(system_prompt: str, tools: list, task: str,
                     "don't know yet, re-read the task description itself rather than more of "
                     "the codebase."
                 )
-            })
+            messages.append({"role": "user", "content": _nudge_text})
         if i == max_iter - 1:
             messages.append({
                 "role": "user",
@@ -2221,6 +2254,8 @@ def run_agent(system_prompt: str, tools: list, task: str,
             })
 
         _no_write_streak = 0 if made_write_this_iter else _no_write_streak + 1
+        if made_write_this_iter:
+            _any_write_this_attempt = True
 
         # Snapshot after this iteration's tool calls are recorded — a crash
         # past this point loses at most the current iteration, not the whole
@@ -2228,7 +2263,24 @@ def run_agent(system_prompt: str, tools: list, task: str,
         if checkpoint_key:
             _save_message_state(checkpoint_key, messages)
 
-    _log(role, "MAX_ITER", f"Reached iteration limit of {max_iter}", level="warning")
+        # Hard cut: the soft nudges above are advisory and were ignored ~11
+        # times in a row in the feature #77 incident. An attempt that has
+        # made ZERO writes by this point is not going to converge — abort
+        # early so (combined with the investigation digest below) the retry
+        # starts informed with half the budget still unspent.
+        if (MAX_ITER_WITHOUT_WRITE > 0 and not _any_write_this_attempt
+                and (i + 1) >= MAX_ITER_WITHOUT_WRITE):
+            _zero_write_abort_iters = i + 1
+            break
+
+    if _zero_write_abort_iters is not None:
+        _log(role, "ZERO_WRITE_ABORT",
+             f"Attempt aborted after {_zero_write_abort_iters} iterations with zero writes "
+             f"(MAX_ITER_WITHOUT_WRITE={MAX_ITER_WITHOUT_WRITE})", level="warning")
+        _cutoff_note = f"aborted after {_zero_write_abort_iters} iterations with zero writes"
+    else:
+        _log(role, "MAX_ITER", f"Reached iteration limit of {max_iter}", level="warning")
+        _cutoff_note = f"hit max_iter {max_iter}"
     _clear_message_state(checkpoint_key)
 
     # e2e_tester only: if this attempt never wrote its own progress/e2e_<id>.json
@@ -2261,7 +2313,7 @@ def run_agent(system_prompt: str, tools: list, task: str,
                         f"# E2E report for feature #{feature_id}\n\n"
                         f"(synthesized by harness after max_iter — the agent never wrote its own report)\n\n"
                         f"## Last run_playwright_tests evidence (tail)\n```\n{tail}\n```\n\n"
-                        f"- Verdict: {VERDICT_E2E_FAILED}: max_iter {max_iter} reached with no agent-written "
+                        f"- Verdict: {VERDICT_E2E_FAILED}: {_cutoff_note} with no agent-written "
                         f"report; see the captured Playwright evidence above.\n"
                     )
                 _log("harness", "E2E_MAX_ITER_REPORT_SYNTHESIZED",
@@ -2282,7 +2334,7 @@ def run_agent(system_prompt: str, tools: list, task: str,
             with open(_investigation_digest_path(feature_id), "w", encoding="utf-8") as f:
                 f.write(_build_investigation_digest(
                     _impl_files_read, _impl_bash_outcomes,
-                    _impl_last_assistant_text, max_iter))
+                    _impl_last_assistant_text, _cutoff_note))
             _log("harness", "IMPL_MAX_ITER_INVESTIGATION_SAVED",
                  f"feature={feature_id} — saved investigation digest "
                  f"({len(_impl_files_read)} files read, {len(_impl_bash_outcomes)} commands) "
@@ -2291,10 +2343,15 @@ def run_agent(system_prompt: str, tools: list, task: str,
             _log("harness", "IMPL_MAX_ITER_INVESTIGATION_SAVE_ERROR",
                  f"feature={feature_id}: {exc}", level="warning")
 
+    if _zero_write_abort_iters is not None:
+        _err_head = (f"[ERROR: attempt aborted: {_zero_write_abort_iters} iterations "
+                     f"with zero writes (MAX_ITER_WITHOUT_WRITE={MAX_ITER_WITHOUT_WRITE})]")
+    else:
+        _err_head = f"[ERROR: max_iter {max_iter} reached]"
     if tool_call_errors:
         recent_errors = "\n".join(f"  - {e}" for e in tool_call_errors[-5:])
-        return f"[ERROR: max_iter {max_iter} reached]\nRecent tool-call errors:\n{recent_errors}"
-    return f"[ERROR: max_iter {max_iter} reached]"
+        return f"{_err_head}\nRecent tool-call errors:\n{recent_errors}"
+    return _err_head
 
 
 # ─── PLUGIN / HOOK SYSTEM ────────────────────────────────────────────────────
@@ -3539,7 +3596,8 @@ def spawn_e2e_tester(feature_id: int, attempt: int = 1) -> str:
     # "[ERROR: max_iter 50 reached]\nRecent tool-call errors: ...".
     md_path = f"{PROGRESS_DIR}/e2e_{feature_id}.md"
     json_path = f"{PROGRESS_DIR}/e2e_{feature_id}.json"
-    if result.startswith("[ERROR: max_iter") and not os.path.exists(json_path) and os.path.exists(md_path):
+    if result.startswith(("[ERROR: max_iter", "[ERROR: attempt aborted")) \
+            and not os.path.exists(json_path) and os.path.exists(md_path):
         try:
             with open(md_path, "r", encoding="utf-8") as f:
                 report_text = f.read()

@@ -2801,6 +2801,133 @@ class TestConvergenceStreakDetector:
         assert not any(self._checkpoint_present(snap) for snap in captured)
 
 
+class TestConvergenceEscalationAndZeroWriteCut:
+    """
+    Regression coverage for feature #77, round 2, attempt 1: the convergence
+    watchdog existed and FIRED — CONVERGENCE_STREAK_LIMIT=7 plus the 60%/85%
+    budget checkpoints injected ~11 nudges — and the agent kept reading until
+    iteration 80 without writing anything. The watchdog wasn't missing; it had
+    no teeth. Two additions: from the second streak firing on, the nudge
+    escalates to an imperative ("your NEXT tool call MUST be write_file"), and
+    MAX_ITER_WITHOUT_WRITE (default 40, 0 disables) aborts an attempt early
+    if it reaches that many total iterations with zero writes — distinct
+    message from a normal max_iter cutoff, and the investigation digest
+    (v1.53.0) still gets written, so the retry starts informed with budget
+    left.
+    """
+
+    def _fake_tool_call(self, call_id, name, args_json):
+        from types import SimpleNamespace
+        fn = SimpleNamespace(name=name, arguments=args_json)
+        return SimpleNamespace(id=call_id, function=fn)
+
+    def _fake_response(self, tool_calls, content=None):
+        from types import SimpleNamespace
+        msg = SimpleNamespace(content=content, tool_calls=tool_calls)
+        usage = SimpleNamespace(prompt_tokens=10, completion_tokens=5)
+        choice = SimpleNamespace(message=msg)
+        return SimpleNamespace(choices=[choice], usage=usage, model="deepseek-v4-pro")
+
+    def _read_response(self, i):
+        return self._fake_response([self._fake_tool_call(f"c{i}", "read_file", '{"path": "src/a.py"}')])
+
+    def _write_response(self, i):
+        return self._fake_response([self._fake_tool_call(f"c{i}", "write_file", '{"path": "src/a.py", "content": "x"}')])
+
+    def _recording_call(self, responses):
+        captured = []
+
+        def fake_call(**kwargs):
+            captured.append(list(kwargs["messages"]))
+            return responses[len(captured) - 1]
+        return fake_call, captured
+
+    def _user_texts(self, snapshot):
+        return [m.get("content", "") for m in snapshot if isinstance(m, dict) and m.get("role") == "user"]
+
+    def test_second_streak_firing_escalates_to_imperative(self, monkeypatch, tmp_path):
+        h = _load_harness(monkeypatch, tmp_path,
+                          {"CONVERGENCE_STREAK_LIMIT": "2", "MAX_ITER_WITHOUT_WRITE": "0"})
+        responses = [self._read_response(i) for i in range(6)]
+        fake_call, captured = self._recording_call(responses)
+        monkeypatch.setattr(h, "_call_api_with_fallback", MagicMock(side_effect=fake_call))
+        monkeypatch.setattr(h, "execute_tool", MagicMock(return_value=json.dumps({"content": "..."})))
+
+        h.run_agent("sys", [], "task", role="implementer", max_iter=6)
+
+        # Streak hits 2 before iteration 2 (first firing, soft text) and 4
+        # before iteration 4 (second firing — escalated).
+        first = "\n".join(self._user_texts(captured[2]))
+        assert "CONVERGENCE CHECKPOINT" in first
+        assert "ESCALATED" not in first
+        second = "\n".join(self._user_texts(captured[4]))
+        assert "ESCALATED" in second
+        assert "MUST be write_file" in second
+        assert "protocol violation" in second
+
+    def test_escalated_nudge_announces_hard_cut_only_before_any_write(self, monkeypatch, tmp_path):
+        # With a write already made, the zero-write abort can no longer fire —
+        # the escalated nudge must not threaten it.
+        h = _load_harness(monkeypatch, tmp_path,
+                          {"CONVERGENCE_STREAK_LIMIT": "1", "MAX_ITER_WITHOUT_WRITE": "30"})
+        responses = [self._write_response(0)] + [self._read_response(i) for i in range(1, 4)]
+        fake_call, captured = self._recording_call(responses)
+        monkeypatch.setattr(h, "_call_api_with_fallback", MagicMock(side_effect=fake_call))
+        monkeypatch.setattr(h, "execute_tool", MagicMock(return_value=json.dumps({"status": "ok"})))
+
+        h.run_agent("sys", [], "task", role="implementer", max_iter=4)
+
+        # With limit=1, streak=2 before iteration 3 → escalated firing #2.
+        escalated = "\n".join(t for t in self._user_texts(captured[3]) if "ESCALATED" in t)
+        assert "MUST be write_file" in escalated
+        assert "abort this attempt outright" not in escalated
+
+    def test_zero_write_abort_fires_at_threshold(self, monkeypatch, tmp_path):
+        h = _load_harness(monkeypatch, tmp_path, {"MAX_ITER_WITHOUT_WRITE": "3"})
+        api = MagicMock(side_effect=[self._read_response(i) for i in range(10)])
+        monkeypatch.setattr(h, "_call_api_with_fallback", api)
+        monkeypatch.setattr(h, "execute_tool", MagicMock(return_value=json.dumps({"content": "..."})))
+
+        result = h.run_agent("sys", [], "task", role="implementer", max_iter=10)
+
+        assert result.startswith("[ERROR: attempt aborted: 3 iterations with zero writes")
+        assert api.call_count == 3  # half the budget saved for the informed retry
+
+    def test_a_single_write_prevents_the_abort(self, monkeypatch, tmp_path):
+        h = _load_harness(monkeypatch, tmp_path, {"MAX_ITER_WITHOUT_WRITE": "3"})
+        responses = [self._write_response(0)] + [self._read_response(i) for i in range(1, 5)]
+        monkeypatch.setattr(h, "_call_api_with_fallback", MagicMock(side_effect=responses))
+        monkeypatch.setattr(h, "execute_tool", MagicMock(return_value=json.dumps({"status": "ok"})))
+
+        result = h.run_agent("sys", [], "task", role="implementer", max_iter=5)
+
+        assert result.startswith("[ERROR: max_iter 5 reached]")  # normal cutoff, not the abort
+
+    def test_abort_still_writes_the_investigation_digest(self, monkeypatch, tmp_path):
+        h = _load_harness(monkeypatch, tmp_path, {"MAX_ITER_WITHOUT_WRITE": "2"})
+        (tmp_path / "progress").mkdir(exist_ok=True)
+        monkeypatch.setattr(h, "_call_api_with_fallback", MagicMock(
+            side_effect=[self._read_response(i) for i in range(2)]))
+        monkeypatch.setattr(h, "execute_tool", MagicMock(
+            return_value=json.dumps({"content": "...", "path": "src/a.py"})))
+
+        h.run_agent("sys", [], "task", role="implementer", max_iter=10, feature_id=9)
+
+        digest = (tmp_path / "progress" / "_investigation_impl_9.md").read_text()
+        assert "aborted after 2 iterations with zero writes" in digest
+        assert "- src/a.py" in digest
+
+    def test_zero_disables_the_hard_cut(self, monkeypatch, tmp_path):
+        h = _load_harness(monkeypatch, tmp_path, {"MAX_ITER_WITHOUT_WRITE": "0"})
+        monkeypatch.setattr(h, "_call_api_with_fallback", MagicMock(
+            side_effect=[self._read_response(i) for i in range(4)]))
+        monkeypatch.setattr(h, "execute_tool", MagicMock(return_value=json.dumps({"content": "..."})))
+
+        result = h.run_agent("sys", [], "task", role="implementer", max_iter=4)
+
+        assert result.startswith("[ERROR: max_iter 4 reached]")
+
+
 class TestSandboxLocalEnvSanitization:
     def test_api_keys_stripped_from_local_subprocess_env(self, monkeypatch):
         monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-should-be-stripped")
