@@ -2665,7 +2665,7 @@ class TestImplMaxIterInvestigationDigest:
 
         h.spawn_implementer(9, "Fix: is_active no persiste")
 
-        assert "PREVIOUS ATTEMPT'S INVESTIGATION — do not re-derive this" in captured["task"]
+        assert "PREVIOUS ATTEMPT'S INVESTIGATION — historical context, not ground truth" in captured["task"]
         assert "pytest tests/test_branches.py → 29 passed in 1.2s" in captured["task"]
 
     def test_spawn_implementer_without_digest_has_no_header(self, monkeypatch, tmp_path):
@@ -3419,6 +3419,149 @@ class TestDestructiveRewriteWarning:
         assert "content you read earlier this run" in warning
         assert "If the file already existed in the last commit" in warning
         assert "not committed yet" in warning
+
+
+class TestInvestigationDigestLifecycle:
+    """
+    progress/_investigation_impl_<id>.md (v1.53.0) was written on a max_iter/
+    zero-write cutoff and injected on every subsequent spawn_implementer call,
+    but never deleted — same staleness class that already forced the spec
+    quarantines (wrong_premise, stale e2e test dir): a feature that eventually
+    gets approved, or that sits "failed" for weeks before being re-queued,
+    would inject a digest describing code that has since changed, with an
+    actively misleading "do not re-read the files listed" instruction. Fixed:
+    the digest is deleted on approval and on a wrong_premise spec quarantine,
+    survives an ordinary final rejection (it can still help an imminent
+    re-run), and is stamped + framed as historical context when injected.
+    """
+
+    def _patch_cycle(self, h, monkeypatch, review_results):
+        monkeypatch.setattr(h, "spawn_spec_writer", MagicMock(return_value="progress/spec_1.md"))
+        monkeypatch.setattr(h, "spawn_implementer", MagicMock(return_value="ok"))
+        monkeypatch.setattr(h, "spawn_e2e_tester", MagicMock(return_value="E2E_PASSED"))
+        monkeypatch.setattr(h, "spawn_reviewer", MagicMock(side_effect=review_results))
+        monkeypatch.setattr(h, "_fire", MagicMock())
+        monkeypatch.setattr(h, "_fire_gate", MagicMock(return_value=None))
+        monkeypatch.setattr(h, "_track_usage", MagicMock())
+
+    def test_clear_investigation_digest_removes_the_file(self, monkeypatch, tmp_path):
+        h = _load_harness(monkeypatch, tmp_path)
+        (tmp_path / "progress").mkdir(exist_ok=True)
+        digest = tmp_path / "progress" / "_investigation_impl_1.md"
+        digest.write_text("stale investigation")
+
+        h._clear_investigation_digest(1)
+
+        assert not digest.exists()
+
+    def test_clear_investigation_digest_is_a_noop_when_absent(self, monkeypatch, tmp_path):
+        h = _load_harness(monkeypatch, tmp_path)
+        (tmp_path / "progress").mkdir(exist_ok=True)
+        h._clear_investigation_digest(1)  # must not raise
+
+    def test_digest_deleted_on_feature_approval(self, monkeypatch, tmp_path):
+        h = _load_harness(monkeypatch, tmp_path)
+        (tmp_path / "progress").mkdir(exist_ok=True)
+        digest = tmp_path / "progress" / "_investigation_impl_1.md"
+        digest.write_text("investigation from a prior failed attempt on old code")
+        self._patch_cycle(h, monkeypatch, review_results=["APPROVED"])
+
+        result = h.run_feature_cycle(1, "desc", e2e=False)
+
+        assert result["approved"] is True
+        assert not digest.exists()
+
+    def test_digest_survives_an_ordinary_final_rejection(self, monkeypatch, tmp_path):
+        # An imminent re-run can still be helped by it — only approval and the
+        # wrong_premise spec quarantine delete it, not a plain exhausted retry.
+        h = _load_harness(monkeypatch, tmp_path, {"MAX_RETRIES_REVIEW": "2"})
+        (tmp_path / "progress").mkdir(exist_ok=True)
+        digest = tmp_path / "progress" / "_investigation_impl_1.md"
+        digest.write_text("investigation recorded 2026-07-01T00:00:00")
+        self._patch_cycle(h, monkeypatch, review_results=["REJECTED: x", "REJECTED: y"])
+
+        result = h.run_feature_cycle(1, "desc", e2e=False)
+
+        assert result["approved"] is False
+        assert digest.exists()
+        assert digest.read_text() == "investigation recorded 2026-07-01T00:00:00"
+
+    def test_digest_cleared_on_wrong_premise_spec_quarantine(self, monkeypatch, tmp_path):
+        h = _load_harness(monkeypatch, tmp_path)
+        monkeypatch.setattr(h, "_call_api_with_fallback", lambda *a, **kw: None)
+        (tmp_path / "progress").mkdir(exist_ok=True)
+        (tmp_path / "progress" / "spec_77.md").write_text(
+            "# cached spec\nRoot cause: the backend does not persist is_active.")
+        (tmp_path / "progress" / "diagnosis_77.json").write_text(json.dumps({
+            "cause": "wrong_premise", "explanation": "pytest passed on attempt 1",
+        }))
+        digest = tmp_path / "progress" / "_investigation_impl_77.md"
+        digest.write_text("investigation chasing the now-refuted premise")
+
+        def fake_run_agent(system_prompt, tools, task, **kw):
+            with open("progress/spec_77.md", "w", encoding="utf-8") as f:
+                f.write("# fresh spec")
+            return "progress/spec_77.md"
+        monkeypatch.setattr(h, "run_agent", fake_run_agent)
+
+        h.spawn_spec_writer(77, "some feature")
+
+        assert not digest.exists()
+
+    def test_digest_kept_on_stale_e2e_quarantine_not_wrong_premise(self, monkeypatch, tmp_path):
+        # The stale-e2e-test-dir quarantine is a different failure mode (a
+        # path pointed at the wrong runner, not a refuted diagnosis) — it must
+        # not incidentally sweep up an unrelated investigation digest.
+        for key in list(sys.modules.keys()):
+            if key in ("tools", "stack_layout"):
+                del sys.modules[key]
+        h = _load_harness(monkeypatch, tmp_path)
+        (tmp_path / "stack_profiles.json").write_text(json.dumps({
+            "e2e_runner": {
+                "playwright": {"name": "Playwright (Python)", "runtime": "python",
+                               "file_ext": ".py", "test_dir": "tests/e2e/",
+                               "run_cmd": "python3 -m pytest tests/e2e/ -v"},
+                "playwright-node": {"name": "Playwright (Node)", "runtime": "node",
+                                    "file_ext": ".spec.ts", "test_dir": "e2e/",
+                                    "run_cmd": "npx playwright test"},
+            }
+        }))
+        monkeypatch.setattr(h, "_call_api_with_fallback", lambda *a, **kw: None)
+        (tmp_path / "progress").mkdir(exist_ok=True)
+        (tmp_path / "progress" / "spec_74.md").write_text(
+            "## Tests to write\nAppend to e2e/biovet.spec.ts.")
+        digest = tmp_path / "progress" / "_investigation_impl_74.md"
+        digest.write_text("unrelated investigation, should survive")
+
+        def fake_run_agent(system_prompt, tools, task, **kw):
+            with open("progress/spec_74.md", "w", encoding="utf-8") as f:
+                f.write("# fresh spec\ntests/e2e/test_feature_74.py")
+            return "progress/spec_74.md"
+        monkeypatch.setattr(h, "run_agent", fake_run_agent)
+
+        h.spawn_spec_writer(74, "desc")
+
+        assert digest.exists()  # untouched — not a wrong_premise quarantine
+
+    def test_injected_digest_is_timestamped_and_framed_as_historical(self, monkeypatch, tmp_path):
+        h = _load_harness(monkeypatch, tmp_path)
+        h.impl_cfg.TOOLS = []
+        (tmp_path / "progress").mkdir(exist_ok=True)
+        digest_text = h._build_investigation_digest(
+            ["src/a.py"], {"pytest tests/": "3 passed"}, "hypothesis text", "hit max_iter 50")
+        (tmp_path / "progress" / "_investigation_impl_9.md").write_text(digest_text)
+        captured = {}
+
+        def fake_run_agent(system_prompt, tools, task, **kw):
+            captured["task"] = task
+            return "progress/impl_9.md"
+        monkeypatch.setattr(h, "run_agent", fake_run_agent)
+
+        h.spawn_implementer(9, "Fix: is_active no persiste")
+
+        assert "historical context, not ground truth" in captured["task"]
+        assert "investigation recorded" in captured["task"]  # timestamp header from the digest body
+        assert "verify before relying on its conclusions" in captured["task"]
 
 
 # ── tools.py: run_repro_script (host-side repro runner) ──────────────────────

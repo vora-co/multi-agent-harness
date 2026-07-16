@@ -1972,6 +1972,29 @@ def _investigation_digest_path(feature_id: int) -> str:
     return f"{PROGRESS_DIR}/_investigation_impl_{feature_id}.md"
 
 
+def _clear_investigation_digest(feature_id: int) -> None:
+    """
+    Delete the investigation digest, if any. Called on the two events after
+    which the digest is actively misleading rather than merely stale: the
+    feature got approved (there's no "next attempt" left to hand it to — the
+    code it describes is about to be superseded by whatever ships), and a
+    wrong_premise spec quarantine (see _refuted_premise_evidence) — an
+    investigation that was chasing a refuted premise must not steer the
+    attempt that works from the freshly regenerated spec. Deliberately NOT
+    called on an ordinary final rejection: a digest surviving that failure
+    can still help an imminent re-run, which is why _build_investigation_digest
+    stamps it with a creation time instead. Best-effort, same as every other
+    quarantine/cleanup helper in this file.
+    """
+    try:
+        os.remove(_investigation_digest_path(feature_id))
+    except FileNotFoundError:
+        pass
+    except OSError as exc:
+        _log("harness", "INVESTIGATION_DIGEST_CLEAR_ERROR",
+             f"feature={feature_id}: {exc}", level="warning")
+
+
 def _bash_outcome_line(result: str) -> str:
     """One-line summary of a run_bash result (e.g. pytest's '29 passed in
     1.2s' closing line). Best-effort, bounded, never raises."""
@@ -2003,9 +2026,18 @@ def _build_investigation_digest(files_read: list, bash_outcomes: dict,
     one-line outcome, (c) the last assistant reasoning text before the cutoff
     (usually contains the active hypothesis). Bounded so it informs the retry
     without eating the budget it exists to protect.
+
+    Stamped with the creation time — see the STALE DIGEST note where this is
+    injected (spawn_implementer) for why: the digest is deleted on approval
+    and on a wrong_premise spec quarantine, but deliberately SURVIVES a final
+    feature failure (it can still help an imminent re-run) and a feature can
+    sit "failed" for weeks before someone resets it to "pending" — by then
+    the code it was written against may no longer exist. The timestamp is
+    what lets the next attempt judge that for itself.
     """
-    parts = [f"(previous attempt was cut off — {cutoff_note} — without finishing; "
-             f"its investigation so far:)"]
+    _created_at = datetime.datetime.now().isoformat(timespec="seconds")
+    parts = [f"(investigation recorded {_created_at} — previous attempt was cut off "
+             f"— {cutoff_note} — without finishing; its investigation so far:)"]
     if files_read:
         shown = files_read[:_INVESTIGATION_MAX_FILES]
         parts.append("## Files already read (deduplicated)\n"
@@ -3003,17 +3035,33 @@ def spawn_implementer(feature_id: int, description: str, attempt: int = 1,
     # read + command outcomes + last hypothesis — see
     # _build_investigation_digest) is on disk: hand it over so this attempt
     # doesn't re-derive knowledge that already cost a full budget to gather.
+    #
+    # STALE DIGEST NOTE: the digest is deleted on approval and on a
+    # wrong_premise spec quarantine (see _clear_investigation_digest) — the
+    # two events after which it would describe code that's about to be (or
+    # already was) superseded. But it deliberately SURVIVES an ordinary final
+    # rejection, because it can still help an imminent re-run — and a feature
+    # can sit "failed" for weeks before someone resets it to "pending" (see
+    # CLAUDE.md's "To reset a failed feature" recipe), by which point the
+    # code it was written against may no longer exist. That's why the digest
+    # is stamped with its creation time and framed here as HISTORICAL context
+    # to verify, not as ground truth to blindly trust — same caution the
+    # wrong_premise/stale-e2e spec quarantines already apply one level up.
     investigation_context = ""
     _inv_path = _investigation_digest_path(feature_id)
     if os.path.exists(_inv_path):
         try:
             with open(_inv_path, "r", encoding="utf-8") as f:
                 investigation_context = (
-                    f"\n## PREVIOUS ATTEMPT'S INVESTIGATION — do not re-derive this\n"
-                    f"A previous attempt ran out of iterations before finishing, but its "
-                    f"investigation survives below. Spend your budget on what it did NOT "
-                    f"reach: do not re-read the files listed, and do not re-run commands "
-                    f"whose outcome is already recorded here.\n{f.read()}\n"
+                    f"\n## PREVIOUS ATTEMPT'S INVESTIGATION — historical context, not ground truth\n"
+                    f"A previous attempt ran out of iterations before finishing. Its investigation "
+                    f"survives below, dated. If the code it describes hasn't changed since then, "
+                    f"trust it fully: do not re-read the files listed, and do not re-run commands "
+                    f"whose outcome is already recorded here — spend your budget on what it did NOT "
+                    f"reach. If you have reason to believe the relevant code changed since that "
+                    f"date (e.g. this feature sat failed for a while before being re-run), verify "
+                    f"before relying on its conclusions rather than assuming they still hold.\n"
+                    f"{f.read()}\n"
                 )
         except OSError:
             pass  # best-effort — a missing/unreadable digest never blocks the spawn
@@ -3269,6 +3317,10 @@ def spawn_spec_writer(feature_id: int, description: str) -> str:
                  level="warning")
             _vprint("normal", "  [cyan]📋 SPEC_WRITER[/] [yellow]⚠ cached spec's diagnosis was "
                               "refuted by direct verification — quarantined, regenerating[/]")
+            # The investigation digest (if any) was built chasing the now-
+            # refuted premise — it must not steer the attempt that works from
+            # the freshly regenerated spec. See _clear_investigation_digest.
+            _clear_investigation_digest(feature_id)
         else:
             _log("spec_writer", "SKIP", f"Spec already exists: {spec_path}")
             _vprint("normal", f"  [cyan]📋 SPEC_WRITER[/] [dim]↩ reusing existing spec →[/] {spec_path}")
@@ -3898,6 +3950,10 @@ def _run_feature_cycle_impl(feature_id: int, description: str, e2e: bool = True)
             # already-shipped feature as stale (recovery skips "done").
             _set_feature_status(feature_id, "done")
             _clear_checkpoint(feature_id)
+            # No attempt is coming after this one — a surviving digest would
+            # only ever be injected against code this approval is about to
+            # change. See _clear_investigation_digest for the full rationale.
+            _clear_investigation_digest(feature_id)
             _fire("after_feature_approved",
                   feature_id=feature_id, description=description, attempts=attempt)
             console.print(f"[green]✅ Feature #{feature_id} approved[/] ({attempt} attempt(s))")
