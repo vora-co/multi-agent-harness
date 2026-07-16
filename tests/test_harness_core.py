@@ -3420,6 +3420,103 @@ class TestDestructiveRewriteWarning:
         assert "If the file already existed in the last commit" in warning
         assert "not committed yet" in warning
 
+    # ── column-0 anchoring: nested methods are not top-level symbols ─────────
+    #
+    # Real finding (discovered running the harness, not reading code):
+    # _PY_SYMBOL_RE/_JS_SYMBOL_RE used to anchor on "^\s*", which accepts any
+    # indentation — so a method nested inside a class matched the same as a
+    # module-level def/class, contradicting _top_level_symbols' own name and
+    # docstring ("Cheap regex heuristic for 'symbols this file defines'" at
+    # module level). Verified against a real repo: deleting a class whose
+    # method was named `validate` reported "def validate" as a removed
+    # "top-level" symbol. The regexes are now anchored to real column 0.
+
+    def test_renaming_a_nested_method_produces_no_warning(self, monkeypatch, tmp_path):
+        t = self._load_tools(monkeypatch, tmp_path)
+        (tmp_path / "src").mkdir()
+        old = (
+            "class BranchValidator:\n"
+            "    def validate(self, payload):\n"
+            "        return payload\n"
+        )
+        new = (
+            "class BranchValidator:\n"
+            "    def validate_payload(self, payload):\n"
+            "        return payload\n"
+        )
+        (tmp_path / "src" / "validator.py").write_text(old)
+        result = json.loads(t.write_file(path="src/validator.py", content=new))
+        assert result["status"] == "ok"
+        assert "warning" not in result  # a nested method rename is not a top-level deletion
+
+    def test_deleting_a_nested_method_produces_no_warning(self, monkeypatch, tmp_path):
+        # A method nested inside a class is not a module-level symbol at all —
+        # deleting it (not renaming it) must stay silent too, symmetric with
+        # the rename case above. This is the same fix, checked from the other
+        # side: before the column-0 anchor, THIS is the case that reported
+        # "def validate" as a removed "top-level" symbol.
+        t = self._load_tools(monkeypatch, tmp_path)
+        (tmp_path / "src").mkdir()
+        old = (
+            "class BranchValidator:\n"
+            "    def validate(self, payload):\n"
+            "        return payload\n"
+            "    def other(self):\n"
+            "        pass\n"
+        )
+        new = (
+            "class BranchValidator:\n"
+            "    def other(self):\n"
+            "        pass\n"
+        )
+        (tmp_path / "src" / "validator.py").write_text(old)
+        result = json.loads(t.write_file(path="src/validator.py", content=new))
+        assert result["status"] == "ok"
+        assert "warning" not in result
+
+    def test_deleting_a_module_level_class_still_warns(self, monkeypatch, tmp_path):
+        # The fix narrows the regex to column 0 — it must not stop detecting
+        # real module-level deletions, which is what the mechanism exists for
+        # (feature #77: a full endpoint + class deleted, never a nested method).
+        t = self._load_tools(monkeypatch, tmp_path)
+        (tmp_path / "src").mkdir()
+        old = (
+            "class BranchValidator:\n"
+            "    def validate(self, payload):\n"
+            "        return payload\n\n"
+            "class Unrelated:\n"
+            "    pass\n"
+        )
+        new = "class Unrelated:\n    pass\n"
+        (tmp_path / "src" / "validator.py").write_text(old)
+        result = json.loads(t.write_file(path="src/validator.py", content=new))
+        assert "class BranchValidator" in result["warning"]
+        assert "def validate" not in result["warning"]  # nested — never in the set at all
+
+    def test_top_level_symbols_excludes_nested_defs_directly(self, monkeypatch, tmp_path):
+        t = self._load_tools(monkeypatch, tmp_path)
+        text = (
+            "class Outer:\n"
+            "    def inner(self):\n"
+            "        pass\n\n"
+            "def top_level():\n"
+            "    pass\n"
+        )
+        symbols = t._top_level_symbols(text, ".py")
+        assert symbols == {"class Outer", "def top_level"}
+
+    def test_top_level_symbols_js_excludes_indented_function(self, monkeypatch, tmp_path):
+        t = self._load_tools(monkeypatch, tmp_path)
+        text = (
+            "export class Service {\n"
+            "  function helper() {}\n"  # not valid JS class-method syntax, but exercises the anchor
+            "}\n\n"
+            "export function topLevel() {}\n"
+        )
+        symbols = t._top_level_symbols(text, ".ts")
+        assert "topLevel" in symbols
+        assert "helper" not in symbols
+
 
 class TestInvestigationDigestLifecycle:
     """

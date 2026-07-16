@@ -207,15 +207,31 @@ try:
 except ValueError:
     DESTRUCTIVE_SHRINK_MIN_LINES = 40
 
-_PY_SYMBOL_RE = re.compile(r"^\s*(?:async\s+)?(def|class)\s+([A-Za-z_]\w*)", re.MULTILINE)
+
+# Anchored to real column 0 (no leading \s*) — deliberately, not just
+# convention. A nested method (e.g. `def validate` inside a class) previously
+# matched too, because ^\s* accepts any indentation, which made
+# _top_level_symbols report methods that aren't top-level at all despite its
+# own name/docstring promising module-level symbols. Verified against a real
+# repo: deleting a class whose method is named `validate` reported "def
+# validate" as a removed "top-level" symbol. Low-severity for the per-write
+# warning below (advisory only), but the premium sdlc_governance gate reuses
+# this same set for a HARD pre-approval gate with a rename filter that matches
+# on bare symbol name across the whole diff — two unrelated classes each
+# defining their own `def validate` let a genuine deletion in one of them get
+# filtered out as a "rename" against the other's, a false negative in exactly
+# the scenario (feature #77) this mechanism exists to catch. The \s* BETWEEN
+# keywords (e.g. `def\s+`) is unrelated to this and stays — that's ordinary
+# whitespace between tokens on the same line, not line-start anchoring.
+_PY_SYMBOL_RE = re.compile(r"^(?:async\s+)?(def|class)\s+([A-Za-z_]\w*)", re.MULTILINE)
 _PY_ROUTE_DECORATOR_RE = re.compile(
     r"^\s*@(\w+)\.(get|post|put|patch|delete|head|options)\s*\(\s*[\"']([^\"']*)[\"']",
     re.MULTILINE,
 )
 _JS_SYMBOL_RE = re.compile(
-    r"^\s*(?:export\s+)?(?:default\s+)?(?:async\s+)?function\s*\*?\s*([A-Za-z_$][\w$]*)"
-    r"|^\s*(?:export\s+)?(?:abstract\s+)?class\s+([A-Za-z_$][\w$]*)"
-    r"|^\s*export\s+(?:const|let|var)\s+([A-Za-z_$][\w$]*)",
+    r"^(?:export\s+)?(?:default\s+)?(?:async\s+)?function\s*\*?\s*([A-Za-z_$][\w$]*)"
+    r"|^(?:export\s+)?(?:abstract\s+)?class\s+([A-Za-z_$][\w$]*)"
+    r"|^export\s+(?:const|let|var)\s+([A-Za-z_$][\w$]*)",
     re.MULTILINE,
 )
 
