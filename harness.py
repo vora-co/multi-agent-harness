@@ -1940,6 +1940,82 @@ def _is_write_call(fn_name: str, result: str) -> bool:
 
 # ─── GENERIC AGENT ENGINE ────────────────────────────────────────────────────
 
+# ─── Implementer investigation digest (max_iter handoff) ────────────────────
+# Real incident (feature #77, round 2): tool_call_errors below already hands a
+# retry the last 5 tool ERRORS (and did its job in round 1, re-feeding the
+# edit_file failure) — but round 2's attempt 1 had ZERO tool errors: 107 clean
+# read_file + 68 clean run_bash, including the key finding that
+# `pytest tests/test_branches.py` passed in full. Attempt 2 started blind and
+# repeated essentially the same investigation (51 reads before writing
+# anything). The existing mechanism re-feeds errors; it does not re-feed
+# KNOWLEDGE. This digest does — deterministic, no LLM call, same philosophy
+# as _build_deterministic_digest and the e2e max_iter report synthesis.
+
+_INVESTIGATION_MAX_FILES = 30
+_INVESTIGATION_MAX_CMDS  = 12
+_INVESTIGATION_VERIFY_RE = re.compile(r"pytest|npm (test|run)|npx |curl|psql|python3? -m|node ")
+
+
+def _investigation_digest_path(feature_id: int) -> str:
+    # Underscore prefix: harness-internal working file, same convention as
+    # the _state_*.json message snapshots living under progress/.
+    return f"{PROGRESS_DIR}/_investigation_impl_{feature_id}.md"
+
+
+def _bash_outcome_line(result: str) -> str:
+    """One-line summary of a run_bash result (e.g. pytest's '29 passed in
+    1.2s' closing line). Best-effort, bounded, never raises."""
+    try:
+        parsed = json.loads(result)
+    except Exception:
+        stripped = result.strip()
+        return stripped.splitlines()[-1][:120] if stripped else "(no output)"
+    if isinstance(parsed, dict):
+        if parsed.get("error"):
+            return f"error: {str(parsed['error'])[:110]}"
+        out = str(parsed.get("stdout") or "").strip()
+        if not out:
+            out = str(parsed.get("stderr") or "").strip()
+        if out:
+            lines = [line for line in out.splitlines() if line.strip()]
+            if lines:
+                return lines[-1][:120]
+    return "(no output)"
+
+
+def _build_investigation_digest(files_read: list, bash_outcomes: dict,
+                                last_assistant_text: str, max_iter: int) -> str:
+    """
+    Short, deterministic context block handed to the next implementer attempt
+    when this one hit max_iter without a verdict: (a) deduplicated files
+    already read, (b) commands already run with their one-line outcome,
+    (c) the last assistant reasoning text before the cutoff (usually contains
+    the active hypothesis). Bounded so it informs the retry without eating
+    the budget it exists to protect.
+    """
+    parts = [f"(previous attempt hit max_iter {max_iter} without finishing; "
+             f"its investigation so far:)"]
+    if files_read:
+        shown = files_read[:_INVESTIGATION_MAX_FILES]
+        parts.append("## Files already read (deduplicated)\n"
+                     + "\n".join(f"- {p}" for p in shown)
+                     + (f"\n(+{len(files_read) - len(shown)} more)" if len(files_read) > len(shown) else ""))
+    cmds = list(bash_outcomes.items())
+    if cmds:
+        if len(cmds) > _INVESTIGATION_MAX_CMDS:
+            # Verification runs (pytest, curl, psql, ...) carry the real
+            # findings — keep those over greps when the list must be cut.
+            prioritized = [c for c in cmds if _INVESTIGATION_VERIFY_RE.search(c[0])]
+            rest        = [c for c in cmds if not _INVESTIGATION_VERIFY_RE.search(c[0])]
+            cmds = (prioritized + rest)[:_INVESTIGATION_MAX_CMDS]
+        parts.append("## Commands already run → last output line\n"
+                     + "\n".join(f"- {cmd} → {outcome}" for cmd, outcome in cmds))
+    if last_assistant_text:
+        parts.append("## Last reasoning before the cutoff (likely the active hypothesis)\n"
+                     + last_assistant_text.strip()[-600:])
+    return "\n\n".join(parts)[:4000]
+
+
 def run_agent(system_prompt: str, tools: list, task: str,
               role: str = "agent", color: str = "white",
               max_iter: int = MAX_ITER_AGENT,
@@ -1973,6 +2049,15 @@ def run_agent(system_prompt: str, tools: list, task: str,
     # real traceback for the next retry/diagnostician instead of nothing.
     # See the synthesis block after the main loop below.
     _last_playwright_evidence = ""
+    # implementer only: investigation trackers for the max_iter digest (see
+    # _build_investigation_digest above). Live trackers rather than a walk of
+    # `messages` at cutoff time, deliberately: _compact_messages can discard
+    # early history, but these survive compaction. (They do NOT survive a
+    # crash+resume via _load_message_state — acceptable, that's the rare
+    # corner and the digest is best-effort.)
+    _impl_files_read: list = []
+    _impl_bash_outcomes: dict = {}
+    _impl_last_assistant_text = ""
 
     # Generic, role-agnostic budget-checkpoint enforcement. Previously this
     # was only advisory prompt text in agents/e2e_tester.py's "BUDGET
@@ -2043,6 +2128,9 @@ def run_agent(system_prompt: str, tools: list, task: str,
         messages.append(msg)
         messages = _compact_messages(messages, role)
 
+        if role == "implementer" and msg.content:
+            _impl_last_assistant_text = str(msg.content)
+
         made_write_this_iter = False
         for tc in msg.tool_calls:
             fn_name = tc.function.name
@@ -2067,6 +2155,24 @@ def run_agent(system_prompt: str, tools: list, task: str,
 
             if _is_write_call(fn_name, result):
                 made_write_this_iter = True
+
+            # implementer only: feed the investigation trackers (files read,
+            # command outcomes) for the max_iter digest.
+            if role == "implementer":
+                if fn_name == "read_file":
+                    _read_path = (fn_args.get("path") or fn_args.get("file_path")
+                                  or fn_args.get("file") or fn_args.get("filename"))
+                    if _read_path and _read_path not in _impl_files_read:
+                        _impl_files_read.append(_read_path)
+                elif fn_name == "run_bash":
+                    _cmd = str(fn_args.get("command", ""))[:160]
+                    if _cmd:
+                        # dict preserves insertion order; a re-run updates the
+                        # outcome in place. Bounded: drop oldest beyond 3x the
+                        # digest cap (the digest builder re-prioritizes anyway).
+                        _impl_bash_outcomes[_cmd] = _bash_outcome_line(result)
+                        while len(_impl_bash_outcomes) > _INVESTIGATION_MAX_CMDS * 3:
+                            _impl_bash_outcomes.pop(next(iter(_impl_bash_outcomes)))
 
             # e2e_tester only: keep the most recent run_playwright_tests
             # evidence (captured post-_redact, same as everything else that
@@ -2164,6 +2270,26 @@ def run_agent(system_prompt: str, tools: list, task: str,
             except OSError as exc:
                 _log("harness", "E2E_MAX_ITER_REPORT_SYNTHESIZE_ERROR",
                      f"feature={feature_id}: {exc}", level="warning")
+
+    # implementer only: persist the investigation digest so the next attempt
+    # spends its budget on what this one did NOT reach, instead of repeating
+    # the same reads/commands. Counterpart to tool_call_errors below, which
+    # only re-feeds ERRORS — an attempt with 175 clean tool calls (feature
+    # #77, round 2, attempt 1) left the retry nothing at all.
+    if role == "implementer" and feature_id is not None \
+            and (_impl_files_read or _impl_bash_outcomes or _impl_last_assistant_text):
+        try:
+            with open(_investigation_digest_path(feature_id), "w", encoding="utf-8") as f:
+                f.write(_build_investigation_digest(
+                    _impl_files_read, _impl_bash_outcomes,
+                    _impl_last_assistant_text, max_iter))
+            _log("harness", "IMPL_MAX_ITER_INVESTIGATION_SAVED",
+                 f"feature={feature_id} — saved investigation digest "
+                 f"({len(_impl_files_read)} files read, {len(_impl_bash_outcomes)} commands) "
+                 f"for the next attempt")
+        except OSError as exc:
+            _log("harness", "IMPL_MAX_ITER_INVESTIGATION_SAVE_ERROR",
+                 f"feature={feature_id}: {exc}", level="warning")
 
     if tool_call_errors:
         recent_errors = "\n".join(f"  - {e}" for e in tool_call_errors[-5:])
@@ -2793,13 +2919,33 @@ def spawn_implementer(feature_id: int, description: str, attempt: int = 1,
             f"report instead of hunting the bug where the spec points.\n"
         )
 
+    # If an earlier attempt hit max_iter, its investigation digest (files
+    # read + command outcomes + last hypothesis — see
+    # _build_investigation_digest) is on disk: hand it over so this attempt
+    # doesn't re-derive knowledge that already cost a full budget to gather.
+    investigation_context = ""
+    _inv_path = _investigation_digest_path(feature_id)
+    if os.path.exists(_inv_path):
+        try:
+            with open(_inv_path, "r", encoding="utf-8") as f:
+                investigation_context = (
+                    f"\n## PREVIOUS ATTEMPT'S INVESTIGATION — do not re-derive this\n"
+                    f"A previous attempt ran out of iterations before finishing, but its "
+                    f"investigation survives below. Spend your budget on what it did NOT "
+                    f"reach: do not re-read the files listed, and do not re-run commands "
+                    f"whose outcome is already recorded here.\n{f.read()}\n"
+                )
+        except OSError:
+            pass  # best-effort — a missing/unreadable digest never blocks the spawn
+
     task = (
         f"{_workdir_banner(cwd)}"
         f"{tree_sections}\n"
         f"{arch_context}"
         f"{layout_context}"
         f"{spec_content}"
-        f"{repro_context}\n"
+        f"{repro_context}"
+        f"{investigation_context}\n"
         f"Implement feature #{feature_id}: {description}{context}\n"
         f"Write your report to {impl_path}\n"
         f"Return only the file path when done."
@@ -2809,7 +2955,8 @@ def spawn_implementer(feature_id: int, description: str, attempt: int = 1,
                                  task=task, feature_id=feature_id)
     result = run_agent(_agent_ctx["system_prompt"], impl_cfg.TOOLS, _agent_ctx["task"],
                        role="implementer", color="blue", max_iter=MAX_ITER_IMPL,
-                       checkpoint_key=f"implementer_{feature_id}_{attempt}")
+                       checkpoint_key=f"implementer_{feature_id}_{attempt}",
+                       feature_id=feature_id)
     done = not result.startswith("[ERROR")
     _vprint("normal", f"  [blue]🔨 IMPLEMENTER[/] {'[green]✓ done[/]' if done else '[red]✗ error[/]'} → {result[:80]}")
     return result

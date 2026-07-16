@@ -2546,6 +2546,140 @@ class TestE2eMaxIterReportSynthesis:
         assert not (tmp_path / "progress" / "e2e_74.json").exists()
 
 
+class TestImplMaxIterInvestigationDigest:
+    """
+    Regression coverage for feature #77, round 2: tool_call_errors already
+    re-feeds the last 5 tool ERRORS to a retry (and worked in round 1), but
+    round 2's attempt 1 had zero tool errors — 107 clean read_file + 68 clean
+    run_bash, including the key finding that pytest tests/test_branches.py
+    passed in full — and attempt 2 started blind, repeating essentially the
+    same investigation (51 reads before writing anything). run_agent now
+    synthesizes an investigation digest (files read, command outcomes, last
+    hypothesis) when an implementer attempt hits max_iter, and
+    spawn_implementer injects it into the next attempt's task.
+    """
+
+    def _fake_tool_call(self, call_id, name, args_json):
+        from types import SimpleNamespace
+        fn = SimpleNamespace(name=name, arguments=args_json)
+        return SimpleNamespace(id=call_id, function=fn)
+
+    def _fake_response(self, tool_calls, content=None):
+        from types import SimpleNamespace
+        msg = SimpleNamespace(content=content, tool_calls=tool_calls)
+        usage = SimpleNamespace(prompt_tokens=10, completion_tokens=5)
+        choice = SimpleNamespace(message=msg)
+        return SimpleNamespace(choices=[choice], usage=usage, model="deepseek-v4-pro")
+
+    def test_digest_written_on_max_iter_dedup_outcomes_and_hypothesis(self, monkeypatch, tmp_path):
+        h = _load_harness(monkeypatch, tmp_path)
+        (tmp_path / "progress").mkdir(exist_ok=True)
+
+        responses = [
+            self._fake_response([self._fake_tool_call("c1", "read_file", '{"path": "src/api/branches.py"}')]),
+            self._fake_response([
+                self._fake_tool_call("c2", "read_file", '{"path": "src/api/branches.py"}'),  # duplicate
+                self._fake_tool_call("c3", "read_file", '{"path": "frontend/pages/sedes.tsx"}'),
+            ]),
+            self._fake_response([self._fake_tool_call("c4", "run_bash", '{"command": "pytest tests/test_branches.py"}')]),
+            self._fake_response(
+                [self._fake_tool_call("c5", "read_file", '{"path": "src/models/branch.py"}')],
+                content="Backend persistence checks out; suspecting the frontend renders by array position.",
+            ),
+        ]
+        monkeypatch.setattr(h, "_call_api_with_fallback", MagicMock(side_effect=responses))
+        monkeypatch.setattr(h, "execute_tool", MagicMock(side_effect=[
+            json.dumps({"content": "...", "path": "src/api/branches.py"}),
+            json.dumps({"content": "...", "path": "src/api/branches.py"}),
+            json.dumps({"content": "...", "path": "frontend/pages/sedes.tsx"}),
+            json.dumps({"stdout": "collected 29 items\n...\n29 passed in 1.2s", "success": True}),
+            json.dumps({"content": "...", "path": "src/models/branch.py"}),
+        ]))
+
+        result = h.run_agent("sys", [], "task", role="implementer", max_iter=4, feature_id=77)
+
+        assert result.startswith("[ERROR: max_iter 4 reached]")
+        digest_path = tmp_path / "progress" / "_investigation_impl_77.md"
+        assert digest_path.exists()
+        digest = digest_path.read_text()
+        # (a) deduplicated file list — the twice-read path appears once
+        assert digest.count("- src/api/branches.py") == 1
+        assert "- frontend/pages/sedes.tsx" in digest
+        # (b) verification command with its one-line outcome
+        assert "pytest tests/test_branches.py → 29 passed in 1.2s" in digest
+        # (c) the last assistant reasoning before the cutoff
+        assert "suspecting the frontend renders by array position" in digest
+
+    def test_no_digest_when_verdict_reached(self, monkeypatch, tmp_path):
+        h = _load_harness(monkeypatch, tmp_path)
+        (tmp_path / "progress").mkdir(exist_ok=True)
+        responses = [
+            self._fake_response([self._fake_tool_call("c1", "read_file", '{"path": "src/a.py"}')]),
+            self._fake_response(None, content="progress/impl_77.md"),  # clean verdict
+        ]
+        monkeypatch.setattr(h, "_call_api_with_fallback", MagicMock(side_effect=responses))
+        monkeypatch.setattr(h, "execute_tool", MagicMock(return_value=json.dumps({"content": "..."})))
+
+        result = h.run_agent("sys", [], "task", role="implementer", max_iter=10, feature_id=77)
+
+        assert result == "progress/impl_77.md"
+        assert not (tmp_path / "progress" / "_investigation_impl_77.md").exists()
+
+    def test_no_digest_for_other_roles(self, monkeypatch, tmp_path):
+        h = _load_harness(monkeypatch, tmp_path)
+        (tmp_path / "progress").mkdir(exist_ok=True)
+        responses = [
+            self._fake_response([self._fake_tool_call(f"c{i}", "read_file", '{"path": "src/a.py"}')])
+            for i in range(3)
+        ]
+        monkeypatch.setattr(h, "_call_api_with_fallback", MagicMock(side_effect=responses))
+        monkeypatch.setattr(h, "execute_tool", MagicMock(return_value=json.dumps({"content": "..."})))
+
+        h.run_agent("sys", [], "task", role="reviewer", max_iter=3, feature_id=77)
+
+        assert not (tmp_path / "progress" / "_investigation_impl_77.md").exists()
+
+    def test_bash_outcome_line_variants(self, monkeypatch, tmp_path):
+        h = _load_harness(monkeypatch, tmp_path)
+        assert h._bash_outcome_line(json.dumps(
+            {"stdout": "collected 29 items\n\n29 passed in 1.2s\n", "success": True}
+        )) == "29 passed in 1.2s"
+        assert h._bash_outcome_line(json.dumps({"error": "command timed out"})).startswith("error: command timed out")
+        assert h._bash_outcome_line(json.dumps({"stdout": ""})) == "(no output)"
+
+    def test_spawn_implementer_injects_digest_into_task(self, monkeypatch, tmp_path):
+        h = _load_harness(monkeypatch, tmp_path)
+        (tmp_path / "progress").mkdir(exist_ok=True)
+        (tmp_path / "progress" / "_investigation_impl_9.md").write_text(
+            "## Commands already run → last output line\n"
+            "- pytest tests/test_branches.py → 29 passed in 1.2s")
+        captured = {}
+
+        def fake_run_agent(system_prompt, tools, task, **kw):
+            captured["task"] = task
+            return "progress/impl_9.md"
+        monkeypatch.setattr(h, "run_agent", fake_run_agent)
+
+        h.spawn_implementer(9, "Fix: is_active no persiste")
+
+        assert "PREVIOUS ATTEMPT'S INVESTIGATION — do not re-derive this" in captured["task"]
+        assert "pytest tests/test_branches.py → 29 passed in 1.2s" in captured["task"]
+
+    def test_spawn_implementer_without_digest_has_no_header(self, monkeypatch, tmp_path):
+        h = _load_harness(monkeypatch, tmp_path)
+        (tmp_path / "progress").mkdir(exist_ok=True)
+        captured = {}
+
+        def fake_run_agent(system_prompt, tools, task, **kw):
+            captured["task"] = task
+            return "progress/impl_9.md"
+        monkeypatch.setattr(h, "run_agent", fake_run_agent)
+
+        h.spawn_implementer(9, "Fix: is_active no persiste")
+
+        assert "PREVIOUS ATTEMPT'S INVESTIGATION" not in captured["task"]
+
+
 class TestIsWriteCall:
     """Unit tests for _is_write_call, the signal behind the convergence
     streak detector: did this tool call actually mutate a file?"""
