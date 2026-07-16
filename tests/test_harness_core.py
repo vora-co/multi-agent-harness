@@ -1841,6 +1841,246 @@ class TestSpecWriterStaleE2eCache:
         assert calls == []  # no stack_profiles.json → no other profiles to compare → reused as-is
 
 
+class TestBugfixReproEnforcement:
+    """
+    Regression coverage for the feature #77 incident (biovet-harness,
+    2026-07-14/15): a bug-fix spec whose "reproduction" existed only as
+    confident prose ("toggle the sede, save, the switch flips back") asserted
+    a backend persistence bug that didn't exist; the implementer burned
+    2 rounds × 2 attempts × 80 iterations in a healthy layer. Harness-side
+    enforcement added: bug-fix features get the repro-script path injected
+    into the spec_writer task, a bug-fix spec generated without a repro
+    script is annotated non-blockingly (same philosophy as _validate_spec),
+    and an existing repro script is surfaced in the implementer task with
+    the run-first/run-last protocol.
+    """
+
+    def _capture_run_agent(self, h, monkeypatch, result_path, spec_body=None, on_call=None):
+        captured = {"tasks": []}
+
+        def fake_run_agent(system_prompt, tools, task, **kw):
+            captured["tasks"].append(task)
+            captured["task"] = task
+            if spec_body is not None:
+                with open(result_path, "w", encoding="utf-8") as f:
+                    f.write(spec_body)
+            if on_call is not None:
+                on_call(len(captured["tasks"]))
+            return result_path
+        monkeypatch.setattr(h, "run_agent", fake_run_agent)
+        return captured
+
+    # ── _is_bugfix_feature heuristic ─────────────────────────────────────────
+    def test_is_bugfix_feature_positives(self, monkeypatch, tmp_path):
+        h = _load_harness(monkeypatch, tmp_path)
+        for desc in [
+            "Fix: sede switch flips back to true after save",
+            "bug: toggle state lost on reload",
+            "is_active no persiste al guardar la sede",
+            "endpoint returns the wrong value for tenant_id",
+            "el endpoint devuelve el valor incorrecto",
+            "regression in professionals list ordering",
+        ]:
+            assert h._is_bugfix_feature(desc), desc
+
+    def test_is_bugfix_feature_negatives(self, monkeypatch, tmp_path):
+        h = _load_harness(monkeypatch, tmp_path)
+        for desc in [
+            "Add CSV export to the reports page",
+            "Implement pagination for the professionals list",
+            "New login page with role-based redirect",
+            "",
+        ]:
+            assert not h._is_bugfix_feature(desc), desc
+
+    # ── _existing_repro_script ───────────────────────────────────────────────
+    def test_existing_repro_script_finds_py_and_sh(self, monkeypatch, tmp_path):
+        h = _load_harness(monkeypatch, tmp_path)
+        (tmp_path / "progress").mkdir(exist_ok=True)
+        assert h._existing_repro_script(5) is None
+        (tmp_path / "progress" / "repro_5.py").write_text("assert False")
+        assert h._existing_repro_script(5) == "progress/repro_5.py"
+        (tmp_path / "progress" / "repro_6.sh").write_text("exit 1")
+        assert h._existing_repro_script(6) == "progress/repro_6.sh"
+
+    # ── spec_writer task injection ───────────────────────────────────────────
+    def test_spec_writer_task_names_repro_path_for_bugfix(self, monkeypatch, tmp_path):
+        h = _load_harness(monkeypatch, tmp_path)
+        monkeypatch.setattr(h, "_call_api_with_fallback", lambda *a, **kw: None)
+        (tmp_path / "progress").mkdir(exist_ok=True)
+        captured = self._capture_run_agent(h, monkeypatch, "progress/spec_9.md")
+
+        h.spawn_spec_writer(9, "Fix: is_active no persiste al togglear la sede")
+
+        assert "progress/repro_9.py" in captured["task"]
+        assert "CONFIRMED or HYPOTHESIS" in captured["task"]
+
+    def test_spec_writer_task_has_no_repro_hint_for_regular_feature(self, monkeypatch, tmp_path):
+        h = _load_harness(monkeypatch, tmp_path)
+        monkeypatch.setattr(h, "_call_api_with_fallback", lambda *a, **kw: None)
+        (tmp_path / "progress").mkdir(exist_ok=True)
+        captured = self._capture_run_agent(h, monkeypatch, "progress/spec_9.md")
+
+        h.spawn_spec_writer(9, "Add CSV export to the reports page")
+
+        assert "repro_9" not in captured["task"]
+
+    # ── blocking repro gate: quarantine + ONE regeneration, then fallback ────
+    def test_bugfix_gate_regenerates_once_then_falls_back_to_annotation(self, monkeypatch, tmp_path):
+        h = _load_harness(monkeypatch, tmp_path)
+        monkeypatch.setattr(h, "_call_api_with_fallback", lambda *a, **kw: None)
+        (tmp_path / "progress").mkdir(exist_ok=True)
+        body = "# Spec\nRoot cause: the backend does not persist is_active."
+        captured = self._capture_run_agent(h, monkeypatch, "progress/spec_9.md", spec_body=body)
+
+        h.spawn_spec_writer(9, "Fix: is_active no persiste al togglear la sede")
+
+        # Exactly one regeneration — never a loop.
+        assert len(captured["tasks"]) == 2
+        assert "REPRO GATE" in captured["tasks"][1]
+        assert "NOT_FEASIBLE" in captured["tasks"][1]  # escape valve offered explicitly
+        # First (rejected) spec quarantined for debugging, same mechanism as .stale.
+        assert (tmp_path / "progress" / "spec_9.md.norepro").exists()
+        # Second spec still has neither → fallback: annotate and continue.
+        spec = (tmp_path / "progress" / "spec_9.md").read_text()
+        assert "Missing reproduction script" in spec
+        assert "HYPOTHESIS" in spec  # tells the implementer to downgrade the claims
+
+    def test_bugfix_gate_passes_when_regeneration_writes_repro(self, monkeypatch, tmp_path):
+        h = _load_harness(monkeypatch, tmp_path)
+        monkeypatch.setattr(h, "_call_api_with_fallback", lambda *a, **kw: None)
+        (tmp_path / "progress").mkdir(exist_ok=True)
+
+        def write_repro_on_second_call(n_calls):
+            if n_calls == 2:
+                (tmp_path / "progress" / "repro_9.py").write_text("assert False")
+        captured = self._capture_run_agent(
+            h, monkeypatch, "progress/spec_9.md",
+            spec_body="# Spec\nRoot cause: the backend does not persist is_active.",
+            on_call=write_repro_on_second_call)
+
+        h.spawn_spec_writer(9, "Fix: is_active no persiste al togglear la sede")
+
+        assert len(captured["tasks"]) == 2
+        spec = (tmp_path / "progress" / "spec_9.md").read_text()
+        assert "Missing reproduction script" not in spec  # gate satisfied on retry
+
+    def test_not_feasible_declaration_satisfies_gate(self, monkeypatch, tmp_path):
+        h = _load_harness(monkeypatch, tmp_path)
+        monkeypatch.setattr(h, "_call_api_with_fallback", lambda *a, **kw: None)
+        (tmp_path / "progress").mkdir(exist_ok=True)
+        captured = self._capture_run_agent(
+            h, monkeypatch, "progress/spec_9.md",
+            spec_body="# Spec\nREPRO: NOT_FEASIBLE — purely visual hover glitch, "
+                      "no state change observable at the API layer.\nRoot cause: HYPOTHESIS ...")
+
+        h.spawn_spec_writer(9, "Fix: tooltip flickers on hover")
+
+        # Consciously absent, with a visible reason — no regeneration, no annotation.
+        assert len(captured["tasks"]) == 1
+        assert not (tmp_path / "progress" / "spec_9.md.norepro").exists()
+        spec = (tmp_path / "progress" / "spec_9.md").read_text()
+        assert "Missing reproduction script" not in spec
+
+    def test_bugfix_spec_with_repro_is_not_annotated(self, monkeypatch, tmp_path):
+        h = _load_harness(monkeypatch, tmp_path)
+        monkeypatch.setattr(h, "_call_api_with_fallback", lambda *a, **kw: None)
+        (tmp_path / "progress").mkdir(exist_ok=True)
+        (tmp_path / "progress" / "repro_9.py").write_text("assert get_sede().is_active is False")
+        captured = self._capture_run_agent(h, monkeypatch, "progress/spec_9.md",
+                                           spec_body="# Spec\nRoot cause (CONFIRMED via progress/repro_9.py): ...")
+
+        h.spawn_spec_writer(9, "Fix: is_active no persiste al togglear la sede")
+
+        assert len(captured["tasks"]) == 1  # gate satisfied first try — no regeneration
+        spec = (tmp_path / "progress" / "spec_9.md").read_text()
+        assert "Missing reproduction script" not in spec
+
+    def test_regular_spec_without_repro_is_not_annotated(self, monkeypatch, tmp_path):
+        h = _load_harness(monkeypatch, tmp_path)
+        monkeypatch.setattr(h, "_call_api_with_fallback", lambda *a, **kw: None)
+        (tmp_path / "progress").mkdir(exist_ok=True)
+        self._capture_run_agent(h, monkeypatch, "progress/spec_9.md",
+                                spec_body="# Spec\nCreate the CSV export endpoint.")
+
+        h.spawn_spec_writer(9, "Add CSV export to the reports page")
+
+        spec = (tmp_path / "progress" / "spec_9.md").read_text()
+        assert "Missing reproduction script" not in spec
+
+    # ── implementer task injection ───────────────────────────────────────────
+    def test_implementer_task_surfaces_existing_repro(self, monkeypatch, tmp_path):
+        h = _load_harness(monkeypatch, tmp_path)
+        (tmp_path / "progress").mkdir(exist_ok=True)
+        (tmp_path / "progress" / "repro_9.py").write_text("assert False")
+        captured = self._capture_run_agent(h, monkeypatch, "progress/impl_9.md")
+
+        h.spawn_implementer(9, "Fix: is_active no persiste al togglear la sede")
+
+        assert "progress/repro_9.py" in captured["task"]
+        assert "run it FIRST" in captured["task"]
+        assert "PREMISE DISCREPANCY" in captured["task"]
+
+    def test_implementer_task_without_repro_has_no_protocol_block(self, monkeypatch, tmp_path):
+        h = _load_harness(monkeypatch, tmp_path)
+        (tmp_path / "progress").mkdir(exist_ok=True)
+        captured = self._capture_run_agent(h, monkeypatch, "progress/impl_9.md")
+
+        h.spawn_implementer(9, "Fix: is_active no persiste al togglear la sede")
+
+        assert "Reproduction script (mandatory protocol)" not in captured["task"]
+
+    # ── CONFIRMED→HYPOTHESIS downgrade invariant (independent of the gate) ───
+    def test_downgrade_unbacked_confirmed_unit(self, monkeypatch, tmp_path):
+        h = _load_harness(monkeypatch, tmp_path)
+        (tmp_path / "progress").mkdir(exist_ok=True)
+        text = ("Root cause (CONFIRMED): backend drops is_active on save. "
+                "UNCONFIRMED user reports also mention ordering.")
+
+        out = h._downgrade_unbacked_confirmed(text, 9)
+        assert "auto-downgraded" in out
+        assert "(CONFIRMED)" not in out
+        assert "UNCONFIRMED user reports" in out  # word boundary — UNCONFIRMED untouched
+
+        # No CONFIRMED label at all → same object back, no-op.
+        plain = "Root cause: HYPOTHESIS — inferred from reading the router."
+        assert h._downgrade_unbacked_confirmed(plain, 9) is plain
+
+        # With a repro attached the label is trustworthy and preserved.
+        (tmp_path / "progress" / "repro_9.py").write_text("assert False")
+        assert h._downgrade_unbacked_confirmed(text, 9) is text
+
+    def test_implementer_injection_downgrades_confirmed_without_repro(self, monkeypatch, tmp_path):
+        h = _load_harness(monkeypatch, tmp_path)
+        (tmp_path / "progress").mkdir(exist_ok=True)
+        (tmp_path / "progress" / "spec_9.md").write_text(
+            "# Spec\nRoot cause (CONFIRMED): the backend does not persist is_active.")
+        captured = self._capture_run_agent(h, monkeypatch, "progress/impl_9.md")
+
+        h.spawn_implementer(9, "Fix: is_active no persiste al togglear la sede",
+                            spec_path="progress/spec_9.md")
+
+        # The unverified premise never travels with the confidence of a verified one.
+        assert "auto-downgraded" in captured["task"]
+        assert "(CONFIRMED)" not in captured["task"]
+        # The spec file on disk is untouched — the downgrade happens at injection only.
+        assert "(CONFIRMED)" in (tmp_path / "progress" / "spec_9.md").read_text()
+
+    def test_implementer_injection_preserves_confirmed_with_repro(self, monkeypatch, tmp_path):
+        h = _load_harness(monkeypatch, tmp_path)
+        (tmp_path / "progress").mkdir(exist_ok=True)
+        (tmp_path / "progress" / "repro_9.py").write_text("assert False")
+        (tmp_path / "progress" / "spec_9.md").write_text(
+            "# Spec\nRoot cause (CONFIRMED via progress/repro_9.py): array reordering.")
+        captured = self._capture_run_agent(h, monkeypatch, "progress/impl_9.md")
+
+        h.spawn_implementer(9, "Fix: is_active no persiste al togglear la sede",
+                            spec_path="progress/spec_9.md")
+
+        assert "(CONFIRMED via progress/repro_9.py)" in captured["task"]
+        assert "auto-downgraded" not in captured["task"]
+
+
 class TestTruncateHeadTail:
     """
     Regression coverage: _validate_spec used to send only spec_content[:3000]
@@ -2575,6 +2815,221 @@ class TestTools:
         t = self._load_tools(monkeypatch, tmp_path)
         result = json.loads(t.execute_tool("write_file", {"path": "src/app.py", "content": "x"}))
         assert "error" not in result
+
+
+# ── tools.py: destructive-rewrite warning on write_file ──────────────────────
+
+class TestDestructiveRewriteWarning:
+    """
+    Regression coverage for the feature #77 (attempt 2, round 2) incident: a
+    single write_file regenerated a ~750-line router from memory — invented
+    imports, an entire POST endpoint deleted, a security model_validator
+    deleted, await session.commit() deleted — and nothing in the pipeline
+    inspected what a full-file rewrite REMOVES (the debug-statements gate only
+    looks at added lines). write_file now compares new content against the
+    existing file and returns a non-blocking "warning" field naming exactly
+    what was dropped, so the agent can self-correct on its next turn.
+    """
+
+    def _load_tools(self, monkeypatch, tmp_path: Path, extra_env: dict = None):
+        monkeypatch.chdir(tmp_path)
+        for k, v in (extra_env or {}).items():
+            monkeypatch.setenv(k, v)
+        for mod in ["sandbox"]:
+            monkeypatch.setitem(sys.modules, mod, MagicMock())
+        for key in list(sys.modules.keys()):
+            if key == "tools":
+                del sys.modules[key]
+        root = Path(__file__).parent.parent
+        if str(root) not in sys.path:
+            sys.path.insert(0, str(root))
+        return importlib.import_module("tools")
+
+    _OLD_ROUTER = (
+        "from fastapi import APIRouter\n"
+        "router = APIRouter()\n\n"
+        "class BranchModel:\n"
+        "    pass\n\n"
+        "def _validate_is_active_consistency(v):\n"
+        "    return v\n\n"
+        "@router.post('/tenant/branches')\n"
+        "async def create_branch(payload):\n"
+        "    return payload\n\n"
+        "@router.get('/tenant/branches')\n"
+        "async def list_branches():\n"
+        "    return []\n"
+    )
+
+    def test_removed_python_symbols_are_named_exactly(self, monkeypatch, tmp_path):
+        t = self._load_tools(monkeypatch, tmp_path)
+        (tmp_path / "src").mkdir()
+        (tmp_path / "src" / "branches.py").write_text(self._OLD_ROUTER)
+        # Rewrite keeps the GET endpoint but drops the POST endpoint, its
+        # handler, and the validator — the #77 shape.
+        new = (
+            "from fastapi import APIRouter\n"
+            "router = APIRouter()\n\n"
+            "class BranchModel:\n"
+            "    pass\n\n"
+            "@router.get('/tenant/branches')\n"
+            "async def list_branches():\n"
+            "    return []\n"
+        )
+        result = json.loads(t.write_file(path="src/branches.py", content=new))
+
+        assert result["status"] == "ok"  # never blocks
+        assert "def create_branch" in result["warning"]
+        assert "def _validate_is_active_consistency" in result["warning"]
+        assert "@router.post('/tenant/branches')" in result["warning"]
+        assert "list_branches" not in result["warning"]  # kept symbols not reported
+        # The write itself still happened — warning, not rejection.
+        assert (tmp_path / "src" / "branches.py").read_text() == new
+
+    def test_shrink_beyond_threshold_is_flagged(self, monkeypatch, tmp_path):
+        t = self._load_tools(monkeypatch, tmp_path)
+        (tmp_path / "src").mkdir()
+        (tmp_path / "src" / "big.py").write_text("# filler\n" * 200)
+        result = json.loads(t.write_file(path="src/big.py", content="# filler\n" * 50))
+        assert result["status"] == "ok"
+        assert "shrinks the file by" in result["warning"]
+
+    def test_shrink_threshold_is_env_configurable(self, monkeypatch, tmp_path):
+        t = self._load_tools(monkeypatch, tmp_path, {"DESTRUCTIVE_SHRINK_RATIO": "0.9"})
+        (tmp_path / "src").mkdir()
+        (tmp_path / "src" / "big.py").write_text("# filler\n" * 200)
+        # 75% shrink, but the configured threshold is 90% — no warning.
+        result = json.loads(t.write_file(path="src/big.py", content="# filler\n" * 50))
+        assert result["status"] == "ok"
+        assert "warning" not in result
+
+    def test_pure_addition_produces_no_warning(self, monkeypatch, tmp_path):
+        t = self._load_tools(monkeypatch, tmp_path)
+        (tmp_path / "src").mkdir()
+        (tmp_path / "src" / "branches.py").write_text(self._OLD_ROUTER)
+        new = self._OLD_ROUTER + "\n@router.delete('/tenant/branches')\nasync def delete_branch():\n    return None\n"
+        result = json.loads(t.write_file(path="src/branches.py", content=new))
+        assert result["status"] == "ok"
+        assert "warning" not in result
+
+    def test_new_file_produces_no_warning(self, monkeypatch, tmp_path):
+        t = self._load_tools(monkeypatch, tmp_path)
+        result = json.loads(t.write_file(path="src/fresh.py", content="def brand_new():\n    pass\n"))
+        assert result["status"] == "ok"
+        assert "warning" not in result
+
+    def test_non_source_extension_is_exempt(self, monkeypatch, tmp_path):
+        t = self._load_tools(monkeypatch, tmp_path)
+        (tmp_path / "progress").mkdir()
+        (tmp_path / "progress" / "impl_1.md").write_text("long report " * 100)
+        # Reports/specs get legitimately rewritten shorter all the time.
+        result = json.loads(t.write_file(path="progress/impl_1.md", content="short"))
+        assert result["status"] == "ok"
+        assert "warning" not in result
+
+    def test_js_removed_exports_are_named(self, monkeypatch, tmp_path):
+        t = self._load_tools(monkeypatch, tmp_path)
+        (tmp_path / "frontend").mkdir()
+        old = (
+            "export const API_BASE = '/api/v1';\n\n"
+            "export async function fetchBranches() {\n  return [];\n}\n\n"
+            "export function toggleBranch(id) {\n  return id;\n}\n"
+        )
+        (tmp_path / "frontend" / "api.ts").write_text(old)
+        new = "export async function fetchBranches() {\n  return [];\n}\n"
+        result = json.loads(t.write_file(path="frontend/api.ts", content=new))
+        assert result["status"] == "ok"
+        assert "API_BASE" in result["warning"]
+        assert "toggleBranch" in result["warning"]
+        assert "fetchBranches" not in result["warning"]
+
+    def test_edit_alias_full_content_path_inherits_the_warning(self, monkeypatch, tmp_path):
+        # The edit_file alias translation writes through write_file(), so a
+        # hallucinated "edit" that hands over full new content with symbols
+        # missing gets the same warning as a direct write_file.
+        t = self._load_tools(monkeypatch, tmp_path)
+        (tmp_path / "src").mkdir()
+        (tmp_path / "src" / "branches.py").write_text(self._OLD_ROUTER)
+        new = "from fastapi import APIRouter\nrouter = APIRouter()\n"
+        result = json.loads(t.execute_tool("edit_file", {"path": "src/branches.py", "content": new}))
+        assert result.get("status") == "ok"
+        assert "def create_branch" in result.get("warning", "")
+
+    def test_shrink_floor_exempts_small_files(self, monkeypatch, tmp_path):
+        # A 10-line file dropping to 6 is a 40% "shrink" that's usually a
+        # legitimate refactor — noise trains agents to ignore warnings, the
+        # exact pattern this mechanism exists to fight. (No symbols involved,
+        # so the symbol check — which has no floor — stays silent too.)
+        t = self._load_tools(monkeypatch, tmp_path)
+        (tmp_path / "src").mkdir()
+        (tmp_path / "src" / "small.py").write_text("# note\n" * 10)
+        result = json.loads(t.write_file(path="src/small.py", content="# note\n" * 6))
+        assert result["status"] == "ok"
+        assert "warning" not in result
+
+    def test_shrink_floor_is_env_configurable(self, monkeypatch, tmp_path):
+        t = self._load_tools(monkeypatch, tmp_path, {"DESTRUCTIVE_SHRINK_MIN_LINES": "5"})
+        (tmp_path / "src").mkdir()
+        (tmp_path / "src" / "small.py").write_text("# note\n" * 10)
+        result = json.loads(t.write_file(path="src/small.py", content="# note\n" * 6))
+        assert "shrinks the file by" in result["warning"]
+
+    def test_symbol_check_has_no_size_floor(self, monkeypatch, tmp_path):
+        # _OLD_ROUTER is ~16 lines — well under the 40-line shrink floor — but
+        # a dropped symbol is meaningful at any file size, so it still warns.
+        t = self._load_tools(monkeypatch, tmp_path)
+        (tmp_path / "src").mkdir()
+        (tmp_path / "src" / "branches.py").write_text(self._OLD_ROUTER)
+        new = self._OLD_ROUTER.replace(
+            "def _validate_is_active_consistency(v):\n    return v\n\n", ""
+        )
+        result = json.loads(t.write_file(path="src/branches.py", content=new))
+        assert "def _validate_is_active_consistency" in result["warning"]
+        assert "shrinks the file by" not in result["warning"]  # floor keeps the size check quiet
+
+    def test_shrink_only_language_go_flags_shrink_without_symbol_diff(self, monkeypatch, tmp_path):
+        # .go/.rb/.php/.java/.cs get the language-agnostic shrink check, but no
+        # symbol diffing — the Python/JS regexes would produce garbage matches
+        # on them, and a wrong "removed symbol" warning is worse than none.
+        t = self._load_tools(monkeypatch, tmp_path)
+        (tmp_path / "src").mkdir()
+        old = "func handler() {\n\t// filler\n}\n" * 60  # 180 lines
+        (tmp_path / "src" / "main.go").write_text(old)
+        result = json.loads(t.write_file(path="src/main.go", content=old[: len(old) // 3]))
+        assert "shrinks the file by" in result["warning"]
+        assert "REMOVED top-level symbol" not in result["warning"]
+
+    def test_warning_conditions_the_git_recovery_path(self, monkeypatch, tmp_path):
+        # git show HEAD:<path> can't recover a file first created during the
+        # same (uncommitted) feature — the warning must offer git only
+        # conditionally, with "content you read earlier this run" as the
+        # unconditional primary path.
+        t = self._load_tools(monkeypatch, tmp_path)
+        (tmp_path / "src").mkdir()
+        (tmp_path / "src" / "branches.py").write_text(self._OLD_ROUTER)
+        new = "from fastapi import APIRouter\nrouter = APIRouter()\n"
+        result = json.loads(t.write_file(path="src/branches.py", content=new))
+        warning = result["warning"]
+        assert "content you read earlier this run" in warning
+        assert "If the file already existed in the last commit" in warning
+        assert "not committed yet" in warning
+
+
+# ── agents/shared_rules.py: MINIMAL_DELTA_RULE shared across writer roles ────
+
+class TestMinimalDeltaRuleShared:
+    def test_rule_interpolated_into_implementer_and_e2e_tester(self):
+        # The two roles that write source-extension files. e2e_tester matters
+        # specifically because a test deleted during a from-memory rewrite
+        # never fails — coverage shrinks silently, and the write_file warning
+        # naming the removed def test_* symbols is the only signal (real
+        # evidence: biovet-harness features 34/35/36/39/46/51, where the
+        # E2E_TESTER wrote through the edit aliases → write_file).
+        import agents.shared_rules as sr
+        import agents.implementer as impl
+        import agents.e2e_tester as e2e
+        assert "MINIMAL-DELTA REWRITES" in sr.MINIMAL_DELTA_RULE
+        assert sr.MINIMAL_DELTA_RULE.strip() in impl.SYSTEM_PROMPT
+        assert sr.MINIMAL_DELTA_RULE.strip() in e2e.SYSTEM_PROMPT
 
 
 # ── tools.py: run_playwright_tests (Python/Node stack branching) ─────────────

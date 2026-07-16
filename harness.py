@@ -2744,16 +2744,46 @@ def spawn_implementer(feature_id: int, description: str, attempt: int = 1,
     if spec_path and os.path.exists(spec_path):
         try:
             with open(spec_path, "r", encoding="utf-8") as f:
-                spec_content = f"\n## Technical specification ({spec_path}):\n{f.read()}\n"
+                _spec_text = f.read()
+            # Invariant, independent of the spec-side repro gate: CONFIRMED
+            # claims without an attached repro script are downgraded to
+            # HYPOTHESIS before the implementer ever sees them — an unverified
+            # premise must never travel with the confidence of a verified one
+            # (the exact mechanism of the feature #77 incident). Covers cached
+            # and fallback-annotated specs the gate never re-checked.
+            _downgraded = _downgrade_unbacked_confirmed(_spec_text, feature_id)
+            if _downgraded is not _spec_text:
+                _log("harness", "SPEC_CONFIRMED_DOWNGRADED",
+                     f"feature={feature_id}: CONFIRMED claim(s) in {spec_path} downgraded to "
+                     f"HYPOTHESIS at injection — no repro script attached", level="warning")
+                _vprint("normal", f"  [blue]🔨 IMPLEMENTER[/] [yellow]⚠ spec's CONFIRMED claims "
+                                  f"downgraded to HYPOTHESIS — no repro script attached[/]")
+            spec_content = f"\n## Technical specification ({spec_path}):\n{_downgraded}\n"
         except Exception:
             spec_content = f"\nRead the technical specification at {spec_path} BEFORE writing code.\n"
+
+    # If a reproduction script exists for this feature, surface it explicitly —
+    # the REPRO SCRIPT PROTOCOL hard rule (agents/implementer.py) triggers off
+    # "your task includes a repro script", so the harness must actually say so.
+    repro_context = ""
+    _repro = _existing_repro_script(feature_id)
+    if _repro:
+        repro_context = (
+            f"\n## Reproduction script (mandatory protocol)\n"
+            f"An executable reproduction script exists at {_repro}. Per your REPRO SCRIPT "
+            f"PROTOCOL hard rule: run it FIRST to confirm the baseline failure, and run it "
+            f"again LAST to confirm the fix before writing your report. If it does NOT fail "
+            f"the way the spec claims, report a PREMISE DISCREPANCY at the top of your "
+            f"report instead of hunting the bug where the spec points.\n"
+        )
 
     task = (
         f"{_workdir_banner(cwd)}"
         f"{tree_sections}\n"
         f"{arch_context}"
         f"{layout_context}"
-        f"{spec_content}\n"
+        f"{spec_content}"
+        f"{repro_context}\n"
         f"Implement feature #{feature_id}: {description}{context}\n"
         f"Write your report to {impl_path}\n"
         f"Return only the file path when done."
@@ -2808,6 +2838,83 @@ def _spec_references_stale_e2e_test_dir(spec_text: str) -> Optional[str]:
     return None
 
 
+_BUGFIX_HINT_RE = re.compile(
+    r"(?i)(\bfix(es|ed)?\b|\bbug(fix)?\b|\bregress?i[oó]n\b|\bdefecto\b"
+    r"|no (se )?persiste|not persist|doesn'?t persist|isn'?t persisted"
+    r"|wrong value|valor (equivocado|incorrecto)"
+    r"|devuelve .{0,40}(incorrect|equivocad|err[oó]ne)"
+    r"|returns? .{0,40}(wrong|incorrect))"
+)
+
+
+def _is_bugfix_feature(description: str) -> bool:
+    """
+    Heuristic used by the BUG-FIX RULE enforcement (see agents/spec_writer.py):
+    does this feature's title/description read like a bug fix rather than new
+    functionality? Deliberately keyword-based and cheap — a false positive
+    only adds a non-blocking nudge/warning, never blocks the pipeline.
+    """
+    return bool(_BUGFIX_HINT_RE.search(description or ""))
+
+
+def _existing_repro_script(feature_id: int) -> Optional[str]:
+    """Path of progress/repro_<id>.py or .sh if one exists, else None."""
+    for ext in (".py", ".sh"):
+        path = f"{PROGRESS_DIR}/repro_{feature_id}{ext}"
+        if os.path.exists(path):
+            return path
+    return None
+
+
+_REPRO_NOT_FEASIBLE_RE = re.compile(r"(?i)\bREPRO:\s*NOT_FEASIBLE\b")
+
+
+def _bugfix_spec_missing_repro(feature_id: int, spec_text: str) -> bool:
+    """
+    True when a bug-fix spec is *silently* missing its reproduction: no
+    progress/repro_<id>.py/.sh on disk AND no explicit
+    `REPRO: NOT_FEASIBLE — <reason>` declaration in the spec text.
+
+    The declaration is the escape valve: it turns "silently absent" into
+    "consciously absent, with the reason visible to the implementer" — which
+    is what keeps the repro gate from looping forever or coercing the
+    spec_writer into fake repros written only to pass the gate.
+    """
+    if _existing_repro_script(feature_id):
+        return False
+    if _REPRO_NOT_FEASIBLE_RE.search(spec_text or ""):
+        return False
+    return True
+
+
+_CONFIRMED_LABEL_RE = re.compile(r"\bCONFIRMED\b")
+
+
+def _downgrade_unbacked_confirmed(spec_text: str, feature_id: int) -> str:
+    """
+    Invariant, independent of the repro gate: a CONFIRMED root-cause label is
+    only allowed to reach the implementer when an executable repro script is
+    actually attached (progress/repro_<id>.py/.sh on disk). Otherwise every
+    CONFIRMED in the spec is rewritten to HYPOTHESIS before injection, so an
+    unverified premise never travels with the confidence of a verified one —
+    even on the gate's fallback path (annotate-and-continue) or for cached
+    specs the gate never saw. That confidence transfer was the exact
+    mechanism of the feature #77 incident: confident prose treated as a
+    confirmed diagnosis by CONVERGENCE_RULE's apply-directly clause.
+
+    Returns spec_text unchanged (same object) when no downgrade applies, so
+    callers can detect a downgrade by identity.
+    """
+    if _existing_repro_script(feature_id):
+        return spec_text
+    if not _CONFIRMED_LABEL_RE.search(spec_text or ""):
+        return spec_text
+    return _CONFIRMED_LABEL_RE.sub(
+        "HYPOTHESIS (auto-downgraded: labeled CONFIRMED but no executable repro script is attached)",
+        spec_text,
+    )
+
+
 def spawn_spec_writer(feature_id: int, description: str) -> str:
     """Generate the detailed technical spec before implementing.
     If the spec already exists on disk, reuse it without calling the agent.
@@ -2849,10 +2956,22 @@ def spawn_spec_writer(feature_id: int, description: str) -> str:
     cwd = os.getcwd()
     arch_context = _load_project_architecture(cwd)
     layout_context = _layout_context()
+    # Bug-fix features: make the BUG-FIX RULE's target path explicit in the
+    # task, so the repro requirement doesn't depend solely on the agent
+    # matching the feature title against its prompt rule.
+    repro_hint = ""
+    if _is_bugfix_feature(description):
+        repro_hint = (
+            f"This feature is a BUG FIX. Per your BUG-FIX RULE you MUST also write an "
+            f"executable reproduction script at {PROGRESS_DIR}/repro_{feature_id}.py "
+            f"(or .sh) that fails while the bug exists and passes once fixed, and label "
+            f"every root-cause claim in the spec CONFIRMED or HYPOTHESIS.\n"
+        )
     task = (
         f"{_workdir_banner(cwd)}"
         f"{arch_context}"
         f"{layout_context}"
+        f"{repro_hint}"
         f"Write the technical specification for feature #{feature_id}: {description}\n"
         f"Save the spec to {spec_path}\n"
         f"Return ONLY the path: {spec_path}"
@@ -2865,6 +2984,55 @@ def spawn_spec_writer(feature_id: int, description: str) -> str:
                        checkpoint_key=f"spec_writer_{feature_id}_1")
     done = not result.startswith("[ERROR")
     _vprint("normal", f"  [cyan]📋 SPEC_WRITER[/] {'[green]✓ spec ready[/]' if done else '[red]✗ error[/]'} → {result[:80]}")
+
+    # ── Bug-fix repro gate (blocking, ONE regeneration max) ──────────────────
+    # A bug-fix spec with neither an executable repro script nor an explicit
+    # `REPRO: NOT_FEASIBLE — <reason>` declaration is quarantined and
+    # regenerated once — same quarantine mechanism as the stale-e2e-path check
+    # in the cache branch above. Strict on the common path, best-effort at the
+    # edge: if the second spec still has neither, we fall through to the
+    # non-blocking annotation below rather than looping — the pipeline is
+    # never left hanging on this gate, and _downgrade_unbacked_confirmed()
+    # still guards the fallback path at implementer-injection time.
+    if done and os.path.exists(spec_path) and _is_bugfix_feature(description):
+        try:
+            with open(spec_path, "r", encoding="utf-8") as f:
+                _gate_text = f.read()
+        except OSError:
+            _gate_text = ""
+        if _bugfix_spec_missing_repro(feature_id, _gate_text):
+            _quarantine_path = f"{spec_path}.norepro"
+            try:
+                os.replace(spec_path, _quarantine_path)
+            except OSError:
+                pass  # best-effort quarantine — the regeneration overwrites spec_path anyway
+            _log("spec_writer", "SPEC_REPRO_GATE",
+                 f"feature={feature_id}: bug-fix spec has no repro script and no "
+                 f"'REPRO: NOT_FEASIBLE' declaration — quarantined to {_quarantine_path}, "
+                 f"regenerating (1 retry max)", level="warning")
+            _vprint("normal", f"  [cyan]📋 SPEC_WRITER[/] [yellow]⚠ bug-fix spec has no repro "
+                              f"script and no NOT_FEASIBLE declaration — regenerating once[/]")
+            regen_task = task + (
+                f"\n\n⚠️ REPRO GATE — your previous spec for this feature was rejected and "
+                f"quarantined because it contained neither an executable reproduction script "
+                f"nor an explicit non-feasibility declaration. This feature is a BUG FIX: you "
+                f"MUST either write {PROGRESS_DIR}/repro_{feature_id}.py (or .sh) that FAILS "
+                f"while the bug exists, OR explicitly declare in the spec "
+                f"`REPRO: NOT_FEASIBLE — <concrete reason>` if scripting it is genuinely not "
+                f"viable (e.g. a purely visual bug, an infrastructure configuration issue). "
+                f"Do NOT write a fake repro that doesn't actually exercise the bug just to "
+                f"pass this gate — an honest NOT_FEASIBLE declaration is the correct choice "
+                f"in that case."
+            )
+            _agent_ctx = _fire_transform("before_spawn_agent", role="spec_writer",
+                                         system_prompt=spec_cfg.SYSTEM_PROMPT,
+                                         task=regen_task, feature_id=feature_id)
+            result = run_agent(_agent_ctx["system_prompt"], spec_cfg.TOOLS, _agent_ctx["task"],
+                               role="spec_writer", color="cyan", max_iter=MAX_ITER_SPEC,
+                               checkpoint_key=f"spec_writer_{feature_id}_2")
+            done = not result.startswith("[ERROR")
+            _vprint("normal", f"  [cyan]📋 SPEC_WRITER[/] "
+                              f"{'[green]✓ spec regenerated[/]' if done else '[red]✗ error[/]'} → {result[:80]}")
 
     # Validate the freshly generated spec against the current codebase.
     # Skipped if the spec failed to generate or the agent returned an error.
@@ -2888,6 +3056,42 @@ def spawn_spec_writer(feature_id: int, description: str) -> str:
                 pass
         else:
             _vprint("normal", f"  [cyan]📋 SPEC_WRITER[/] [dim]✓ spec validated — no issues[/]")
+
+    # Fallback after the repro gate is exhausted (non-blocking, same philosophy
+    # as _validate_spec): if even the regenerated spec has neither a repro
+    # script nor a NOT_FEASIBLE declaration, annotate and continue — never
+    # leave the pipeline hanging on this gate. The annotation tells the
+    # implementer to downgrade every claim to HYPOTHESIS and layer-isolate
+    # first; _downgrade_unbacked_confirmed() enforces the CONFIRMED part of
+    # that mechanically at injection time regardless.
+    if done and os.path.exists(spec_path) and _is_bugfix_feature(description):
+        try:
+            with open(spec_path, "r", encoding="utf-8") as f:
+                _final_text = f.read()
+        except OSError:
+            _final_text = ""
+        if _bugfix_spec_missing_repro(feature_id, _final_text):
+            _log("spec_writer", "SPEC_MISSING_REPRO",
+                 f"feature={feature_id}: bug-fix spec still has no {PROGRESS_DIR}/repro_{feature_id}.py/.sh "
+                 f"and no 'REPRO: NOT_FEASIBLE' declaration after regeneration — annotating spec "
+                 f"and continuing", level="warning")
+            _vprint("normal", f"  [cyan]📋 SPEC_WRITER[/] [yellow]⚠ regenerated spec still has no "
+                              f"repro script — annotating spec and continuing[/]")
+            try:
+                with open(spec_path, "a", encoding="utf-8") as f:
+                    f.write(
+                        f"\n\n---\n"
+                        f"## ⚠ Missing reproduction script\n"
+                        f"This is a bug-fix feature, but no executable reproduction script was "
+                        f"written to {PROGRESS_DIR}/repro_{feature_id}.py (or .sh) and no "
+                        f"`REPRO: NOT_FEASIBLE` declaration was made, even after one regeneration. "
+                        f"Implementer: treat every root-cause claim above as HYPOTHESIS regardless "
+                        f"of how it is phrased, and apply your LAYER ISOLATION rule (direct "
+                        f"curl/httpx + DB check) before trusting the spec's stated location of "
+                        f"the bug.\n"
+                    )
+            except Exception:
+                pass
 
     _fire("after_spec_generated",
           feature_id=feature_id, spec_path=spec_path, issues=spec_issues)

@@ -1,4 +1,5 @@
 import os, json, subprocess, datetime, re, sys
+from typing import Optional
 
 # ─── SECURITY ────────────────────────────────────────────────────────────────
 
@@ -161,6 +162,130 @@ def read_file(path: str = None, limit: int = None, offset: int = 0,
     except Exception as e:
         return json.dumps({"error": str(e)})
 
+# ─── Destructive-rewrite detection (write_file) ─────────────────────────────
+# Real incident (feature #77, attempt 2, round 2): a single write_file
+# regenerated backend/app/api/v1/branches.py (~750 lines) from memory —
+# invented imports (a module that doesn't exist), the entire POST
+# /tenant/branches endpoint deleted, a security model_validator deleted, and
+# await session.commit() deleted. The debug-statements gate only inspects
+# ADDED lines; nothing inspected what a full-file rewrite REMOVES. The same
+# regression had already reached origin/main one round earlier; the post-fail
+# quarantine only saved the tree because the feature happened to fail.
+# This check never blocks the write — it names exactly what was removed in a
+# "warning" field of the tool result, so the agent can self-correct on its
+# next turn instead of shipping the deletion silently.
+
+# Languages with symbol-extraction regexes below. The shrink check is
+# language-agnostic, so it additionally covers every stack the harness
+# supports (go-gin, ruby-rails, php-laravel, java-spring, dotnet-core) —
+# those get shrink detection only, no symbol diffing, until someone writes
+# their regexes.
+_JS_FILE_EXTS = (".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs")
+_SOURCE_FILE_EXTS = (".py",) + _JS_FILE_EXTS + (".go", ".rb", ".php", ".java", ".cs")
+
+# Fraction of the previous file size a rewrite may shrink by before it's
+# flagged (0.30 = flag when the new content is >30% smaller). Env-overridable.
+try:
+    DESTRUCTIVE_SHRINK_RATIO = float(os.getenv("DESTRUCTIVE_SHRINK_RATIO", "0.30"))
+except ValueError:
+    DESTRUCTIVE_SHRINK_RATIO = 0.30
+
+# The shrink check only applies when the existing file exceeds this many
+# lines. A 10-line file dropping to 6 is a 40% "shrink" that's usually a
+# legitimate refactor — and noise trains agents to ignore warnings, which is
+# exactly the pattern this mechanism exists to fight. The symbol check has no
+# floor: a dropped symbol is meaningful at any file size.
+try:
+    DESTRUCTIVE_SHRINK_MIN_LINES = int(os.getenv("DESTRUCTIVE_SHRINK_MIN_LINES", "40"))
+except ValueError:
+    DESTRUCTIVE_SHRINK_MIN_LINES = 40
+
+_PY_SYMBOL_RE = re.compile(r"^\s*(?:async\s+)?(def|class)\s+([A-Za-z_]\w*)", re.MULTILINE)
+_PY_ROUTE_DECORATOR_RE = re.compile(
+    r"^\s*@(\w+)\.(get|post|put|patch|delete|head|options)\s*\(\s*[\"']([^\"']*)[\"']",
+    re.MULTILINE,
+)
+_JS_SYMBOL_RE = re.compile(
+    r"^\s*(?:export\s+)?(?:default\s+)?(?:async\s+)?function\s*\*?\s*([A-Za-z_$][\w$]*)"
+    r"|^\s*(?:export\s+)?(?:abstract\s+)?class\s+([A-Za-z_$][\w$]*)"
+    r"|^\s*export\s+(?:const|let|var)\s+([A-Za-z_$][\w$]*)",
+    re.MULTILINE,
+)
+
+
+def _top_level_symbols(text: str, ext: str) -> set:
+    """
+    Cheap regex heuristic for "symbols this file defines": def/class (plus
+    @router.<method>('<path>') route decorators) for Python; function/class/
+    exported const for JS/TS. Deliberately not a parser — the goal is naming
+    what a rewrite dropped, not full static analysis.
+    """
+    symbols = set()
+    if ext == ".py":
+        for kw, name in _PY_SYMBOL_RE.findall(text):
+            symbols.add(f"{kw} {name}")
+        for obj, method, route in _PY_ROUTE_DECORATOR_RE.findall(text):
+            symbols.add(f"@{obj}.{method}('{route}')")
+    elif ext in _JS_FILE_EXTS:
+        for groups in _JS_SYMBOL_RE.findall(text):
+            name = next((g for g in groups if g), None)
+            if name:
+                symbols.add(name)
+    # Other source extensions (shrink-check-only languages): no symbols —
+    # applying the JS regexes to Go/Ruby/PHP/Java/C# would produce garbage
+    # matches, and a wrong "removed symbol" warning is worse than none.
+    return symbols
+
+
+def _destructive_rewrite_warning(path: str, new_content: str) -> Optional[str]:
+    """
+    Compare new_content against what's currently on disk at path (must be
+    called BEFORE the write). Returns a warning string when the rewrite
+    (a) shrinks the file by more than DESTRUCTIVE_SHRINK_RATIO, or
+    (b) drops top-level symbols present in the previous version — naming
+    exactly which ones. Returns None otherwise. Best-effort: any error makes
+    this a no-op; it never blocks or fails the write.
+    """
+    try:
+        ext = os.path.splitext(path)[1].lower()
+        if ext not in _SOURCE_FILE_EXTS or not os.path.isfile(path):
+            return None
+        with open(path, "r", encoding="utf-8") as f:
+            old_content = f.read()
+        problems = []
+        if (len(old_content) > 0 and DESTRUCTIVE_SHRINK_RATIO > 0
+                and len(old_content.splitlines()) > DESTRUCTIVE_SHRINK_MIN_LINES):
+            shrink = 1 - (len(new_content) / len(old_content))
+            if shrink > DESTRUCTIVE_SHRINK_RATIO:
+                problems.append(
+                    f"shrinks the file by {shrink:.0%} "
+                    f"({len(old_content)} → {len(new_content)} chars)"
+                )
+        removed = sorted(_top_level_symbols(old_content, ext) - _top_level_symbols(new_content, ext))
+        if removed:
+            problems.append(
+                "REMOVED top-level symbol(s) that existed in the previous version: "
+                + ", ".join(removed)
+            )
+        if not problems:
+            return None
+        return (
+            f"⚠ DESTRUCTIVE REWRITE of existing file '{path}': this write "
+            + "; and it ".join(problems)
+            + ". The file was written anyway (the pipeline is not blocked), but if any of "
+              "this was not intentional you MUST restore those sections NOW, before doing "
+              "anything else — re-add them from the original content you read earlier this "
+              "run (the overwritten version is no longer on disk). If the file already "
+              f"existed in the last commit, run_bash(\"git diff -- {path}\") / "
+              f"run_bash(\"git show HEAD:{path}\") can also recover it — but a file first "
+              "created during this same feature is not committed yet, so do not count on "
+              "git for it. Never regenerate an existing file from memory: read it and "
+              "apply the minimal delta."
+        )
+    except Exception:
+        return None
+
+
 def write_file(path: str = None, content: str = "", file_path: str = None,
                file: str = None, filename: str = None) -> str:
     path = path or file_path or file or filename
@@ -172,10 +297,16 @@ def write_file(path: str = None, content: str = "", file_path: str = None,
                      f"Make sure the file is inside one of: {', '.join(SAFE_WRITE_DIRS)}."
         })
     try:
+        # Must run before the write — it compares against the current on-disk
+        # content, which the write below replaces.
+        warning = _destructive_rewrite_warning(path, content)
         os.makedirs(os.path.dirname(path), exist_ok=True) if os.path.dirname(path) else None
         with open(path, "w", encoding="utf-8") as f:
             f.write(content)
-        return json.dumps({"status": "ok", "path": path})
+        result = {"status": "ok", "path": path}
+        if warning:
+            result["warning"] = warning
+        return json.dumps(result)
     except Exception as e:
         return json.dumps({"error": str(e)})
 

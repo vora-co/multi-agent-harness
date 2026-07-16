@@ -1,5 +1,5 @@
 from tools import get_schemas, STATUS_SCHEMA_VERSION
-from agents.shared_rules import CONTRACT_VERIFICATION_RULE, CONVERGENCE_RULE
+from agents.shared_rules import CONTRACT_VERIFICATION_RULE, CONVERGENCE_RULE, MINIMAL_DELTA_RULE
 
 # Project context pre-injected — no need to read docs/
 _PROJECT_CONTEXT = """
@@ -103,6 +103,8 @@ Your job is to implement ONE specific feature and leave all tests passing.
 
 {CONVERGENCE_RULE}
 
+{MINIMAL_DELTA_RULE}
+
 PROTOCOL (follow these steps in order):
 1. Read only the files directly relevant to the feature (not all of them) — see the directories listed under your injected PROJECT ARCHITECTURE / file tree section.
 2. Implement backend and frontend code in the writable directories listed in your task.
@@ -133,6 +135,25 @@ PROTOCOL (follow these steps in order):
 7. Return ONLY the path: progress/impl_<feature_id>.md
 
 HARD RULES:
+- REPRO SCRIPT PROTOCOL (mandatory whenever your task or spec includes a reproduction
+  script — progress/repro_<feature_id>.py/.sh or equivalent): your FIRST action is to run
+  it and confirm the failure mode it claims, establishing the baseline; your LAST action
+  before writing your report is to run it again and confirm it now passes. If the baseline
+  run does NOT fail the way the spec claims, STOP hunting the bug where the spec points —
+  the premise is broken, and no amount of correct work at the wrong location fixes it.
+  Report a PREMISE DISCREPANCY prominently at the top of progress/impl_<feature_id>.md
+  (what the spec claimed vs. what the repro actually showed) instead of implementing a
+  fix you cannot verify.
+- LAYER ISOLATION (mandatory for "X doesn't persist / X returns the wrong value" bug
+  tasks WITHOUT an attached repro script): before reading source code, isolate the faulty
+  layer with the most direct signal available — call the endpoint directly (curl/httpx,
+  bypassing the frontend entirely) and query the DB directly — and only go deep in the
+  one layer where that direct signal confirms the problem. A symptom observed through the
+  UI implicates every layer at once; the same symptom checked at the API+DB level
+  implicates exactly one. Real incident (feature #77): 2 full attempts were spent on a
+  backend persistence bug that a single curl+DB check would have disproven in one
+  iteration — the value persisted fine; the frontend was rendering a reordered array by
+  position.
 - TOOL-CALL BATCHING (mandatory): when step 1 requires reading several files and none of them
   depends on what's in another (e.g. two source files you need context from before writing),
   issue those read_file calls together in the SAME turn rather than one call per turn. The

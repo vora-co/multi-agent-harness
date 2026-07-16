@@ -45,6 +45,8 @@ You → run only feature 2 and stop      # run a specific feature (via the Leade
 - Spec writer caches existing specs (`progress/spec_N.md`) — won't regenerate if exists
 - Implementer caches impl if `progress/impl_N.md` shows tests passing
 - Reviewer in lightweight mode for frontend: only checks files exist, doesn't run servers
+- `write_file` on an existing source file warns (non-blocking) when the rewrite shrinks it >`DESTRUCTIVE_SHRINK_RATIO` (default 30%, only above `DESTRUCTIVE_SHRINK_MIN_LINES`=40 lines; shrink check covers `.py`/JS/TS plus `.go .rb .php .java .cs`) or drops top-level symbols (`def`/`class`/route decorators/JS exports; Python/JS/TS only, no size floor) — the warning names the removed symbols so the agent restores them next turn. `MINIMAL_DELTA_RULE` (shared, `agents/shared_rules.py`): never regenerate an existing file from memory, minimal delta over content actually read — interpolated into implementer AND e2e_tester (a deleted test never fails; the warning is the only signal)
+- Bug-fix features require an executable repro script (`progress/repro_N.py`/`.sh`, fails while the bug exists) or an explicit `REPRO: NOT_FEASIBLE — <reason>` declaration; a spec with neither is quarantined (`.norepro`) and regenerated once, then falls back to annotate-and-continue. Root-cause claims are labeled CONFIRMED/HYPOTHESIS (unlabeled = HYPOTHESIS); CONFIRMED without an attached repro is auto-downgraded to HYPOTHESIS at implementer injection. Implementer runs the repro first (baseline) and last (fix confirmation)
 - `datetime.fromisoformat()` in Python 3.9 doesn't accept `Z` or milliseconds — use `.toISOString().split('.')[0]` in JS
 
 ## To reset a failed feature

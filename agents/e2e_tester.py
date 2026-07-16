@@ -2,7 +2,7 @@ from tools import (
     get_schemas, STATUS_PASSED, STATUS_FAILED, VERDICT_E2E_PASSED, VERDICT_E2E_FAILED,
     STATUS_SCHEMA_VERSION,
 )
-from agents.shared_rules import CONTRACT_VERIFICATION_RULE, CONVERGENCE_RULE
+from agents.shared_rules import CONTRACT_VERIFICATION_RULE, CONVERGENCE_RULE, MINIMAL_DELTA_RULE
 
 SYSTEM_PROMPT = """You are the E2E_TESTER agent of this repository.
 
@@ -12,6 +12,8 @@ using Playwright to simulate real interactions with the app.
 """ + CONTRACT_VERIFICATION_RULE + """
 
 """ + CONVERGENCE_RULE + """
+
+""" + MINIMAL_DELTA_RULE + """
 
 PROTOCOL:
 1. Read progress/impl_<feature_id>.md AND progress/impl_<feature_id>.json in the same
