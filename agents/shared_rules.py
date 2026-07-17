@@ -38,6 +38,42 @@ earlier this run, or, if the file already existed in the last commit, via
 run_bash("git diff -- <path>") / run_bash("git show HEAD:<path>").
 """
 
+DB_CONNECTED_TEST_RULE = """
+DATABASE-CONNECTED TEST DETECTION (mandatory, applies to every test file you are about to
+run): before running any test file with a plain run_bash pytest invocation, check whether
+it imports asyncpg directly or defines/calls a `_dsn(` connection helper (grep for
+`import asyncpg` or `_dsn(` in the file — this is a content signal, not a specific
+filename; any test file matching it counts, not just a currently-known one). If it
+matches, you MUST run that file via run_backend_pytest(test_path=...) instead of
+run_bash — never run_bash for a file matching this signature.
+- WHY THIS IS MANDATORY, NOT ADVISORY: run_bash executes inside an isolated sandbox
+  container with NO route to this project's Postgres/backend compose services. A test that
+  opens a real asyncpg connection run through run_bash WILL ALWAYS fail with a connection
+  error (e.g. "Connect call failed ('127.0.0.1', 5432)") no matter what the code under test
+  actually does — that failure carries ZERO information about correctness, in either
+  direction. run_backend_pytest runs on the host via docker exec into the project's real
+  backend container (starting the backend+postgres compose services itself first if
+  they're not already up), so it gets an actual Postgres connection instead of a
+  guaranteed sandbox artifact.
+- If run_backend_pytest is not present in your toolset when you need it, do NOT fall back
+  to run_bash for a DB-connecting test file — note in your report that this test's
+  coverage could not be executed and why (the harness exposes the tool automatically once
+  it detects this feature touches backend/tests/; its absence means that detection didn't
+  fire for this feature).
+- RESIDUAL CONNECTION FAILURE (mandatory, deterministic — this is not a judgment call): if
+  a test still fails with "Connect call failed" or an equivalent connection-refused/timeout
+  error AFTER being run via run_backend_pytest, that failure is neither an acceptable
+  environmental exception to wave through NOR a code defect to blame on the implementation
+  — it means the postgres/backend compose containers are not actually reachable in this
+  environment even though run_backend_pytest starts them itself. Real incident: two
+  structurally identical features got opposite verdicts from two separate reviewer runs on
+  the same kind of failure — one silently approved, one rejected — because nothing gave
+  either of them a deterministic rule for this exact case. This paragraph is that rule:
+  state explicitly, in whatever report or verdict you produce, that this is a genuine
+  environment setup problem that needs human investigation — never silently approve past
+  it, and never spend further attempts trying to "fix" application code in response to it.
+"""
+
 CONVERGENCE_RULE = """
 CONVERGENCE OVER EXPLORATION (mandatory): your job is to converge on an edit or a
 decision, not to build a complete mental model of the codebase first. Exploration

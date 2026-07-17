@@ -112,7 +112,13 @@ HARD RULES:
   only a case with a mocked session. Add a one-line note on that case explaining why: a mocked
   session never executes real SQL, so it cannot catch a database engine syntax error (e.g. a bind
   parameter cast like `:param::jsonb` breaking the driver's parameter parser) — that class of bug
-  ships silently past any number of tests run only against a mock.
+  ships silently past any number of tests run only against a mock. If that test case connects via
+  asyncpg directly (or defines/calls a `_dsn(` helper) rather than going through the app's own
+  session/ORM layer, do not instruct the implementer to run it with a plain pytest/run_bash
+  invocation in your "Tests to write" notes — the implementer and reviewer already know (via their
+  own DATABASE-CONNECTED TEST DETECTION rule) to run any such file with run_backend_pytest instead,
+  since a sandboxed run_bash pytest invocation has no route to a real Postgres and would always
+  fail regardless of whether the SQL is correct.
 - Only write to progress/.
 - Do NOT implement code — only specify. (Sole exception: the executable
   reproduction script required by the BUG-FIX RULE below — it is a diagnostic

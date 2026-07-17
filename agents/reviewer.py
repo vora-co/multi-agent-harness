@@ -2,7 +2,7 @@ from tools import (
     get_schemas, STATUS_APPROVED, STATUS_REJECTED, VERDICT_APPROVED, VERDICT_REJECTED,
     STATUS_SCHEMA_VERSION,
 )
-from agents.shared_rules import CONTRACT_VERIFICATION_RULE, CONVERGENCE_RULE
+from agents.shared_rules import CONTRACT_VERIFICATION_RULE, CONVERGENCE_RULE, DB_CONNECTED_TEST_RULE
 
 _PROJECT_CONTEXT = """
 ## ARCHITECTURE
@@ -30,6 +30,8 @@ Your job is to objectively validate the implementer's work.
 
 {CONVERGENCE_RULE}
 
+{DB_CONNECTED_TEST_RULE}
+
 PROTOCOL (follow these steps in order):
 1. Read progress/impl_<feature_id>.md.
 2. Read the code files mentioned in that report.
@@ -42,6 +44,10 @@ PROTOCOL (follow these steps in order):
     unit tests commonly mock the API client and never exercise the real wire shape.
 3. Run the tests using the command given under STACK COMMANDS in your task:
    run_bash("<test command from STACK COMMANDS>")  # already runs from the project root, no cd needed
+   EXCEPT any test file matching the DATABASE-CONNECTED TEST DETECTION signal above (imports
+   asyncpg directly, or defines/calls `_dsn(`) — run that one via run_backend_pytest instead,
+   never via this run_bash command, even if it happens to be part of the same test directory
+   STACK COMMANDS would otherwise run as one batch.
 4. Write progress/review_<feature_id>.md with:
    - pytest output (copy the stdout)
    - Verdict: {VERDICT_APPROVED} or {VERDICT_REJECTED}
@@ -70,8 +76,25 @@ APPROVAL CRITERIA:
 ✓ For every list endpoint touched by this feature, the backend's response_model/schema shape
   matches the frontend API client function's return type and actual return statement for that
   same route (see step 2b) — verified by reading both sides, not by file existence alone.
+✓ Any test file matching the DATABASE-CONNECTED TEST DETECTION signal (imports asyncpg
+  directly, or defines/calls `_dsn(`) was run via run_backend_pytest, not run_bash. A
+  "Connect call failed" result from run_bash on such a file is not valid evidence in either
+  direction — it must be re-run via run_backend_pytest before you reach any verdict.
 
 HARD RULES:
+- DATABASE CONNECTIVITY FAILURES ARE NEVER A ROUTINE REJECTION OR A SILENT APPROVAL
+  (mandatory, deterministic — see DATABASE-CONNECTED TEST DETECTION above for the full
+  rationale): if a DB-connecting test still fails with "Connect call failed" or an
+  equivalent connection error AFTER you ran it via run_backend_pytest, do not approve the
+  feature (the test never actually validated anything) and do not write an ordinary
+  numbered "what needs to be fixed" rejection either (the implementer's code did not cause
+  this — retrying will not fix it). Instead return exactly:
+  "{VERDICT_REJECTED}: ENVIRONMENT ERROR — run_backend_pytest also failed with a Postgres
+  connection error ('<the exact error text>'); postgres/backend compose services are not
+  reachable in this environment. This needs human investigation, not another implementer
+  retry." Say this explicitly in progress/review_<feature_id>.md too, not only in the
+  returned verdict string — a human scanning the report should immediately see this is an
+  environment problem, not a code review finding.
 - TOOL-CALL BATCHING (mandatory): step 2 and 2b commonly require reading several code/schema/
   client files that don't depend on each other's contents (e.g. a backend response_model and the
   frontend client function for a different route). Issue those read_file calls together in the

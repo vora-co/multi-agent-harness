@@ -4163,6 +4163,66 @@ class TestMinimalDeltaRuleShared:
         assert sr.MINIMAL_DELTA_RULE.strip() in e2e.SYSTEM_PROMPT
 
 
+class TestDbConnectedTestRuleShared:
+    """
+    Regression coverage for biovet #79/#80/#81: two structurally identical
+    features got opposite reviewer verdicts for the same "Connect call failed
+    127.0.0.1:5432" failure — run_bash's sandbox has no route to Postgres, so
+    that failure is a guaranteed sandbox artifact for any asyncpg-based test,
+    but nothing in the reviewer's prompt gave it a deterministic rule for it.
+    DB_CONNECTED_TEST_RULE (shared) requires detecting such a test (grep for
+    `import asyncpg` or `_dsn(`, not a hardcoded filename) and running it via
+    the new run_backend_pytest tool instead — and treats a connection failure
+    that survives run_backend_pytest as a genuine environment problem to
+    surface explicitly, never a silent approval or a routine rejection.
+    """
+
+    def test_rule_interpolated_into_reviewer_and_implementer(self):
+        import agents.shared_rules as sr
+        import agents.reviewer as reviewer
+        import agents.implementer as impl
+        assert "DATABASE-CONNECTED TEST DETECTION" in sr.DB_CONNECTED_TEST_RULE
+        assert "import asyncpg" in sr.DB_CONNECTED_TEST_RULE
+        assert "_dsn(" in sr.DB_CONNECTED_TEST_RULE
+        assert sr.DB_CONNECTED_TEST_RULE.strip() in reviewer.SYSTEM_PROMPT
+        assert sr.DB_CONNECTED_TEST_RULE.strip() in impl.SYSTEM_PROMPT
+
+    def test_reviewer_has_a_deterministic_environment_error_verdict(self):
+        import agents.reviewer as reviewer
+        # The exact wording matters: a human scanning progress/review_<id>.md
+        # for "ENVIRONMENT ERROR" must be able to find it, and it must not
+        # read as an ordinary numbered rejection implying the implementer's
+        # code is at fault.
+        assert "ENVIRONMENT ERROR" in reviewer.SYSTEM_PROMPT
+        assert "run_backend_pytest" in reviewer.SYSTEM_PROMPT
+        assert "human investigation" in reviewer.SYSTEM_PROMPT
+
+    def test_implementer_flags_residual_failure_instead_of_retrying_fixes(self):
+        import agents.implementer as impl
+        assert "DATABASE ENVIRONMENT ERROR" in impl.SYSTEM_PROMPT
+        assert "run_backend_pytest" in impl.SYSTEM_PROMPT
+
+    def test_spec_writer_points_db_tests_at_run_backend_pytest(self):
+        import agents.spec_writer as spec
+        assert "run_backend_pytest" in spec.SYSTEM_PROMPT
+        assert "_dsn(" in spec.SYSTEM_PROMPT
+
+    def test_no_leftover_language_treats_connection_failure_as_acceptable(self):
+        # Guards the fix itself: every occurrence of "environmental exception"
+        # in these prompts must be a NEGATION (it explicitly says this is NOT
+        # one) — never a bare, unqualified acceptance of the failure.
+        import re
+        import agents.reviewer as reviewer
+        import agents.implementer as impl
+        negation_re = re.compile(r"\b(not|nor|neither)\s+an?\s+acceptable\s+environmental\s+exception", re.IGNORECASE)
+        for prompt in (reviewer.SYSTEM_PROMPT, impl.SYSTEM_PROMPT):
+            occurrences = list(re.finditer(r"environmental exception", prompt, re.IGNORECASE))
+            assert occurrences  # the rule's own text must be present
+            for m in occurrences:
+                window = prompt[max(0, m.start() - 40):m.end()]
+                assert negation_re.search(window), f"unqualified 'environmental exception' near: {window!r}"
+
+
 # ── tools.py: run_playwright_tests (Python/Node stack branching) ─────────────
 
 class _FakeCompleted:

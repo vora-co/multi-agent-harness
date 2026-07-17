@@ -1,5 +1,7 @@
 from tools import get_schemas, STATUS_SCHEMA_VERSION
-from agents.shared_rules import CONTRACT_VERIFICATION_RULE, CONVERGENCE_RULE, MINIMAL_DELTA_RULE
+from agents.shared_rules import (
+    CONTRACT_VERIFICATION_RULE, CONVERGENCE_RULE, MINIMAL_DELTA_RULE, DB_CONNECTED_TEST_RULE,
+)
 
 # Project context pre-injected — no need to read docs/
 _PROJECT_CONTEXT = """
@@ -105,18 +107,30 @@ Your job is to implement ONE specific feature and leave all tests passing.
 
 {MINIMAL_DELTA_RULE}
 
+{DB_CONNECTED_TEST_RULE}
+
 PROTOCOL (follow these steps in order):
 1. Read only the files directly relevant to the feature (not all of them) — see the directories listed under your injected PROJECT ARCHITECTURE / file tree section.
 2. Implement backend and frontend code in the writable directories listed in your task.
 3. Write tests in the test directory shown in your injected STACK COMMANDS / layout, named test_<module>.py.
 4. Run the tests using the command given under STACK COMMANDS in your task:
    run_bash("<test command from STACK COMMANDS>")  # already runs from the project root, no cd needed
+   EXCEPT any test file matching the DATABASE-CONNECTED TEST DETECTION signal above (imports
+   asyncpg directly, or defines/calls `_dsn(`) — run that one via run_backend_pytest instead.
    - If they pass: go to step 5.
    - If they fail: diagnose from the pytest output you already have (the specific failing
      assertion/traceback line) before doing anything else — do NOT re-read files you already
      read in step 1 unless the traceback names a file you haven't seen yet. Make the fix and
      re-run immediately; don't insert a round of general re-exploration between a failure and
      the retry. Maximum 3 attempts. If you can't get them to pass, document and continue.
+     EXCEPTION — RESIDUAL DB CONNECTION FAILURE: if a DB-connecting test still fails with
+     "Connect call failed" (or equivalent) after you already ran it via run_backend_pytest per
+     the rule above, this is not something your 3 fix attempts can resolve — do not spend any
+     of them on it. Flag it prominently at the top of progress/impl_<feature_id>.md as
+     "DATABASE ENVIRONMENT ERROR: <exact error text>" and proceed to step 5 with that test
+     counted as failed in your pytest output/tests_passed, exactly as the DB_CONNECTED_TEST_RULE
+     above requires — do not silently mark it passed, and do not keep retrying application code
+     that isn't the cause.
 4b. PREMISE CHECK EXIT (sanctioned verdict — this is NOT an implementer failure): if your
    direct verification contradicts the diagnosis the spec asserts about the EXISTING code —
    the reproduction script does not fail where the spec says it must fail, or the tests of
