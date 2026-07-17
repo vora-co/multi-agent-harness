@@ -840,6 +840,25 @@ def _validate_extra_args(extra_args: str) -> Optional[str]:
     return None
 
 
+def _compose_file_flags() -> list:
+    """
+    `-f` flags for `docker compose` invocations. Projects that follow the
+    pattern documented in docker-compose.e2e.yml's own header comment keep
+    infra (postgres/minio/etc.) in docker-compose.yml but define the app's
+    own backend/frontend services ONLY in docker-compose.e2e.yml, meant to
+    be combined via `-f docker-compose.yml -f docker-compose.e2e.yml` — with
+    no `-f` at all, `docker compose config` only sees the default file(s)
+    and never reports a backend service, even though one may already be
+    running (started by other tooling). Once any `-f` is given, compose
+    stops auto-discovering docker-compose.yml, so it must be listed
+    explicitly alongside the overlay. Projects with no docker-compose.e2e.yml
+    are unaffected — default discovery behaves exactly as before.
+    """
+    if os.path.isfile(os.path.join(os.getcwd(), "docker-compose.e2e.yml")):
+        return ["-f", "docker-compose.yml", "-f", "docker-compose.e2e.yml"]
+    return []
+
+
 def _docker_compose_config() -> Optional[dict]:
     """
     Best-effort `docker compose config --format json` → the parsed "services"
@@ -850,7 +869,7 @@ def _docker_compose_config() -> Optional[dict]:
     """
     try:
         result = subprocess.run(
-            ["docker", "compose", "config", "--format", "json"],
+            ["docker", "compose", *_compose_file_flags(), "config", "--format", "json"],
             capture_output=True, text=True, timeout=30, cwd=os.getcwd(),
         )
     except Exception:
@@ -930,9 +949,11 @@ def run_backend_pytest(test_path: str = None, extra_args: str = "", timeout: int
         return json.dumps({"error": f"Could not detect: {'; '.join(missing)}.",
                            "services_found": sorted(services.keys())})
 
+    compose_file_flags = _compose_file_flags()
     try:
         up = subprocess.run(
-            ["docker", "compose", "up", "-d", "--wait", backend_service, postgres_service],
+            ["docker", "compose", *compose_file_flags, "up", "-d", "--wait",
+             backend_service, postgres_service],
             capture_output=True, text=True, timeout=COMPOSE_UP_TIMEOUT_S, cwd=os.getcwd(),
         )
     except subprocess.TimeoutExpired:
@@ -949,7 +970,7 @@ def run_backend_pytest(test_path: str = None, extra_args: str = "", timeout: int
 
     try:
         ps = subprocess.run(
-            ["docker", "compose", "ps", "-q", backend_service],
+            ["docker", "compose", *compose_file_flags, "ps", "-q", backend_service],
             capture_output=True, text=True, timeout=30, cwd=os.getcwd(),
         )
     except Exception as e:

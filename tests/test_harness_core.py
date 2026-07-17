@@ -3935,6 +3935,69 @@ class TestRunBackendPytest:
         _, exec_kwargs = next((argv, kw) for argv, kw in calls if argv[:2] == ["docker", "exec"])
         assert exec_kwargs["timeout"] == t.BACKEND_PYTEST_TIMEOUT_S
 
+    def test_e2e_overlay_present_adds_dash_f_flags_to_all_compose_calls(self, monkeypatch, tmp_path):
+        # Projects that keep backend/frontend service definitions only in
+        # docker-compose.e2e.yml (infra lives in docker-compose.yml) report
+        # no backend service at all under plain `docker compose config` —
+        # the overlay must be included via -f on every compose invocation.
+        from types import SimpleNamespace
+        t = self._load_tools(monkeypatch, tmp_path)
+        (tmp_path / "docker-compose.e2e.yml").write_text("services: {}\n")
+        calls = []
+
+        def fake(argv, **kwargs):
+            calls.append(argv)
+            if "config" in argv:
+                return SimpleNamespace(returncode=0, stdout=self._COMPOSE_CONFIG, stderr="")
+            if "up" in argv:
+                return SimpleNamespace(returncode=0, stdout="", stderr="")
+            if "ps" in argv:
+                return SimpleNamespace(returncode=0, stdout="abc123\n", stderr="")
+            if argv[:2] == ["docker", "exec"]:
+                return SimpleNamespace(returncode=0, stdout="3 passed in 0.5s\n", stderr="")
+            raise AssertionError(f"Unexpected subprocess.run call: {argv}")
+        monkeypatch.setattr(t.subprocess, "run", fake)
+
+        result = json.loads(t.run_backend_pytest(test_path="backend/tests/test_migrations.py"))
+
+        assert result["passed"] is True
+        compose_calls = [c for c in calls if c[:2] == ["docker", "compose"]]
+        assert len(compose_calls) == 3  # config, up, ps
+        expected_flags = ["-f", "docker-compose.yml", "-f", "docker-compose.e2e.yml"]
+        for c in compose_calls:
+            assert c[2:2 + len(expected_flags)] == expected_flags, c
+
+    def test_no_e2e_overlay_leaves_compose_calls_unchanged(self, monkeypatch, tmp_path):
+        # No docker-compose.e2e.yml next to the project root: behavior must
+        # be identical to before this fix — no -f flags, default discovery.
+        t = self._load_tools(monkeypatch, tmp_path)
+        calls = self._fake_run(monkeypatch, t)
+
+        result = json.loads(t.run_backend_pytest(test_path="backend/tests/test_migrations.py"))
+
+        assert result["passed"] is True
+        compose_calls = [argv for argv, kw in calls if argv[:2] == ["docker", "compose"]]
+        assert len(compose_calls) == 3
+        for c in compose_calls:
+            assert "-f" not in c
+
+    def test_e2e_overlay_present_but_compose_config_still_fails(self, monkeypatch, tmp_path):
+        # The overlay changes which files are passed to `docker compose
+        # config`, but a failure there must still surface the same clear
+        # error — never a crash or a different failure mode.
+        from types import SimpleNamespace
+        t = self._load_tools(monkeypatch, tmp_path)
+        (tmp_path / "docker-compose.e2e.yml").write_text("services: {}\n")
+
+        def fake(argv, **kwargs):
+            return SimpleNamespace(returncode=1, stdout="", stderr="no configuration file provided")
+        monkeypatch.setattr(t.subprocess, "run", fake)
+
+        result = json.loads(t.run_backend_pytest(test_path="backend/tests/test_migrations.py"))
+
+        assert "error" in result
+        assert "compose" in result["error"].lower()
+
     def test_registered_in_schema_and_dispatch(self, monkeypatch, tmp_path):
         t = self._load_tools(monkeypatch, tmp_path)
         self._fake_run(monkeypatch, t)
