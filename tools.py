@@ -1,4 +1,4 @@
-import os, json, subprocess, datetime, re, sys
+import os, json, subprocess, datetime, re, sys, shlex
 from typing import Optional
 
 # ─── SECURITY ────────────────────────────────────────────────────────────────
@@ -86,6 +86,24 @@ try:
 except ValueError:
     REPRO_SCRIPT_TIMEOUT_S = 180
 MUTATION_TEST_TIMEOUT_S = 300
+
+# Ceiling for run_backend_pytest's actual pytest run — same ceiling-not-floor
+# semantics as REPRO_SCRIPT_TIMEOUT_S (a caller-supplied timeout is capped,
+# never raised). Separate from COMPOSE_UP_TIMEOUT_S below: starting/waiting
+# on containers and running the test suite are unrelated waits.
+try:
+    BACKEND_PYTEST_TIMEOUT_S = int(os.getenv("BACKEND_PYTEST_TIMEOUT_S", "180"))
+except ValueError:
+    BACKEND_PYTEST_TIMEOUT_S = 180
+COMPOSE_UP_TIMEOUT_S = 120
+
+# Image substrings used to find the backend/postgres compose services by
+# what they actually run, not by a hardcoded container name (which encodes
+# the compose PROJECT name — derived from the checkout directory or
+# COMPOSE_PROJECT_NAME, so it varies per clone/CI run). Env-overridable in
+# case a project's backend image doesn't have "python" in it.
+BACKEND_COMPOSE_IMAGE_SUBSTRING = os.getenv("BACKEND_COMPOSE_IMAGE_SUBSTRING", "python")
+POSTGRES_COMPOSE_IMAGE_SUBSTRING = os.getenv("POSTGRES_COMPOSE_IMAGE_SUBSTRING", "postgres")
 
 # Secret-holding files agents must never read, regardless of SAFE_WRITE_DIRS —
 # read_file/list_files are not otherwise confined the way write_file/append_file
@@ -770,6 +788,205 @@ def run_repro_script(feature_id: int = None, timeout: int = None, **kwargs) -> s
     })
 
 
+# ─── run_backend_pytest: host-side pytest against a real Postgres ───────────
+# Same class of gap run_repro_script (v1.55.0) closed for browser-only bugs,
+# extended to "and no Postgres": run_bash's sandbox is an isolated Docker
+# network with no route to the project's compose services, so any
+# backend/tests/*.py file that opens a real asyncpg connection (e.g.
+# backend/tests/test_migrations.py) fails with "Connect call failed" no
+# matter what the code under test actually does — the agent cannot tell a
+# real regression from "the sandbox can't reach Postgres." Widening the
+# sandbox's own network would weaken the egress-proxy's isolation guarantee
+# for every other sandboxed command, not just DB tests — so this tool
+# deliberately runs on the HOST via subprocess instead, the same structural
+# choice run_repro_script/run_playwright_tests already made.
+
+_BACKEND_TESTS_PATH_RE = re.compile(r"^backend/tests/[\w./-]+\.py$")
+# Reject shell metacharacters in extra_args outright — even though the actual
+# subprocess call below is list-based (no shell=True, so these can't inject
+# a second command), a value that needs shell syntax to make sense (e.g.
+# "-k foo; rm -rf /") shouldn't reach shlex.split silently truncated at the
+# semicolon and passed to pytest as if it were legitimate arguments either.
+_SHELL_METACHAR_RE = re.compile(r"[;&|$`<>\n]")
+
+
+def _validate_backend_test_path(test_path: str) -> Optional[str]:
+    """Returns an error string if test_path is unsafe/out of scope, else None."""
+    if not test_path:
+        return "Required argument 'test_path' is missing"
+    normalized = os.path.normpath(str(test_path)).replace("\\", "/")
+    if ".." in normalized.split("/"):
+        return f"'{test_path}' is not allowed — path traversal ('..') is rejected"
+    if not _BACKEND_TESTS_PATH_RE.match(normalized):
+        return (f"'{test_path}' must be a .py file inside backend/tests/ (e.g. "
+                f"'backend/tests/test_migrations.py') — got '{normalized}'. This is a narrow "
+                f"tool for backend/tests/, not general host execution.")
+    return None
+
+
+def _validate_extra_args(extra_args: str) -> Optional[str]:
+    """Returns an error string if extra_args is unsafe/unparseable, else None."""
+    if not extra_args:
+        return None
+    match = _SHELL_METACHAR_RE.search(extra_args)
+    if match:
+        return (f"extra_args contains a disallowed character ({match.group(0)!r}) — it is passed "
+                f"directly to pytest's own argument parser, never a shell, so shell syntax "
+                f"(';', '|', '&&', redirects, backticks) has no effect and is rejected outright.")
+    try:
+        shlex.split(extra_args)
+    except ValueError as e:
+        return f"extra_args could not be parsed as shell-style arguments: {e}"
+    return None
+
+
+def _docker_compose_config() -> Optional[dict]:
+    """
+    Best-effort `docker compose config --format json` → the parsed "services"
+    dict (service_name -> service definition, including its resolved
+    "image"). Returns None on any failure (Docker not installed, no compose
+    file in the project root, timeout, malformed JSON) — callers turn that
+    into one clear error message, never a raw traceback.
+    """
+    try:
+        result = subprocess.run(
+            ["docker", "compose", "config", "--format", "json"],
+            capture_output=True, text=True, timeout=30, cwd=os.getcwd(),
+        )
+    except Exception:
+        return None
+    if result.returncode != 0:
+        return None
+    try:
+        parsed = json.loads(result.stdout)
+    except (json.JSONDecodeError, TypeError):
+        return None
+    services = parsed.get("services") if isinstance(parsed, dict) else None
+    return services if isinstance(services, dict) else None
+
+
+def _detect_compose_service_by_image(services: dict, image_substring: str) -> Optional[str]:
+    """
+    First service name whose resolved "image" contains image_substring
+    (case-insensitive) — never a hardcoded service/container name. A
+    container name like "<project>-backend-1" bakes in the compose PROJECT
+    name, which is derived from the checkout directory (or
+    COMPOSE_PROJECT_NAME) and therefore varies per clone/CI run; matching by
+    what the service actually runs is the only check that's portable.
+    """
+    needle = image_substring.lower()
+    for name, definition in (services or {}).items():
+        image = str(definition.get("image", "")) if isinstance(definition, dict) else ""
+        if needle in image.lower():
+            return name
+    return None
+
+
+def run_backend_pytest(test_path: str = None, extra_args: str = "", timeout: int = None, **kwargs) -> str:
+    """
+    Run a backend/tests/*.py file against a REAL Postgres — ON THE HOST,
+    outside the docker sandbox, via `docker exec` into the project's own
+    compose-managed backend container. See the module-level comment above
+    this function for why: run_bash's sandbox network has no route to the
+    project's compose services.
+
+    Narrow by design, not general host execution: test_path must resolve
+    (after normalization) to a real path inside backend/tests/ ending in
+    .py, and extra_args is rejected outright if it contains any shell
+    metacharacter — the actual subprocess call is list-based (no shell=True)
+    so injection isn't structurally possible, but a value that only makes
+    sense with shell syntax is refused rather than silently mis-parsed.
+
+    Self-sufficient regardless of the sandbox environment's current state:
+    always runs `docker compose up -d --wait` on the detected backend +
+    postgres services first, so this never assumes a container is already
+    running.
+    """
+    path_error = _validate_backend_test_path(test_path)
+    if path_error:
+        return json.dumps({"error": path_error})
+    args_error = _validate_extra_args(extra_args)
+    if args_error:
+        return json.dumps({"error": args_error})
+    normalized_path = os.path.normpath(str(test_path)).replace("\\", "/")
+
+    services = _docker_compose_config()
+    if services is None:
+        return json.dumps({
+            "error": "Could not read the docker compose configuration ('docker compose config "
+                     "--format json' failed or returned no services). Is a docker-compose.yml "
+                     "present in the project root, and is Docker running?",
+        })
+    backend_service = _detect_compose_service_by_image(services, BACKEND_COMPOSE_IMAGE_SUBSTRING)
+    postgres_service = _detect_compose_service_by_image(services, POSTGRES_COMPOSE_IMAGE_SUBSTRING)
+    missing = []
+    if not backend_service:
+        missing.append(f"backend service (no compose service image contains "
+                        f"'{BACKEND_COMPOSE_IMAGE_SUBSTRING}')")
+    if not postgres_service:
+        missing.append(f"postgres service (no compose service image contains "
+                        f"'{POSTGRES_COMPOSE_IMAGE_SUBSTRING}')")
+    if missing:
+        return json.dumps({"error": f"Could not detect: {'; '.join(missing)}.",
+                           "services_found": sorted(services.keys())})
+
+    try:
+        up = subprocess.run(
+            ["docker", "compose", "up", "-d", "--wait", backend_service, postgres_service],
+            capture_output=True, text=True, timeout=COMPOSE_UP_TIMEOUT_S, cwd=os.getcwd(),
+        )
+    except subprocess.TimeoutExpired:
+        return json.dumps({"error": f"'docker compose up -d --wait' timed out after "
+                                    f"{COMPOSE_UP_TIMEOUT_S}s waiting for "
+                                    f"{backend_service}/{postgres_service} to become healthy."})
+    except Exception as e:
+        return json.dumps({"error": f"Failed to start compose services: {e}"})
+    if up.returncode != 0:
+        return json.dumps({
+            "error": f"'docker compose up -d --wait {backend_service} {postgres_service}' failed.",
+            "output": (up.stdout + up.stderr)[-2000:],
+        })
+
+    try:
+        ps = subprocess.run(
+            ["docker", "compose", "ps", "-q", backend_service],
+            capture_output=True, text=True, timeout=30, cwd=os.getcwd(),
+        )
+    except Exception as e:
+        return json.dumps({"error": f"Failed to resolve the '{backend_service}' container id: {e}"})
+    container_id = next((line.strip() for line in ps.stdout.splitlines() if line.strip()), "")
+    if not container_id:
+        return json.dumps({"error": f"'{backend_service}' has no running container after "
+                                    f"'docker compose up -d --wait'."})
+
+    try:
+        timeout_s = BACKEND_PYTEST_TIMEOUT_S if timeout is None else min(int(timeout), BACKEND_PYTEST_TIMEOUT_S)
+    except (TypeError, ValueError):
+        timeout_s = BACKEND_PYTEST_TIMEOUT_S
+
+    argv = ["docker", "exec", "-w", "/app/backend", container_id,
+            "python3", "-m", "pytest", normalized_path, "-v", "--tb=short"]
+    if extra_args:
+        argv.extend(shlex.split(extra_args))  # already validated: no shell metacharacters
+
+    try:
+        result = subprocess.run(argv, capture_output=True, text=True, timeout=timeout_s, cwd=os.getcwd())
+    except subprocess.TimeoutExpired:
+        return json.dumps({"error": f"Backend pytest run timed out after {timeout_s}s.",
+                           "test_path": normalized_path})
+    except Exception as e:
+        return json.dumps({"error": str(e), "test_path": normalized_path})
+
+    output = result.stdout + result.stderr
+    return json.dumps({
+        "test_path": normalized_path,
+        "backend_service": backend_service,
+        "returncode": result.returncode,
+        "passed": result.returncode == 0,
+        "output": output[-3000:],
+    })
+
+
 # ─── SCHEMA REGISTRY ────────────────────────────────────────────────────────
 
 def _schema(name, desc, props, required):
@@ -794,6 +1011,7 @@ TOOLS_FN = {
     "run_playwright_tests": run_playwright_tests,
     "take_screenshot": take_screenshot,
     "run_repro_script": run_repro_script,
+    "run_backend_pytest": run_backend_pytest,
 }
 
 TOOLS_SCHEMA = {
@@ -857,6 +1075,20 @@ TOOLS_SCHEMA = {
             "feature_id": {"type": "integer", "description": "The feature whose repro script to run"},
             "timeout":    {"type": "integer", "description": f"Optional timeout in seconds (capped at {REPRO_SCRIPT_TIMEOUT_S})"}
         }, ["feature_id"]),
+
+    "run_backend_pytest": _schema(
+        "run_backend_pytest",
+        "Run a backend/tests/*.py file against a REAL Postgres ON THE HOST, via docker exec into "
+        "the project's own compose-managed backend container — use this whenever a test needs a "
+        "real DB connection (e.g. asyncpg-based tests), since run_bash's sandbox has no route to "
+        "the compose services and always fails with a connection error regardless of the code "
+        "under test. Self-sufficient: starts the backend+postgres compose services first if they "
+        "aren't already up. Returns passed (exit 0), returncode, and the pytest output.",
+        {
+            "test_path":  {"type": "string", "description": "Path to a test file inside backend/tests/, e.g. 'backend/tests/test_migrations.py'"},
+            "extra_args": {"type": "string", "description": "Extra pytest CLI args, e.g. '-k test_foo'. No shell syntax — passed directly to pytest."},
+            "timeout":    {"type": "integer", "description": f"Optional timeout in seconds for the pytest run (capped at {BACKEND_PYTEST_TIMEOUT_S})"}
+        }, ["test_path"]),
 
     "run_mutation_tests": _schema(
         "run_mutation_tests",

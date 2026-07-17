@@ -3748,6 +3748,205 @@ class TestRunReproScript:
         assert result["passed"] is True
 
 
+class TestRunBackendPytest:
+    """
+    Coverage for run_backend_pytest: agents (implementer, reviewer) had no
+    way to execute backend/tests/*.py files that need a real Postgres
+    connection — run_bash's sandbox network has no route to the project's
+    compose services, so any asyncpg-based test always fails with a
+    connection error regardless of the code under test. This tool runs ON
+    THE HOST via docker exec into the compose-managed backend container,
+    same structural choice as run_repro_script/run_playwright_tests.
+    Services are detected by matching each compose service's resolved image
+    against a substring (never a hardcoded container name, which bakes in
+    the compose PROJECT name).
+    """
+
+    def _load_tools(self, monkeypatch, tmp_path: Path):
+        monkeypatch.chdir(tmp_path)
+        for mod in ["sandbox"]:
+            monkeypatch.setitem(sys.modules, mod, MagicMock())
+        for key in list(sys.modules.keys()):
+            if key == "tools":
+                del sys.modules[key]
+        root = Path(__file__).parent.parent
+        if str(root) not in sys.path:
+            sys.path.insert(0, str(root))
+        return importlib.import_module("tools")
+
+    _COMPOSE_CONFIG = json.dumps({
+        "services": {
+            "backend":  {"image": "myproj-backend-python:latest"},
+            "db":       {"image": "postgres:15"},
+            "frontend": {"image": "node:20"},
+        }
+    })
+
+    def _fake_run(self, monkeypatch, t, overrides=None, container_id="abc123"):
+        """
+        Stubs subprocess.run with a prefix-matched fake, mirroring the real
+        call sequence: compose config -> compose up -> compose ps -> exec.
+        `overrides` lets a test replace any step's response by argv prefix.
+        """
+        from types import SimpleNamespace
+        responses = {
+            ("docker", "compose", "config", "--format", "json"):
+                SimpleNamespace(returncode=0, stdout=self._COMPOSE_CONFIG, stderr=""),
+            ("docker", "compose", "up", "-d", "--wait"):
+                SimpleNamespace(returncode=0, stdout="", stderr=""),
+            ("docker", "compose", "ps", "-q"):
+                SimpleNamespace(returncode=0, stdout=f"{container_id}\n", stderr=""),
+            ("docker", "exec"):
+                SimpleNamespace(returncode=0, stdout="3 passed in 0.5s\n", stderr=""),
+        }
+        if overrides:
+            responses.update(overrides)
+        calls = []
+
+        def fake(argv, **kwargs):
+            calls.append((argv, kwargs))
+            for prefix in sorted(responses, key=len, reverse=True):
+                if tuple(argv[:len(prefix)]) == prefix:
+                    return responses[prefix]
+            raise AssertionError(f"Unexpected subprocess.run call: {argv}")
+        monkeypatch.setattr(t.subprocess, "run", fake)
+        return calls
+
+    def test_happy_path_detects_services_and_runs_pytest(self, monkeypatch, tmp_path):
+        t = self._load_tools(monkeypatch, tmp_path)
+        calls = self._fake_run(monkeypatch, t)
+
+        result = json.loads(t.run_backend_pytest(test_path="backend/tests/test_migrations.py"))
+
+        assert result["passed"] is True
+        assert result["backend_service"] == "backend"  # detected by image, not hardcoded
+        assert result["test_path"] == "backend/tests/test_migrations.py"
+        assert "3 passed" in result["output"]
+        exec_call = next(argv for argv, kw in calls if argv[:2] == ["docker", "exec"])
+        assert "abc123" in exec_call  # the detected container id, not a guessed name
+        assert "backend/tests/test_migrations.py" in exec_call
+
+    def test_test_path_outside_backend_tests_is_rejected(self, monkeypatch, tmp_path):
+        t = self._load_tools(monkeypatch, tmp_path)
+        calls = self._fake_run(monkeypatch, t)
+
+        result = json.loads(t.run_backend_pytest(test_path="backend/app/main.py"))
+
+        assert "error" in result
+        assert calls == []  # rejected before any subprocess call
+
+    def test_path_traversal_is_rejected(self, monkeypatch, tmp_path):
+        t = self._load_tools(monkeypatch, tmp_path)
+        calls = self._fake_run(monkeypatch, t)
+
+        result = json.loads(t.run_backend_pytest(
+            test_path="backend/tests/../../../etc/passwd.py"))
+
+        assert "error" in result
+        assert calls == []
+
+    def test_missing_test_path_is_rejected(self, monkeypatch, tmp_path):
+        t = self._load_tools(monkeypatch, tmp_path)
+        result = json.loads(t.run_backend_pytest())
+        assert "error" in result
+
+    def test_extra_args_with_shell_metacharacters_rejected(self, monkeypatch, tmp_path):
+        t = self._load_tools(monkeypatch, tmp_path)
+        calls = self._fake_run(monkeypatch, t)
+
+        result = json.loads(t.run_backend_pytest(
+            test_path="backend/tests/test_migrations.py", extra_args="-k foo; rm -rf /"))
+
+        assert "error" in result
+        assert calls == []  # rejected before any subprocess call, not silently truncated
+
+    def test_extra_args_passed_through_as_separate_argv_elements(self, monkeypatch, tmp_path):
+        # No shell=True anywhere in the chain — extra_args reaches pytest's
+        # own argument parser as discrete argv elements, never a shell string.
+        t = self._load_tools(monkeypatch, tmp_path)
+        calls = self._fake_run(monkeypatch, t)
+
+        result = json.loads(t.run_backend_pytest(
+            test_path="backend/tests/test_migrations.py", extra_args="-k test_foo --maxfail=1"))
+
+        assert result["passed"] is True
+        exec_call = next(argv for argv, kw in calls if argv[:2] == ["docker", "exec"])
+        assert "-k" in exec_call and "test_foo" in exec_call and "--maxfail=1" in exec_call
+        for argv, kw in calls:
+            assert kw.get("shell") is not True
+
+    def test_missing_postgres_service_errors(self, monkeypatch, tmp_path):
+        from types import SimpleNamespace
+        t = self._load_tools(monkeypatch, tmp_path)
+        no_pg_config = json.dumps({"services": {"backend": {"image": "myproj-backend-python:latest"}}})
+        calls = self._fake_run(monkeypatch, t, overrides={
+            ("docker", "compose", "config", "--format", "json"):
+                SimpleNamespace(returncode=0, stdout=no_pg_config, stderr=""),
+        })
+
+        result = json.loads(t.run_backend_pytest(test_path="backend/tests/test_migrations.py"))
+
+        assert "error" in result
+        assert "postgres" in result["error"].lower()
+        # No compose-up/exec attempted once service detection already failed.
+        assert not any(argv[:3] == ["docker", "compose", "up"] for argv, kw in calls)
+
+    def test_compose_config_failure_returns_clear_error(self, monkeypatch, tmp_path):
+        from types import SimpleNamespace
+        t = self._load_tools(monkeypatch, tmp_path)
+        self._fake_run(monkeypatch, t, overrides={
+            ("docker", "compose", "config", "--format", "json"):
+                SimpleNamespace(returncode=1, stdout="", stderr="no configuration file provided"),
+        })
+
+        result = json.loads(t.run_backend_pytest(test_path="backend/tests/test_migrations.py"))
+
+        assert "error" in result
+        assert "compose" in result["error"].lower()
+
+    def test_compose_up_failure_returns_output(self, monkeypatch, tmp_path):
+        from types import SimpleNamespace
+        t = self._load_tools(monkeypatch, tmp_path)
+        self._fake_run(monkeypatch, t, overrides={
+            ("docker", "compose", "up", "-d", "--wait"):
+                SimpleNamespace(returncode=1, stdout="", stderr="pull access denied"),
+        })
+
+        result = json.loads(t.run_backend_pytest(test_path="backend/tests/test_migrations.py"))
+
+        assert "error" in result
+        assert "pull access denied" in result["output"]
+
+    def test_empty_container_id_after_up_errors(self, monkeypatch, tmp_path):
+        t = self._load_tools(monkeypatch, tmp_path)
+        self._fake_run(monkeypatch, t, container_id="")
+
+        result = json.loads(t.run_backend_pytest(test_path="backend/tests/test_migrations.py"))
+
+        assert "error" in result
+
+    def test_timeout_is_capped_at_the_ceiling(self, monkeypatch, tmp_path):
+        t = self._load_tools(monkeypatch, tmp_path)
+        calls = self._fake_run(monkeypatch, t)
+
+        json.loads(t.run_backend_pytest(
+            test_path="backend/tests/test_migrations.py", timeout=999999))
+
+        _, exec_kwargs = next((argv, kw) for argv, kw in calls if argv[:2] == ["docker", "exec"])
+        assert exec_kwargs["timeout"] == t.BACKEND_PYTEST_TIMEOUT_S
+
+    def test_registered_in_schema_and_dispatch(self, monkeypatch, tmp_path):
+        t = self._load_tools(monkeypatch, tmp_path)
+        self._fake_run(monkeypatch, t)
+        schemas = t.get_schemas("run_backend_pytest")
+        assert len(schemas) == 1
+        assert schemas[0]["function"]["name"] == "run_backend_pytest"
+        assert "test_path" in schemas[0]["function"]["parameters"]["required"]
+        result = json.loads(t.execute_tool(
+            "run_backend_pytest", {"test_path": "backend/tests/test_migrations.py"}))
+        assert result["passed"] is True
+
+
 # ── harness.py: scoped exposure of run_repro_script to the implementer ───────
 
 class TestReproToolExposure:
@@ -3800,6 +3999,150 @@ class TestReproToolExposure:
         captured = self._spawn(h, monkeypatch, 9, "Fix: is_active no persiste", e2e=False)
         assert "Reproduction script (mandatory protocol)" in captured["task"]
         assert "run_repro_script" not in captured["task"]
+
+
+# ── harness.py: scoped exposure of run_backend_pytest to implementer+reviewer
+
+class TestBackendPytestToolExposure:
+    """
+    run_backend_pytest is exposed to BOTH implementer and reviewer whenever a
+    feature's own file list includes something under backend/tests/*.py —
+    checked via the spec text (available before any attempt has run) OR'd
+    with impl.json's files_touched (real ground truth once an attempt has
+    run). Deliberately no bugfix/e2e restriction, unlike run_repro_script:
+    this isn't repro-specific, it's "does this feature's test suite need a
+    real DB."
+    """
+
+    def _tool_names(self, tools):
+        return [s["function"]["name"] for s in tools]
+
+    def _spawn_impl(self, h, monkeypatch, feature_id, description, **spawn_kw):
+        h.impl_cfg.TOOLS = []
+        captured = {}
+
+        def fake_run_agent(system_prompt, tools, task, **kw):
+            captured["tools"] = tools
+            return f"progress/impl_{feature_id}.md"
+        monkeypatch.setattr(h, "run_agent", fake_run_agent)
+        h.spawn_implementer(feature_id, description, **spawn_kw)
+        return captured
+
+    def _spawn_reviewer(self, h, monkeypatch, feature_id, **spawn_kw):
+        h.reviewer_cfg.TOOLS = []
+        captured = {}
+
+        def fake_run_agent(system_prompt, tools, task, **kw):
+            captured["tools"] = tools
+            return "APPROVED"
+        monkeypatch.setattr(h, "run_agent", fake_run_agent)
+        h.spawn_reviewer(feature_id, **spawn_kw)
+        return captured
+
+    def test_implementer_exposed_via_spec_text(self, monkeypatch, tmp_path):
+        h = _load_harness(monkeypatch, tmp_path)
+        (tmp_path / "progress").mkdir(exist_ok=True)
+        (tmp_path / "progress" / "spec_9.md").write_text(
+            "## Files to create or modify\n- backend/tests/test_migrations.py\n")
+        captured = self._spawn_impl(h, monkeypatch, 9, "Add a migration for the branches table",
+                                    spec_path="progress/spec_9.md")
+        assert "run_backend_pytest" in self._tool_names(captured["tools"])
+
+    def test_implementer_exposed_via_prior_attempt_files_touched(self, monkeypatch, tmp_path):
+        # A retry: no spec text match this time, but the previous attempt's
+        # own files_touched already names a backend/tests/ path.
+        h = _load_harness(monkeypatch, tmp_path)
+        (tmp_path / "progress").mkdir(exist_ok=True)
+        (tmp_path / "progress" / "impl_9.json").write_text(json.dumps({
+            "schema_version": 1, "status": "done", "tests_passed": False,
+            "files_touched": ["backend/tests/test_migrations.py"],
+        }))
+        captured = self._spawn_impl(h, monkeypatch, 9, "Add a migration for the branches table",
+                                    attempt=2, rejection_reason="fix the test")
+        assert "run_backend_pytest" in self._tool_names(captured["tools"])
+
+    def test_implementer_not_exposed_for_unrelated_feature(self, monkeypatch, tmp_path):
+        h = _load_harness(monkeypatch, tmp_path)
+        (tmp_path / "progress").mkdir(exist_ok=True)
+        captured = self._spawn_impl(h, monkeypatch, 9, "Add CSV export to the reports page")
+        assert "run_backend_pytest" not in self._tool_names(captured["tools"])
+
+    def test_implementer_exposure_independent_of_e2e_flag(self, monkeypatch, tmp_path):
+        # Unlike run_repro_script, this gate has no e2e restriction — a
+        # backend-only (e2e=false) feature touching backend/tests/ still
+        # needs the tool.
+        h = _load_harness(monkeypatch, tmp_path)
+        (tmp_path / "progress").mkdir(exist_ok=True)
+        (tmp_path / "progress" / "spec_9.md").write_text("backend/tests/test_migrations.py")
+        captured = self._spawn_impl(h, monkeypatch, 9, "Add a migration", e2e=False,
+                                    spec_path="progress/spec_9.md")
+        assert "run_backend_pytest" in self._tool_names(captured["tools"])
+
+    def test_reviewer_exposed_via_impl_files_touched(self, monkeypatch, tmp_path):
+        h = _load_harness(monkeypatch, tmp_path)
+        (tmp_path / "progress").mkdir(exist_ok=True)
+        (tmp_path / "progress" / "impl_9.json").write_text(json.dumps({
+            "schema_version": 1, "status": "done", "tests_passed": True,
+            "files_touched": ["backend/tests/test_migrations.py"],
+        }))
+        captured = self._spawn_reviewer(h, monkeypatch, 9)
+        assert "run_backend_pytest" in self._tool_names(captured["tools"])
+
+    def test_reviewer_not_exposed_for_unrelated_feature(self, monkeypatch, tmp_path):
+        h = _load_harness(monkeypatch, tmp_path)
+        (tmp_path / "progress").mkdir(exist_ok=True)
+        (tmp_path / "progress" / "impl_9.json").write_text(json.dumps({
+            "schema_version": 1, "status": "done", "tests_passed": True,
+            "files_touched": ["frontend/pages/reports.tsx"],
+        }))
+        captured = self._spawn_reviewer(h, monkeypatch, 9)
+        assert "run_backend_pytest" not in self._tool_names(captured["tools"])
+
+    def test_reviewer_exposed_via_spec_path_fallback(self, monkeypatch, tmp_path):
+        h = _load_harness(monkeypatch, tmp_path)
+        (tmp_path / "progress").mkdir(exist_ok=True)
+        (tmp_path / "progress" / "spec_9.md").write_text("backend/tests/test_migrations.py")
+        captured = self._spawn_reviewer(h, monkeypatch, 9, spec_path="progress/spec_9.md")
+        assert "run_backend_pytest" in self._tool_names(captured["tools"])
+
+
+# ── harness.py: _feature_touches_backend_tests (unit) ────────────────────────
+
+class TestFeatureTouchesBackendTests:
+    def test_matches_spec_text(self, monkeypatch, tmp_path):
+        h = _load_harness(monkeypatch, tmp_path)
+        (tmp_path / "progress").mkdir(exist_ok=True)
+        assert h._feature_touches_backend_tests(
+            1, "## Files\n- backend/tests/test_migrations.py\n") is True
+
+    def test_matches_impl_files_touched(self, monkeypatch, tmp_path):
+        h = _load_harness(monkeypatch, tmp_path)
+        (tmp_path / "progress").mkdir(exist_ok=True)
+        (tmp_path / "progress" / "impl_1.json").write_text(json.dumps({
+            "schema_version": 1, "status": "done", "tests_passed": True,
+            "files_touched": ["backend/app/main.py", "backend/tests/test_x.py"],
+        }))
+        assert h._feature_touches_backend_tests(1, "") is True
+
+    def test_false_when_neither_source_matches(self, monkeypatch, tmp_path):
+        h = _load_harness(monkeypatch, tmp_path)
+        (tmp_path / "progress").mkdir(exist_ok=True)
+        (tmp_path / "progress" / "impl_1.json").write_text(json.dumps({
+            "schema_version": 1, "status": "done", "tests_passed": True,
+            "files_touched": ["frontend/pages/x.tsx"],
+        }))
+        assert h._feature_touches_backend_tests(1, "no backend paths here") is False
+
+    def test_false_when_nothing_on_disk(self, monkeypatch, tmp_path):
+        h = _load_harness(monkeypatch, tmp_path)
+        (tmp_path / "progress").mkdir(exist_ok=True)
+        assert h._feature_touches_backend_tests(1, "") is False
+
+    def test_corrupt_impl_json_is_a_noop_not_a_crash(self, monkeypatch, tmp_path):
+        h = _load_harness(monkeypatch, tmp_path)
+        (tmp_path / "progress").mkdir(exist_ok=True)
+        (tmp_path / "progress" / "impl_1.json").write_text("{not valid json[[")
+        assert h._feature_touches_backend_tests(1, "") is False
 
 
 # ── agents/shared_rules.py: MINIMAL_DELTA_RULE shared across writer roles ────

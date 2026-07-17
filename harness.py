@@ -2975,6 +2975,9 @@ def spawn_implementer(feature_id: int, description: str, attempt: int = 1,
     layout_context = _layout_context()
 
     spec_content = ""
+    _spec_text = ""  # populated below when spec_path resolves; used again by the
+                      # run_backend_pytest exposure check further down even if the
+                      # try block below fails partway through
     if spec_path and os.path.exists(spec_path):
         try:
             with open(spec_path, "r", encoding="utf-8") as f:
@@ -3009,6 +3012,15 @@ def spawn_implementer(feature_id: int, description: str, attempt: int = 1,
     if e2e and _is_bugfix_feature(description):
         _impl_tools = list(_impl_tools) + get_schemas("run_repro_script")
         _repro_tool_exposed = True
+
+    # Scoped tool exposure: run_backend_pytest — a host-side runner (docker
+    # exec into the compose-managed backend container) for backend/tests/*.py
+    # files that need a real Postgres connection. No bugfix/e2e restriction
+    # (unlike run_repro_script above) since this isn't repro-specific — it's
+    # "does this feature's own test suite need a real DB", independent of
+    # whether the feature is a bug fix or whether it has E2E coverage.
+    if _feature_touches_backend_tests(feature_id, _spec_text):
+        _impl_tools = list(_impl_tools) + get_schemas("run_backend_pytest")
 
     # If a reproduction script exists for this feature, surface it explicitly —
     # the REPRO SCRIPT PROTOCOL hard rule (agents/implementer.py) triggers off
@@ -3158,6 +3170,37 @@ def _existing_repro_script(feature_id: int) -> Optional[str]:
 
 
 _REPRO_NOT_FEASIBLE_RE = re.compile(r"(?i)\bREPRO:\s*NOT_FEASIBLE\b")
+
+_BACKEND_TESTS_PATH_HINT_RE = re.compile(r"backend/tests/[\w./-]+\.py")
+
+
+def _feature_touches_backend_tests(feature_id: int, spec_text: str = "") -> bool:
+    """
+    Scoping heuristic for the run_backend_pytest tool (same non-blocking
+    philosophy as _is_bugfix_feature): does this feature's own file list
+    include something under backend/tests/*.py? Checked from both sides,
+    OR'd together rather than short-circuiting, since either alone can be
+    incomplete at a given call site:
+      - progress/impl_<id>.json's "files_touched" — real ground truth once
+        an attempt has actually run, available to spawn_reviewer and to a
+        spawn_implementer retry.
+      - The spec's own "Files to create or modify" text — available before
+        any attempt has run, so spawn_implementer's first attempt still gets
+        the tool exposed instead of only from the second attempt on.
+    A false positive only adds an unused tool to the agent's toolset; it
+    never blocks or changes any other behavior.
+    """
+    if _BACKEND_TESTS_PATH_HINT_RE.search(spec_text or ""):
+        return True
+    try:
+        with open(f"{PROGRESS_DIR}/impl_{feature_id}.json", "r", encoding="utf-8") as f:
+            impl_status = json.load(f)
+        files_touched = impl_status.get("files_touched") if isinstance(impl_status, dict) else None
+        if files_touched and any(_BACKEND_TESTS_PATH_HINT_RE.search(str(p)) for p in files_touched):
+            return True
+    except Exception:
+        pass
+    return False
 
 
 def _bugfix_spec_missing_repro(feature_id: int, spec_text: str) -> bool:
@@ -3482,7 +3525,8 @@ def spawn_spec_writer(feature_id: int, description: str) -> str:
     return result
 
 
-def spawn_reviewer(feature_id: int, e2e: bool = True, attempt: int = 1) -> str:
+def spawn_reviewer(feature_id: int, e2e: bool = True, attempt: int = 1,
+                   spec_path: str = None) -> str:
     _phase_header("reviewer", "Reviewing", feature_id)
     _log("reviewer", "SPAWN", f"feature={feature_id} e2e={e2e} attempt={attempt}")
 
@@ -3537,10 +3581,25 @@ def spawn_reviewer(feature_id: int, e2e: bool = True, attempt: int = 1) -> str:
         f"Write your verdict to {PROGRESS_DIR}/review_{feature_id}.md\n"
         f"Return ONLY: '{VERDICT_APPROVED}' or '{VERDICT_REJECTED}: <reason>'"
     )
+    # Scoped tool exposure: run_backend_pytest, same gate and rationale as
+    # spawn_implementer's (see the comment there) — checked from impl.json's
+    # files_touched (real ground truth: the implementer already ran by the
+    # time the reviewer is spawned) OR'd with the spec text as a fallback.
+    _review_tools = reviewer_cfg.TOOLS
+    _review_spec_text = ""
+    if spec_path and os.path.exists(spec_path):
+        try:
+            with open(spec_path, "r", encoding="utf-8") as f:
+                _review_spec_text = f.read()
+        except OSError:
+            pass
+    if _feature_touches_backend_tests(feature_id, _review_spec_text):
+        _review_tools = list(_review_tools) + get_schemas("run_backend_pytest")
+
     _agent_ctx = _fire_transform("before_spawn_agent", role="reviewer",
                                  system_prompt=reviewer_cfg.SYSTEM_PROMPT,
                                  task=task, feature_id=feature_id)
-    result = run_agent(_agent_ctx["system_prompt"], reviewer_cfg.TOOLS, _agent_ctx["task"],
+    result = run_agent(_agent_ctx["system_prompt"], _review_tools, _agent_ctx["task"],
                        role="reviewer", color="magenta", max_iter=max_iter,
                        checkpoint_key=f"reviewer_{feature_id}_{attempt}")
 
@@ -3861,7 +3920,7 @@ def _run_feature_cycle_impl(feature_id: int, description: str, e2e: bool = True)
             # _reviewer_verdict prefers the structured progress/review_<id>.json
             # written alongside the report, falling back to parsing the returned
             # chat string (_verdict_is + stripping "REJECTED:") when absent.
-            review_result = spawn_reviewer(feature_id, e2e=e2e, attempt=attempt)
+            review_result = spawn_reviewer(feature_id, e2e=e2e, attempt=attempt, spec_path=spec_path)
             approved, rejection_reason = _reviewer_verdict(review_result, f"{PROGRESS_DIR}/review_{feature_id}.md")
 
         if not approved:
