@@ -859,29 +859,36 @@ def _compose_file_flags() -> list:
     return []
 
 
-def _docker_compose_config() -> Optional[dict]:
+def _docker_compose_config() -> tuple:
     """
-    Best-effort `docker compose config --format json` → the parsed "services"
-    dict (service_name -> service definition, including its resolved
-    "image"). Returns None on any failure (Docker not installed, no compose
-    file in the project root, timeout, malformed JSON) — callers turn that
-    into one clear error message, never a raw traceback.
+    Best-effort `docker compose config --format json` → (services, error).
+    `services` is the parsed "services" dict (service_name -> service
+    definition, including its resolved "image") on success, else None.
+    `error` is a short human-readable reason on failure (Docker not
+    installed, no compose file in the project root, timeout, malformed
+    JSON, or — notably — a required env-var interpolation failure such as
+    an e2e overlay whose service command is only resolvable by external
+    tooling), else None on success. Callers use `error` to distinguish
+    "compose config is fundamentally unusable here" (worth falling back to
+    plain `docker ps`) from "ran fine, nothing matched".
     """
     try:
         result = subprocess.run(
             ["docker", "compose", *_compose_file_flags(), "config", "--format", "json"],
             capture_output=True, text=True, timeout=30, cwd=os.getcwd(),
         )
-    except Exception:
-        return None
+    except Exception as e:
+        return None, str(e)
     if result.returncode != 0:
-        return None
+        return None, (result.stdout + result.stderr).strip()[-1000:]
     try:
         parsed = json.loads(result.stdout)
     except (json.JSONDecodeError, TypeError):
-        return None
+        return None, "'docker compose config' output could not be parsed as JSON."
     services = parsed.get("services") if isinstance(parsed, dict) else None
-    return services if isinstance(services, dict) else None
+    if not isinstance(services, dict):
+        return None, "'docker compose config' succeeded but returned no services."
+    return services, None
 
 
 def _detect_compose_service_by_image(services: dict, image_substring: str) -> Optional[str]:
@@ -901,6 +908,50 @@ def _detect_compose_service_by_image(services: dict, image_substring: str) -> Op
     return None
 
 
+def _docker_ps_running_containers() -> Optional[list]:
+    """
+    Best-effort `docker ps --format {{.ID}}\\t{{.Image}}` → list of
+    (container_id, image) tuples for currently-running containers. Plain
+    `docker`, never `docker compose` — no compose file is parsed, so this
+    works even when `docker compose config` itself is unusable (e.g. an
+    overlay requiring an env var only injected transiently by external
+    tooling). Returns None on any failure (Docker not installed/running,
+    timeout).
+    """
+    try:
+        result = subprocess.run(
+            ["docker", "ps", "--format", "{{.ID}}\t{{.Image}}"],
+            capture_output=True, text=True, timeout=30, cwd=os.getcwd(),
+        )
+    except Exception:
+        return None
+    if result.returncode != 0:
+        return None
+    containers = []
+    for line in result.stdout.splitlines():
+        line = line.strip()
+        if "\t" not in line:
+            continue
+        cid, image = line.split("\t", 1)
+        if cid.strip():
+            containers.append((cid.strip(), image.strip()))
+    return containers
+
+
+def _detect_running_container_by_image(containers: list, image_substring: str) -> Optional[str]:
+    """
+    First running container id whose image contains image_substring
+    (case-insensitive) — the `docker ps` analogue of
+    _detect_compose_service_by_image, used only in the fallback path where
+    `docker compose config` can't be parsed at all.
+    """
+    needle = image_substring.lower()
+    for cid, image in containers or []:
+        if needle in image.lower():
+            return cid
+    return None
+
+
 def run_backend_pytest(test_path: str = None, extra_args: str = "", timeout: int = None, **kwargs) -> str:
     """
     Run a backend/tests/*.py file against a REAL Postgres — ON THE HOST,
@@ -917,9 +968,15 @@ def run_backend_pytest(test_path: str = None, extra_args: str = "", timeout: int
     sense with shell syntax is refused rather than silently mis-parsed.
 
     Self-sufficient regardless of the sandbox environment's current state:
-    always runs `docker compose up -d --wait` on the detected backend +
-    postgres services first, so this never assumes a container is already
-    running.
+    when `docker compose config` succeeds, always runs `docker compose up
+    -d --wait` on the detected backend + postgres services first, so this
+    never assumes a container is already running. When `docker compose
+    config` itself is unusable (e.g. an e2e overlay whose service command
+    interpolates a required env var only injected transiently by external
+    tooling — never durably written to .env), falls back to plain `docker
+    ps` and matches an already-running container by image, skipping
+    `docker compose up` entirely since compose can't safely operate on a
+    file it can't parse.
     """
     path_error = _validate_backend_test_path(test_path)
     if path_error:
@@ -929,56 +986,70 @@ def run_backend_pytest(test_path: str = None, extra_args: str = "", timeout: int
         return json.dumps({"error": args_error})
     normalized_path = os.path.normpath(str(test_path)).replace("\\", "/")
 
-    services = _docker_compose_config()
-    if services is None:
-        return json.dumps({
-            "error": "Could not read the docker compose configuration ('docker compose config "
-                     "--format json' failed or returned no services). Is a docker-compose.yml "
-                     "present in the project root, and is Docker running?",
-        })
-    backend_service = _detect_compose_service_by_image(services, BACKEND_COMPOSE_IMAGE_SUBSTRING)
-    postgres_service = _detect_compose_service_by_image(services, POSTGRES_COMPOSE_IMAGE_SUBSTRING)
-    missing = []
-    if not backend_service:
-        missing.append(f"backend service (no compose service image contains "
-                        f"'{BACKEND_COMPOSE_IMAGE_SUBSTRING}')")
-    if not postgres_service:
-        missing.append(f"postgres service (no compose service image contains "
-                        f"'{POSTGRES_COMPOSE_IMAGE_SUBSTRING}')")
-    if missing:
-        return json.dumps({"error": f"Could not detect: {'; '.join(missing)}.",
-                           "services_found": sorted(services.keys())})
+    services, config_error = _docker_compose_config()
+    backend_service = None
+    container_id = None
 
-    compose_file_flags = _compose_file_flags()
-    try:
-        up = subprocess.run(
-            ["docker", "compose", *compose_file_flags, "up", "-d", "--wait",
-             backend_service, postgres_service],
-            capture_output=True, text=True, timeout=COMPOSE_UP_TIMEOUT_S, cwd=os.getcwd(),
-        )
-    except subprocess.TimeoutExpired:
-        return json.dumps({"error": f"'docker compose up -d --wait' timed out after "
-                                    f"{COMPOSE_UP_TIMEOUT_S}s waiting for "
-                                    f"{backend_service}/{postgres_service} to become healthy."})
-    except Exception as e:
-        return json.dumps({"error": f"Failed to start compose services: {e}"})
-    if up.returncode != 0:
-        return json.dumps({
-            "error": f"'docker compose up -d --wait {backend_service} {postgres_service}' failed.",
-            "output": (up.stdout + up.stderr)[-2000:],
-        })
+    if services is not None:
+        backend_service = _detect_compose_service_by_image(services, BACKEND_COMPOSE_IMAGE_SUBSTRING)
+        postgres_service = _detect_compose_service_by_image(services, POSTGRES_COMPOSE_IMAGE_SUBSTRING)
+        missing = []
+        if not backend_service:
+            missing.append(f"backend service (no compose service image contains "
+                            f"'{BACKEND_COMPOSE_IMAGE_SUBSTRING}')")
+        if not postgres_service:
+            missing.append(f"postgres service (no compose service image contains "
+                            f"'{POSTGRES_COMPOSE_IMAGE_SUBSTRING}')")
+        if missing:
+            return json.dumps({"error": f"Could not detect: {'; '.join(missing)}.",
+                               "services_found": sorted(services.keys())})
 
-    try:
-        ps = subprocess.run(
-            ["docker", "compose", *compose_file_flags, "ps", "-q", backend_service],
-            capture_output=True, text=True, timeout=30, cwd=os.getcwd(),
-        )
-    except Exception as e:
-        return json.dumps({"error": f"Failed to resolve the '{backend_service}' container id: {e}"})
-    container_id = next((line.strip() for line in ps.stdout.splitlines() if line.strip()), "")
-    if not container_id:
-        return json.dumps({"error": f"'{backend_service}' has no running container after "
-                                    f"'docker compose up -d --wait'."})
+        compose_file_flags = _compose_file_flags()
+        try:
+            up = subprocess.run(
+                ["docker", "compose", *compose_file_flags, "up", "-d", "--wait",
+                 backend_service, postgres_service],
+                capture_output=True, text=True, timeout=COMPOSE_UP_TIMEOUT_S, cwd=os.getcwd(),
+            )
+        except subprocess.TimeoutExpired:
+            return json.dumps({"error": f"'docker compose up -d --wait' timed out after "
+                                        f"{COMPOSE_UP_TIMEOUT_S}s waiting for "
+                                        f"{backend_service}/{postgres_service} to become healthy."})
+        except Exception as e:
+            return json.dumps({"error": f"Failed to start compose services: {e}"})
+        if up.returncode != 0:
+            return json.dumps({
+                "error": f"'docker compose up -d --wait {backend_service} {postgres_service}' failed.",
+                "output": (up.stdout + up.stderr)[-2000:],
+            })
+
+        try:
+            ps = subprocess.run(
+                ["docker", "compose", *compose_file_flags, "ps", "-q", backend_service],
+                capture_output=True, text=True, timeout=30, cwd=os.getcwd(),
+            )
+        except Exception as e:
+            return json.dumps({"error": f"Failed to resolve the '{backend_service}' container id: {e}"})
+        container_id = next((line.strip() for line in ps.stdout.splitlines() if line.strip()), "")
+        if not container_id:
+            return json.dumps({"error": f"'{backend_service}' has no running container after "
+                                        f"'docker compose up -d --wait'."})
+    else:
+        containers = _docker_ps_running_containers()
+        container_id = _detect_running_container_by_image(
+            containers, BACKEND_COMPOSE_IMAGE_SUBSTRING) if containers else None
+        if not container_id:
+            return json.dumps({
+                "error": (
+                    f"Could not read the docker compose configuration ('docker compose config "
+                    f"--format json' failed: {config_error}) and no running container's image "
+                    f"contains '{BACKEND_COMPOSE_IMAGE_SUBSTRING}' either. If this project defines "
+                    f"its backend only in an e2e/dev compose overlay that requires runtime-injected "
+                    f"env vars, start it via that external mechanism first, then retry."
+                ),
+            })
+        backend_service = f"<running container {container_id}, detected via 'docker ps' " \
+                           f"(docker compose config unusable: {config_error})>"
 
     try:
         timeout_s = BACKEND_PYTEST_TIMEOUT_S if timeout is None else min(int(timeout), BACKEND_PYTEST_TIMEOUT_S)

@@ -3897,12 +3897,62 @@ class TestRunBackendPytest:
         self._fake_run(monkeypatch, t, overrides={
             ("docker", "compose", "config", "--format", "json"):
                 SimpleNamespace(returncode=1, stdout="", stderr="no configuration file provided"),
+            ("docker", "ps", "--format"):
+                SimpleNamespace(returncode=0, stdout="", stderr=""),  # nothing running either
         })
 
         result = json.loads(t.run_backend_pytest(test_path="backend/tests/test_migrations.py"))
 
         assert "error" in result
         assert "compose" in result["error"].lower()
+
+    def test_compose_config_fails_but_matching_container_already_running(self, monkeypatch, tmp_path):
+        # e.g. an e2e overlay whose backend command interpolates a required
+        # env var only injected transiently by external tooling (never
+        # written to .env) — `docker compose config` fails outright even
+        # though a real backend container, started by that external
+        # tooling, is already running. Fall back to plain `docker ps`,
+        # matching by image, and skip `docker compose up` entirely.
+        from types import SimpleNamespace
+        t = self._load_tools(monkeypatch, tmp_path)
+        calls = self._fake_run(monkeypatch, t, overrides={
+            ("docker", "compose", "config", "--format", "json"):
+                SimpleNamespace(returncode=1, stdout="",
+                                 stderr="required variable HARNESS_BACKEND_CMD is missing a value"),
+            ("docker", "ps", "--format"):
+                SimpleNamespace(returncode=0,
+                                 stdout="deadbeef1234\tmyproj-backend-python:latest\n"
+                                        "cafef00dcafe\tpostgres:15\n",
+                                 stderr=""),
+        })
+
+        result = json.loads(t.run_backend_pytest(test_path="backend/tests/test_migrations.py"))
+
+        assert result["passed"] is True
+        assert "deadbeef1234" in result["backend_service"]
+        exec_call = next(argv for argv, kw in calls if argv[:2] == ["docker", "exec"])
+        assert "deadbeef1234" in exec_call
+        # docker compose up must never be attempted — compose can't safely
+        # operate on a file it couldn't parse.
+        assert not any(argv[:3] == ["docker", "compose", "up"] for argv, kw in calls)
+
+    def test_compose_config_fails_and_nothing_running_gives_actionable_error(self, monkeypatch, tmp_path):
+        from types import SimpleNamespace
+        t = self._load_tools(monkeypatch, tmp_path)
+        calls = self._fake_run(monkeypatch, t, overrides={
+            ("docker", "compose", "config", "--format", "json"):
+                SimpleNamespace(returncode=1, stdout="",
+                                 stderr="required variable HARNESS_BACKEND_CMD is missing a value"),
+            ("docker", "ps", "--format"):
+                SimpleNamespace(returncode=0, stdout="cafef00dcafe\tpostgres:15\n", stderr=""),
+        })
+
+        result = json.loads(t.run_backend_pytest(test_path="backend/tests/test_migrations.py"))
+
+        assert "error" in result
+        assert "HARNESS_BACKEND_CMD" in result["error"]  # surfaces the real interpolation failure
+        assert "external mechanism" in result["error"]  # distinguishing, actionable guidance
+        assert not any(argv[:3] == ["docker", "compose", "up"] for argv, kw in calls)
 
     def test_compose_up_failure_returns_output(self, monkeypatch, tmp_path):
         from types import SimpleNamespace
